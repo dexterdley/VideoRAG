@@ -4,19 +4,24 @@ import json
 import shutil
 import asyncio
 import multiprocessing
+import torch # Added for local model
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from functools import partial
 from typing import Callable, Dict, List, Optional, Type, Union, cast
-from transformers import AutoModel, AutoTokenizer
+from transformers import AutoModel, AutoTokenizer, AutoProcessor, AutoModelForVision2Seq
 import tiktoken
+from sentence_transformers import SentenceTransformer # Added for local embeddings
 
+import torchvision.transforms.functional as F
+sys.modules['torchvision.transforms.functional_tensor'] = F
 
+# Keep existing relative imports
 from ._llm import (
     LLMConfig,
     openai_config,
-    azure_openai_config,
-    ollama_config
+    # azure_openai_config, # Not needed
+    # ollama_config        # Not needed
 )
 from ._op import (
     chunking_by_video_segments,
@@ -55,13 +60,18 @@ from ._videoutil import(
     saving_video_segments,
 )
 
-
 @dataclass
 class VideoRAG:
     working_dir: str = field(
         default_factory=lambda: f"./videorag_cache_{datetime.now().strftime('%Y-%m-%d-%H:%M:%S')}"
     )
     
+    # --- Local Model Configuration (New) ---
+    local_llm_path: str = "Qwen/Qwen3-VL-8B-Instruct" # Use Qwen-3 path if available
+    local_embedding_path: str = "BAAI/bge-m3"        # Standard local embedding model
+    device: str = "cuda" if torch.cuda.is_available() else "cpu"
+    # ---------------------------------------
+
     # video
     threads_for_split: int = 10
     video_segment_length: int = 30 # seconds
@@ -71,7 +81,7 @@ class VideoRAG:
     audio_output_format: str = "mp3"
     video_embedding_batch_num: int = 2
     segment_retrieval_top_k: int = 4
-    video_embedding_dim: int = 1024
+    video_embedding_dim: int = 1024 # Ensure this matches your local_embedding_path dimension (bge-m3 is 1024)
     
     # query
     retrieval_topk_chunks: int = 2
@@ -82,27 +92,21 @@ class VideoRAG:
     enable_naive_rag: bool = True
 
     # text chunking
-    chunk_func: Callable[
-        [
-            list[list[int]],
-            List[str],
-            tiktoken.Encoding,
-            Optional[int],
-        ],
-        List[Dict[str, Union[str, int]]],
-    ] = chunking_by_video_segments
+    chunk_func: Callable = chunking_by_video_segments
     chunk_token_size: int = 1200
-    # chunk_overlap_token_size: int = 100
-    tiktoken_model_name: str = "gpt-4o"
+    tiktoken_model_name: str = "gpt-4o" 
 
     # entity extraction
     entity_extract_max_gleaning: int = 1
     entity_summary_to_max_tokens: int = 500
 
-    # Change to your LLM provider
-    llm: LLMConfig = field(default_factory=openai_config)
+    # Removed API LLMConfig default, we will override in post_init
+    llm: LLMConfig = field(default_factory=lambda: LLMConfig(
+        domain="local", 
+        model_name="qwen-local", 
+        embedding_dim=1024 # Match bge-m3
+    ))
     
-    # entity extraction
     entity_extraction_func: callable = extract_entities
     
     # storage
@@ -119,94 +123,146 @@ class VideoRAG:
     convert_response_to_json_func: callable = convert_response_to_json
 
     def load_caption_model(self, debug=False):
-        # caption model
+        # caption model (MiniCPM-V)
         if not debug:
-            self.caption_model = AutoModel.from_pretrained('./MiniCPM-V-2_6-int4', trust_remote_code=True)
-            self.caption_tokenizer = AutoTokenizer.from_pretrained('./MiniCPM-V-2_6-int4', trust_remote_code=True)
-            self.caption_model.eval()
+            print("Loading Caption Model (MiniCPM-V)...")
+            self.caption_model = AutoModel.from_pretrained('.checkpoints/MiniCPM-V-2_6-int4', trust_remote_code=True, dtype=torch.bfloat16)
+            self.caption_tokenizer = AutoTokenizer.from_pretrained('.checkpoints/MiniCPM-V-2_6-int4', trust_remote_code=True)
+            self.caption_model.to(self.device).eval()
         else:
             self.caption_model = None
             self.caption_tokenizer = None
-    
+
+    def load_local_llm(self):
+        """Loads Qwen and Embedding models locally"""
+        print(f"Loading Local LLM: {self.local_llm_path}...")
+        self.qwen_tokenizer = AutoTokenizer.from_pretrained(self.local_llm_path, trust_remote_code=True)
+        self.qwen_model = AutoModelForVision2Seq.from_pretrained(
+            self.local_llm_path, 
+            device_map="auto", 
+            dtype=torch.bfloat16,
+            trust_remote_code=True
+        ).eval()
+
+        print(f"Loading Local Embeddings: {self.local_embedding_path}...")
+        self.embed_model = SentenceTransformer(self.local_embedding_path, device=self.device)
+
+    async def _local_qwen_chat(self, prompt: str, system_prompt: str = None, history: list = None, **kwargs):
+        """Async wrapper for Qwen Inference"""
+        # Prepare messages
+        messages = []
+        if system_prompt:
+            messages.append({"role": "system", "content": system_prompt})
+        if history:
+            messages.extend(history)
+        messages.append({"role": "user", "content": prompt})
+
+        text = self.qwen_tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True
+        )
+        model_inputs = self.qwen_tokenizer([text], return_tensors="pt").to(self.device)
+
+        # Run inference in a thread to avoid blocking asyncio loop
+        def run_inference():
+            with torch.no_grad():
+                generated_ids = self.qwen_model.generate(
+                    model_inputs.input_ids,
+                    max_new_tokens=2048,
+                    temperature=0.7
+                )
+            generated_ids = [
+                output_ids[len(input_ids):] for input_ids, output_ids in zip(model_inputs.input_ids, generated_ids)
+            ]
+            return self.qwen_tokenizer.batch_decode(generated_ids, skip_special_tokens=True)[0]
+
+        return await asyncio.to_thread(run_inference)
+
+    async def _local_embedding_func(self, texts: list[str]):
+        """Async wrapper for Local Embeddings"""
+        def run_embed():
+            # Normalize embeddings is important for cosine similarity
+            embeddings = self.embed_model.encode(texts, normalize_embeddings=True)
+            return embeddings.tolist()
+        
+        return await asyncio.to_thread(run_embed)
+
     def __post_init__(self):
-        _print_config = ",\n  ".join([f"{k} = {v}" for k, v in asdict(self).items()])
-        logger.debug(f"VideoRAG init with param:\n\n  {_print_config}\n")
+        self.load_local_llm()
         
         if not os.path.exists(self.working_dir) and self.always_create_working_dir:
-            logger.info(f"Creating working directory {self.working_dir}")
             os.makedirs(self.working_dir)
 
         self.video_path_db = self.key_string_value_json_storage_cls(
             namespace="video_path", global_config=asdict(self)
         )
-        
         self.video_segments = self.key_string_value_json_storage_cls(
             namespace="video_segments", global_config=asdict(self)
         )
-
         self.text_chunks = self.key_string_value_json_storage_cls(
             namespace="text_chunks", global_config=asdict(self)
         )
-
         self.llm_response_cache = (
             self.key_string_value_json_storage_cls(
                 namespace="llm_response_cache", global_config=asdict(self)
-            )
-            if self.enable_llm_cache
-            else None
+            ) if self.enable_llm_cache else None
         )
-
         self.chunk_entity_relation_graph = self.graph_storage_cls(
             namespace="chunk_entity_relation", global_config=asdict(self)
         )
 
-        self.embedding_func = limit_async_func_call(self.llm.embedding_func_max_async)(wrap_embedding_func_with_attrs(
-                embedding_dim = self.llm.embedding_dim,
-                max_token_size = self.llm.embedding_max_token_size,
-                model_name = self.llm.embedding_model_name)(self.llm.embedding_func))
+        # --- FIX IS HERE: Added **kwargs to lambda ---
+        # The library tries to pass 'model_name' when calling this, so we must accept it.
+        local_embed_wrapper = lambda texts, **kwargs: self._local_embedding_func(texts)
+        
+        self.embedding_func = limit_async_func_call(10)(wrap_embedding_func_with_attrs(
+                embedding_dim = self.video_embedding_dim,
+                max_token_size = 8192,
+                model_name = self.local_embedding_path)(local_embed_wrapper))
+
         self.entities_vdb = (
             self.vector_db_storage_cls(
                 namespace="entities",
                 global_config=asdict(self),
                 embedding_func=self.embedding_func,
                 meta_fields={"entity_name"},
-            )
-            if self.enable_local
-            else None
+            ) if self.enable_local else None
         )
         self.chunks_vdb = (
             self.vector_db_storage_cls(
                 namespace="chunks",
                 global_config=asdict(self),
                 embedding_func=self.embedding_func,
-            )
-            if self.enable_naive_rag
-            else None
+            ) if self.enable_naive_rag else None
         )
-        
         self.video_segment_feature_vdb = (
             self.vs_vector_db_storage_cls(
                 namespace="video_segment_feature",
                 global_config=asdict(self),
-                embedding_func=None, # we code the embedding process inside the insert() function.
+                embedding_func=None,
             )
         )
         
-        self.llm.best_model_func = limit_async_func_call(self.llm.best_model_max_async)(
-            partial(self.llm.best_model_func, hashing_kv=self.llm_response_cache)
+        async def qwen_wrapper(prompt, system_prompt=None, history=None, **kwargs):
+            return await self._local_qwen_chat(prompt, system_prompt, history)
+
+        self.llm.best_model_func = limit_async_func_call(1)(
+            partial(qwen_wrapper, hashing_kv=self.llm_response_cache)
         )
-        self.llm.cheap_model_func = limit_async_func_call(self.llm.cheap_model_max_async)(
-            partial(self.llm.cheap_model_func, hashing_kv=self.llm_response_cache)
+        self.llm.cheap_model_func = limit_async_func_call(1)(
+            partial(qwen_wrapper, hashing_kv=self.llm_response_cache)
         )
+        # -----------------------------------------------
 
     def insert_video(self, video_path_list=None):
         loop = always_get_an_event_loop()
         for video_path in video_path_list:
             # Step0: check the existence
             video_name = os.path.basename(video_path).split('.')[0]
-            if video_name in self.video_segments._data:
-                logger.info(f"Find the video named {os.path.basename(video_path)} in storage and skip it.")
-                continue
+            #if video_name in self.video_segments._data:
+            #    logger.info(f"Find the video named {os.path.basename(video_path)} in storage and skip it.")
+            #    continue
             loop.run_until_complete(self.video_path_db.upsert(
                 {video_name: video_path}
             ))

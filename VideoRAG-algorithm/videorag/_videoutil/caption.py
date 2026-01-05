@@ -16,8 +16,8 @@ def encode_video(video, frame_times):
     
 def segment_caption(video_name, video_path, segment_index2name, transcripts, segment_times_info, caption_result, error_queue):
     try:
-        model = AutoModel.from_pretrained('./MiniCPM-V-2_6-int4', trust_remote_code=True)
-        tokenizer = AutoTokenizer.from_pretrained('./MiniCPM-V-2_6-int4', trust_remote_code=True)
+        model = AutoModel.from_pretrained('.checkpoints/MiniCPM-V-2_6-int4', trust_remote_code=True)
+        tokenizer = AutoTokenizer.from_pretrained('.checkpoints/MiniCPM-V-2_6-int4', trust_remote_code=True)
         model.eval()
         
         with VideoFileClip(video_path) as video:
