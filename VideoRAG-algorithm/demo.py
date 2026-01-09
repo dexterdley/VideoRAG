@@ -19,23 +19,23 @@ def get_args():
     return args
 
 def main(args):
-    # 1. Initialize VideoRAG
+    # 1. Initialize QwenVideoRAG
     # The working_dir is where the vector index and metadata will be saved.
     working_dir = "./videorag-workdir"
-    print(f"Initializing VideoRAG in {working_dir}...")
+    print(f"Initializing Qwen VideoRAG in {working_dir}...")
 
     videorag = VideoRAG(
-        llm=openai_4o_mini_config, 
+        llm=openai_4o_mini_config,
         working_dir=working_dir
     )
 
     # 2. Indexing Phase
     # TODO: Update these paths to actual video files on your machine.
     video_paths = [
-        './vids/trump.mp4'
+        #'./vids/trump.mp4'
         #'./vids/69118fe052fb155119d76733j1I4g7PP06.mp4',
         #'./vids/6911901d0b52d480daffcdf5OKs2mEUO06.mp4'
-        #'./vids/2025-12-23 13-44-19_Trim.mp4'
+        './vids/2025-12-23 13-44-19_Trim.mp4'
     ]
 
     # Check if files exist before processing to avoid vague errors

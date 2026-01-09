@@ -594,22 +594,6 @@ async def videorag_query(
     use_model_func = global_config["llm"]["best_model_func"]
     query = query
     
-    # naive chunks
-    results = await chunks_vdb.query(query, top_k=query_param.top_k)
-    if not len(results):
-        return PROMPTS["fail_response"]
-    chunks_ids = [r["id"] for r in results]
-    chunks = await text_chunks_db.get_by_ids(chunks_ids)
-
-    maybe_trun_chunks = truncate_list_by_token_size(
-        chunks,
-        key=lambda x: x["content"],
-        max_token_size=query_param.naive_max_token_for_text_unit,
-    )
-    logger.info(f"Truncate {len(chunks)} to {len(maybe_trun_chunks)} chunks")
-    section = "-----New Chunk-----\n".join([c["content"] for c in maybe_trun_chunks])
-    retreived_chunk_context = section
-    
     # visual retrieval
     query_for_entity_retrieval = await _refine_entity_retrieval_query(
         query,
@@ -650,6 +634,10 @@ async def videorag_query(
     
     # caption
     retrieved_segments = list(entity_retrieved_segments.union(visual_retrieved_segments))
+    # retrieved_segments = list(entity_retrieved_segments & visual_retrieved_segments)
+    if len(retrieved_segments) == 0:
+        retrieved_segments = entity_retrieved_segments
+
     retrieved_segments = sorted(
         retrieved_segments,
         key=lambda x: (
@@ -661,7 +649,7 @@ async def videorag_query(
     print(f"Retrieved Text Segments {entity_retrieved_segments}")
     print(query_for_visual_retrieval)
     print(f"Retrieved Visual Segments {visual_retrieved_segments}")
-    
+    '''
     already_processed = 0
     async def _filter_single_segment(knowledge: str, segment_key_dp: tuple[str, str]):
         nonlocal use_model_func, already_processed
@@ -694,8 +682,33 @@ async def videorag_query(
     if len(remain_segments) == 0:
         print("Since no segments remain after filtering, we utilized all the retrieved segments.")
         remain_segments = retrieved_segments
+    '''
+    remain_segments = retrieved_segments
     print(f"Remain segments {remain_segments}")
     
+    # naive chunks
+    results = await chunks_vdb.query(query, top_k=query_param.top_k)
+    if not len(results):
+        return PROMPTS["fail_response"]
+    chunks_ids = [r["id"] for r in results]
+    chunks = await text_chunks_db.get_by_ids(chunks_ids)
+    '''
+    maybe_trun_chunks = truncate_list_by_token_size(
+        chunks,
+        key=lambda x: x["content"],
+        max_token_size=query_param.naive_max_token_for_text_unit,
+    )
+    logger.info(f"Truncate {len(chunks)} to {len(maybe_trun_chunks)} chunks")
+    section = "-----New Chunk-----\n".join([c["content"] for c in maybe_trun_chunks])
+    '''
+    section = "-----New Chunk-----\n"
+    for chunk in chunks:
+        overlap_segment = set(remain_segments) & set(chunk['video_segment_id'])
+        if len(overlap_segment) > 0:
+            section.join(chunk["content"])
+
+    retrieved_chunk_context = section
+
     # visual retrieval
     keywords_for_caption = await _extract_keywords_query(
         query,
@@ -706,7 +719,7 @@ async def videorag_query(
     caption_results = retrieved_segment_caption(
         caption_model,
         caption_tokenizer,
-        keywords_for_caption,
+        keywords_for_caption, #From LLM
         remain_segments,
         video_path_db,
         video_segments,
@@ -725,7 +738,7 @@ async def videorag_query(
         text_units_section_list.append([video_name, start_time, end_time, caption_results[s_id]])
     text_units_context = list_of_list_to_csv(text_units_section_list)
 
-    retreived_video_context = f"\n-----Retrieved Knowledge From Videos-----\n```csv\n{text_units_context}\n```\n"
+    retrieved_video_context = f"\n-----Retrieved Knowledge From Videos-----\n```csv\n{text_units_context}\n```\n" # Captions
     
     if query_param.wo_reference:
         sys_prompt_temp = PROMPTS["videorag_response_wo_reference"]
@@ -733,14 +746,15 @@ async def videorag_query(
         sys_prompt_temp = PROMPTS["videorag_response"]
         
     sys_prompt = sys_prompt_temp.format(
-        video_data=retreived_video_context,
-        chunk_data=retreived_chunk_context,
+        video_data=retrieved_video_context,
+        chunk_data=retrieved_chunk_context,
         response_type=query_param.response_type
     )
     response = await use_model_func(
         query,
         system_prompt=sys_prompt,
     )
+    import pdb; pdb.set_trace()
     return response
 
 async def videorag_query_multiple_choice(
@@ -777,9 +791,9 @@ async def videorag_query_multiple_choice(
         )
         logger.info(f"Truncate {len(chunks)} to {len(maybe_trun_chunks)} chunks")
         section = "-----New Chunk-----\n".join([c["content"] for c in maybe_trun_chunks])
-        retreived_chunk_context = section
+        retrieved_chunk_context = section
     else:
-        retreived_chunk_context = "No Content"
+        retrieved_chunk_context = "No Content"
         
     # visual retrieval
     query_for_entity_retrieval = await _refine_entity_retrieval_query(
@@ -896,14 +910,14 @@ async def videorag_query_multiple_choice(
         text_units_section_list.append([video_name, start_time, end_time, caption_results[s_id]])
     text_units_context = list_of_list_to_csv(text_units_section_list)
 
-    retreived_video_context = f"\n-----Retrieved Knowledge From Videos-----\n```csv\n{text_units_context}\n```\n"
+    retrieved_video_context = f"\n-----Retrieved Knowledge From Videos-----\n```csv\n{text_units_context}\n```\n"
     
     # NOTE: I update here to use a different prompt
     sys_prompt_temp = PROMPTS["videorag_response_for_multiple_choice_question"]
         
     sys_prompt = sys_prompt_temp.format(
-        video_data=retreived_video_context,
-        chunk_data=retreived_chunk_context,
+        video_data=retrieved_video_context,
+        chunk_data=retrieved_chunk_context,
         response_type=query_param.response_type
     )
     response = await use_model_func(

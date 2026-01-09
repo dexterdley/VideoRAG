@@ -61,7 +61,7 @@ from ._videoutil import(
 )
 
 @dataclass
-class VideoRAG:
+class QwenVideoRAG:
     working_dir: str = field(
         default_factory=lambda: f"./videorag_cache_{datetime.now().strftime('%Y-%m-%d-%H:%M:%S')}"
     )
@@ -212,6 +212,8 @@ class VideoRAG:
             namespace="chunk_entity_relation", global_config=asdict(self)
         )
 
+        # --- FIX IS HERE: Added **kwargs to lambda ---
+        # The library tries to pass 'model_name' when calling this, so we must accept it.
         local_embed_wrapper = lambda texts, **kwargs: self._local_embedding_func(texts)
         
         self.embedding_func = limit_async_func_call(10)(wrap_embedding_func_with_attrs(
