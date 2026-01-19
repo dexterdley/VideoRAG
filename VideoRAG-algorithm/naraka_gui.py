@@ -7,9 +7,11 @@ import numpy as np
 import asyncio
 import gradio as gr
 import subprocess
+from copy import deepcopy
+import json
 from PIL import Image
 from decord import VideoReader, cpu
-from transformers import AutoModel, AutoTokenizer
+from transformers import AutoModel, AutoTokenizer, AutoProcessor
 
 ### TO DO ###
 # yes or no then take the probs of yes token
@@ -22,6 +24,7 @@ Cut yield 511.52
 async 409.36
 resolution 372.78
 step30  357.2
+yesno: 176.11
 '''
 
 # --- CONFIGURATION ---
@@ -56,6 +59,8 @@ try:
         trust_remote_code=True
     )
     caption_model.eval()
+    processor = AutoProcessor.from_pretrained(MODEL_PATH, trust_remote_code=True)
+
     print("Model loaded successfully!")
 
 except Exception as e:
@@ -108,14 +113,84 @@ def load_dummy_video():
     else:
         return None
 
-# --- HELPER: Make Text Progress Bar ---
-def get_progress_bar(current, total, length=20):
-    percent = min(1.0, current / total)
-    filled_len = int(length * percent)
-    bar = "█" * filled_len + "░" * (length - filled_len)
-    return f"Progress: |{bar}| {int(percent * 100)}%"
+def batched_minicpm_inference(
+        model, 
+        tokenizer, 
+        processor=None, 
+        images=None, 
+        max_slice_nums=1, 
+        use_image_id=False, 
+        max_inp_length=2048,
+        msgs_template=None,
+        system_prompt=None,
+        **kwargs
+    ):
+    
+        prompts_lists = []
+        input_images_lists = []
+        
+        for img in images:
+            msgs = deepcopy(msgs_template)
+            if isinstance(msgs[0]["content"], str):
+                msgs[0]["content"] = [img, msgs[0]["content"]]
+                
+            # Convert message content to the specific format MiniCPM expects: "(<image>./</image>)"
+            # This flattens the list [Image, Text] into a single string with the placeholder
+            current_images = []
+            for i, msg in enumerate(msgs):
+                if isinstance(msg["content"], list):
+                    cur_content_text = []
+                    for c in msg["content"]:
+                        if isinstance(c, Image.Image):
+                            current_images.append(c)
+                            cur_content_text.append("(<image>./</image>)")
+                        elif isinstance(c, str):
+                            cur_content_text.append(c)
+                    msg["content"] = "\n".join(cur_content_text)
+                    
+            if system_prompt:
+                msgs.insert(0, {'role': 'system', 'content': system_prompt})
+        
+            prompt_str = processor.tokenizer.apply_chat_template(
+                msgs, 
+                tokenize=False, 
+                add_generation_prompt=True
+            )
+            
+            prompts_lists.append(prompt_str)
+            input_images_lists.append(current_images)
+        
+        max_slice_nums = 1
+        max_inp_length = 2048
+        
+        inputs = processor(
+            prompts_lists, 
+            input_images_lists, 
+            max_slice_nums=max_slice_nums,
+            use_image_id=False,
+            return_tensors="pt", 
+            max_length=max_inp_length
+        ).to(caption_model.device)
+        
+        if "position_ids" not in inputs:
+            batch_size, seq_len = inputs["input_ids"].shape
+            # Create simple sequential positions [0, 1, 2, ... seq_len]
+            inputs["position_ids"] = torch.arange(seq_len, dtype=torch.long, device=caption_model.device).unsqueeze(0).expand(batch_size, -1)
+        
+        if "image_sizes" in inputs:
+            inputs.pop("image_sizes")
+        
+        with torch.inference_mode():
+            outputs = caption_model(inputs, attention_mask=inputs["attention_mask"])
+            logits = outputs.logits[:, -1, :]
+            probs = torch.nn.functional.softmax(logits, dim=-1)
+        
+        response = caption_tokenizer.batch_decode(probs.argmax(1))
+        confidence = probs.max(1).values
 
-# --- 2. CORE LOGIC ---
+        return response, confidence
+
+# --- MAIN ---
 async def analyze_video(video_path):
     gr.Info("Starting Process ⏳ (开始)")
     t1 = time.time()
@@ -144,11 +219,13 @@ async def analyze_video(video_path):
     step = int(fps)      
 
     prompt = (
-        "Analyze these frames for text banners or UI notifications indicating "
-        "player achievements. Specifically look for keywords like 'First Blood', "
-        "'Double Kill', 'Triple Kill', 'Quadra Kill', or 'Invincible'. "
-        "First answer Yes or No, then explain why this is a significant, exciting event"
+    "Analyze these frames for text banners like 'First Blood', 'Double Kill', "
+    "'Triple Kill', 'Quadra Kill', or 'Invincible'. "
+    "If any of these are present, answer 'Yes'. Otherwise, answer 'No'. "
+    "Do not provide any explanation."
     )
+
+    system_prompt = "You are a video game expert identifier."
 
     start_scan_time = 280 if duration > 280 else 0
     scan_range = list(range(start_scan_time, int(duration), segment_length))
@@ -178,10 +255,11 @@ async def analyze_video(video_path):
         frames = [Image.fromarray(f) for f in batch_frames]
 
         # Prepare Msgs
-        msgs = [{'role': 'user', 'content': frames + [prompt]}]
+        # msgs = [{'role': 'user', 'content': frames + [prompt]}]
 
         # Inference
         with torch.inference_mode():
+            '''
             answer = await asyncio.to_thread(
                 caption_model.chat,
                 image=None,
@@ -192,6 +270,19 @@ async def analyze_video(video_path):
                 max_slice_nums=1,
                 use_image_id=False
             )
+            '''
+            answer, confidence = batched_minicpm_inference(
+                caption_model, 
+                caption_tokenizer, 
+                processor=processor, 
+                images=frames, 
+                max_slice_nums=1, 
+                use_image_id=False, 
+                max_inp_length=2048,
+                msgs_template=[{"role": "user", "content": prompt}],
+                system_prompt=system_prompt
+            )
+    
         
         # HIT FOUND logic
         if "Yes" in answer:
@@ -223,8 +314,6 @@ async def analyze_video(video_path):
             yield log_output, slots[0], slots[1], slots[2], slider_val
         
     log_output += "\nAnalysis Complete."
-    prog_str = get_progress_bar(total_steps, total_steps)
-    final_display_log = f"{prog_str} DONE\n"
 
     gr.Info("Process complete, you can download your videos! \n (切片成功，您可以下载视频了)")
     t2 = time.time()

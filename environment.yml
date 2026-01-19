@@ -73,7 +73,6 @@ dependencies:
       - huggingface-hub==0.36.0
       - humanfriendly==10.0
       - idna==3.11
-      - imagebind==0.1.0
       - imageio==2.37.2
       - imageio-ffmpeg==0.6.0
       - iopath==0.1.10
