@@ -1,4 +1,5 @@
 import os
+import shutil
 import logging
 import torch
 import tqdm
@@ -7,16 +8,18 @@ import numpy as np
 import asyncio
 import gradio as gr
 import subprocess
-from copy import deepcopy
 import json
+import argparse
+from copy import deepcopy
 from PIL import Image
 from decord import VideoReader, cpu
 from transformers import AutoModel, AutoTokenizer, AutoProcessor
 
 ### TO DO ###
-# yes or no then take the probs of yes token
+# accelerate with vLLM
+# video naration
 # do up DPO
-### ###
+### END OF TODO A###
 '''
 GUI Experiments Times
 Start 786.3
@@ -26,16 +29,40 @@ resolution 372.78
 step30  357.2
 yesno: 176.11
 '''
+# --- REFERENCE CODE
+# https://huggingface.co/openbmb/MiniCPM-V-2_6-int4/blob/main/modeling_minicpmv.py
 
+'''
+Analyze these frames for text banners like '首胜', '2连胜', '3连胜', '4连胜', or '无敌'. If any of these are present, answer 'Yes'. Otherwise, answer 'No'. Do not provide any explanation.
+Analyze these frames for text banners in the upper right corner with player names indicating kills. If any of these are kills, answer 'Yes'. Otherwise, answer 'No'. Do not provide any explanation.
+'''
 # --- CONFIGURATION ---
 USE_BACKBONE = "Mini"
-MODEL_PATH = '/home/dexter/VideoRAG/.checkpoints/MiniCPM-V-2_6-int4'
+path_linux = '/home/dexter/VideoRAG/.checkpoints/MiniCPM-V-2_6-int4'
+path_wsl = './MiniCPM-V-2_6-int4'
+
+parser = argparse.ArgumentParser(description="Naraka Highlight Detector UI")
+parser.add_argument("--language", type=str, default="English", help="Default prompt language")
+args = parser.parse_args()
+
+if os.path.exists(path_wsl):
+    MODEL_PATH = path_wsl
+elif os.path.exists(path_linux):
+    MODEL_PATH = path_linux
+print(f"Found file in: {MODEL_PATH}")
+    
 OUTPUT_FOLDER = "highlights_found"  # Folder to save clips
 DUMMY_VIDEO_PATHS =  [
         "/home/dexter/LLaVA-VLS/playground/demo/QID80I1IRyI.mp4",
         "/home/dexter/LLaVA-VLS/playground/demo/69118fe052fb155119d76733j1I4g7PP06.mp4",
-        "/home/dexter/LLaVA-VLS/playground/demo/Eo_9CAjLoWM_fixed.mp4"
+        "/home/dexter/LLaVA-VLS/playground/demo/Eo_9CAjLoWM_fixed.mp4",
+        "/home/dexter/VideoRAG/naraka_vids/naraka1.mp4",
+        "/home/dexter/VideoRAG/naraka_vids/naraka2.mp4",
+        "/home/dexter/VideoRAG/naraka_vids/naraka3.mp4"
         ]
+
+if os.path.exists(OUTPUT_FOLDER):
+    shutil.rmtree(OUTPUT_FOLDER)
 
 # Ensure output folder exists
 os.makedirs(OUTPUT_FOLDER, exist_ok=True)
@@ -49,8 +76,8 @@ try:
     caption_model = AutoModel.from_pretrained(
         MODEL_PATH, 
         trust_remote_code=True, 
-        dtype=torch.bfloat16
-        #device_map=device,
+        dtype=torch.bfloat16,
+        device_map=device,
         #low_cpu_mem_usage=True
     )
     
@@ -60,7 +87,9 @@ try:
     )
     caption_model.eval()
     processor = AutoProcessor.from_pretrained(MODEL_PATH, trust_remote_code=True)
-
+    yes_token_id = caption_tokenizer.encode("Yes", add_special_tokens=False)[0]
+    no_token_id = caption_tokenizer.encode("No", add_special_tokens=False)[0]
+    
     print("Model loaded successfully!")
 
 except Exception as e:
@@ -81,8 +110,6 @@ async def async_cut_clip(input_path, start_sec, end_sec, output_path):
         "-avoid_negative_ts", "1",  # Fix timestamps
         output_path
     ]
-    #subprocess.run(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-
     process = await asyncio.create_subprocess_exec(
         *command,
         stdout=asyncio.subprocess.DEVNULL,
@@ -159,17 +186,14 @@ def batched_minicpm_inference(
             
             prompts_lists.append(prompt_str)
             input_images_lists.append(current_images)
-        
-        max_slice_nums = 1
-        max_inp_length = 2048
-        
+                
         inputs = processor(
             prompts_lists, 
             input_images_lists, 
-            max_slice_nums=max_slice_nums,
+            max_slice_nums=1,
             use_image_id=False,
             return_tensors="pt", 
-            max_length=max_inp_length
+            max_length=2048
         ).to(caption_model.device)
         
         if "position_ids" not in inputs:
@@ -185,13 +209,13 @@ def batched_minicpm_inference(
             logits = outputs.logits[:, -1, :]
             probs = torch.nn.functional.softmax(logits, dim=-1)
         
-        response = caption_tokenizer.batch_decode(probs.argmax(1))
-        confidence = probs.max(1).values
-
+        # response = caption_tokenizer.batch_decode(probs.argmax(1))
+        # confidence = probs.max(1).values
+        confidence, response = probs.max(1)
         return response, confidence
 
 # --- MAIN ---
-async def analyze_video(video_path):
+async def analyze_video(video_path, input_prompt):
     gr.Info("Starting Process ⏳ (开始)")
     t1 = time.time()
     if not video_path:
@@ -217,15 +241,15 @@ async def analyze_video(video_path):
     duration = len(vr) / fps
     segment_length = 20
     step = int(fps)      
+    prev_start_sec = -100
+    prev_end_sec = -100
 
-    prompt = (
-    "Analyze these frames for text banners like 'First Blood', 'Double Kill', "
-    "'Triple Kill', 'Quadra Kill', or 'Invincible'. "
-    "If any of these are present, answer 'Yes'. Otherwise, answer 'No'. "
-    "Do not provide any explanation."
-    )
+    prompt = input_prompt
 
-    system_prompt = "You are a video game expert identifier."
+    if args.language == "CHN":
+        system_prompt = "你是一位专业的游戏视觉识别专家。"
+    else:
+        system_prompt = "You are a video game expert identifier."
 
     start_scan_time = 280 if duration > 280 else 0
     scan_range = list(range(start_scan_time, int(duration), segment_length))
@@ -234,19 +258,15 @@ async def analyze_video(video_path):
     # Iterate
     bg_tasks = []
     recent_clips = []
-
+    slots = None
     for i, start_sec in enumerate(scan_range):
-        
-        timestamp = f"[{start_sec}s - {start_sec + segment_length}s]"
-        
+                
         slider_val = int((i / total_steps) * 100)
-        #yield log_output, current_sys_log, gr.skip(), slider_val
                 
         # Prepare Frames
         start_frame = int(start_sec * fps)
         end_sec = min(start_sec + segment_length, duration)
         end_frame = int(end_sec * fps)
-        
         indices = list(range(start_frame, end_frame, step))
 
         #batch_frames = vr.get_batch(indices).asnumpy()
@@ -254,23 +274,8 @@ async def analyze_video(video_path):
         batch_frames = batch_frames.asnumpy()
         frames = [Image.fromarray(f) for f in batch_frames]
 
-        # Prepare Msgs
-        # msgs = [{'role': 'user', 'content': frames + [prompt]}]
-
         # Inference
         with torch.inference_mode():
-            '''
-            answer = await asyncio.to_thread(
-                caption_model.chat,
-                image=None,
-                msgs=msgs,
-                tokenizer=caption_tokenizer,
-                sampling=False,
-                temperature=0.0,
-                max_slice_nums=1,
-                use_image_id=False
-            )
-            '''
             answer, confidence = batched_minicpm_inference(
                 caption_model, 
                 caption_tokenizer, 
@@ -285,33 +290,72 @@ async def analyze_video(video_path):
     
         
         # HIT FOUND logic
-        if "Yes" in answer:
-            new_entry = f"{timestamp} 🎯 FOUND MATCH\nResponse: {answer}\n----------------\n"
-            log_output = new_entry + log_output
-            
-            # 1. Generate filename
-            clip_name = f"highlight_{start_sec}_{end_sec}.mp4"
-            clip_path = os.path.join(OUTPUT_FOLDER, clip_name)
-            
-            # 2. Slice the video using FFMPEG
-            #cut_clip(video_path, start_sec, end_sec, clip_path)
-            task = asyncio.create_task(async_cut_clip(video_path, start_sec, end_sec, clip_path))
-            bg_tasks.append(task)
-            bg_tasks = [t for t in bg_tasks if not t.done()]
+        if sum(answer == yes_token_id) > 0:
 
+            hit_mask = (answer.cpu() == yes_token_id)
+            #timestamp = torch.tensor(list(range(int(start_sec), int(end_sec), 1)))[hit_mask]
+            # ✅ New Code (Dynamic Length)
+            # We generate exactly as many timestamps as we have mask items
+            num_frames = hit_mask.shape[0]
+            timestamp = torch.tensor([int(start_sec) + i for i in range(num_frames)])[hit_mask]
+            timestamp_conf = confidence[hit_mask].mean().cpu().item()
 
-            # --- LIST LOGIC ---
-            # Insert new clip at the FRONT (Index 0)
-            recent_clips.insert(0, clip_path)
+            # --- [CASE A] OVERLAP DETECTED: EXTEND VIDEO ---
+            if start_sec == prev_end_sec:
+                # 1. Extend the end time
+                prev_end_sec = end_sec
                 
-            # Keep only top 3 (Trim the end)
-            recent_clips = recent_clips[:3]
+                # 2. Update Log
+                log_output = f"🔗 Extending Clip: Now {prev_start_sec}s - {prev_end_sec}s\n" + log_output
                 
-            # Pad with None if we have fewer than 3 clips (e.g. [clip1, None, None])
+                # 3. Generate NEW filename for the LONGER duration
+                # Note: We use the OLD start time (prev_start_sec) and NEW end time
+                clip_name = f"highlight_{prev_start_sec}_{prev_end_sec}.mp4"
+                clip_path = os.path.join(OUTPUT_FOLDER, clip_name)
+                
+                # 4. Re-cut the video (Overwrite the visual experience)
+                await async_cut_clip(video_path, prev_start_sec, prev_end_sec, clip_path)
+
+                # 5. Update UI List (Replace the top item, DO NOT shift others)
+                if recent_clips:
+                    recent_clips[0] = clip_path
+                else:
+                    recent_clips.append(clip_path)
+
+            # --- [CASE B] NO OVERLAP: NEW CLIP ---
+            else:
+                # 1. Start new tracking
+                prev_end_sec = end_sec
+                prev_start_sec = start_sec
+                
+                # 2. Update Log
+                new_entry = f"{timestamp} 🎯 NEW MATCH FOUND \n Confidence: {100 * timestamp_conf:.1f}%\n----------------\n"
+                log_output = new_entry + log_output
+
+                # 3. Generate filename
+                clip_name = f"highlight_{start_sec}_{end_sec}.mp4"
+                clip_path = os.path.join(OUTPUT_FOLDER, clip_name)
+                
+                # 4. Cut
+                await async_cut_clip(video_path, start_sec, end_sec, clip_path)
+
+                # 5. Push to Stack (Insert at top)
+                recent_clips.insert(0, clip_path)
+                recent_clips = recent_clips[:3]
+
+            # --- COMMON CLEANUP & YIELD ---
+            
+            # Pad slots with None if we have fewer than 3 clips
             slots = recent_clips + [None] * (3 - len(recent_clips))
 
-            # 3. Yield BOTH the log and the new video path
+            # Yield updated state
             yield log_output, slots[0], slots[1], slots[2], slider_val
+
+        else:
+            if slots is None:
+                yield log_output, None, None, None, slider_val
+            else:
+                yield log_output, slots[0], slots[1], slots[2], slider_val
         
     log_output += "\nAnalysis Complete."
 
@@ -322,12 +366,33 @@ async def analyze_video(video_path):
 
 # --- 3. GUI LAYOUT ---
 
+if args.language == "CHN":
+    DEFAULT_PROMPT = (
+        "分析这些画面，检测是否存在类似 '首胜'、'2连胜'、'3连胜'、'4连胜' 或 '无敌' 的文字横幅。"
+        "请忽略画面中的其他所有横幅或文字。"
+        "如果存在上述任意一种，请回答 'Yes'。否则，请回答 'No'。不要提供任何解释。"
+    )
+else:
+    DEFAULT_PROMPT = (
+        "Analyze these frames for text banners like 'First Blood', 'Double Kill', "
+        "'Triple Kill', 'Quadra Kill', or 'Invincible'. "
+        "If any of these are present, answer 'Yes'. Otherwise, answer 'No'. "
+        "Do not provide any explanation."
+    )
+
 with gr.Blocks() as demo:
-    gr.Markdown("## Naraka Bladepoint Gaming Highlight Detector (永劫无间精彩视频切片工具)")
-    
+    gr.Markdown("## Naraka Bladepoint Gaming Highlight Detector (永劫无间精彩视频切片工具)")    
     with gr.Row():
         with gr.Column(scale=1):
             video_input = gr.Video(label="1. Upload Gameplay (输入玩家视频)")
+            
+            prompt_input = gr.Textbox(
+                label="Custom Prompt (自定义提示词)", 
+                value=DEFAULT_PROMPT, 
+                lines=5,
+                info="Enter your own instruction here."
+            )
+
             progress_bar = gr.Slider(0, 100, value=0, label="Progress Bar (%)", interactive=False)
 
             btn = gr.Button("🚀 Find Highlights (开始分析)", variant="primary")
@@ -348,7 +413,7 @@ with gr.Blocks() as demo:
                         label="2. 🔥 Newest Hit (最新高光时刻)",
                         autoplay=False,
                         interactive=False,
-                        height=400  # Increased to match the stack on the right
+                        height=420  # Increased to match the stack on the right
                     )
 
                 # scale=1 makes this a sidebar
@@ -358,25 +423,23 @@ with gr.Blocks() as demo:
                         label="3. Previous",
                         autoplay=False,
                         interactive=False,
-                        height=200
+                        height=210
                     )
 
                     v3 = gr.Video(
                         label="4. Oldest",
                         autoplay=False,
                         interactive=False,
-                        height=200
+                        height=210
                     )
     
             # The new video box for hits
-            #highlight_output = gr.Video(label="2. Latest Highlight Preview (最新高光时刻)", autoplay=False)
             output_log = gr.Textbox(label="5. Analysis Log (日志)", lines=15, interactive=False)
-
             
     # Action 1: Start Analysis
     btn.click(
         fn=analyze_video, 
-        inputs=video_input, 
+        inputs=[video_input, prompt_input], 
         outputs=[output_log, v1, v2, v3, progress_bar]
     )
 
@@ -386,6 +449,7 @@ theme = gr.themes.Glass(primary_hue="sky", radius_size="lg", font=[gr.themes.Goo
         block_background_fill_dark="#1e293b"
         )
 if __name__ == "__main__":
+
     demo.queue().launch(server_name="0.0.0.0", 
         server_port=7860,
         theme=theme,
