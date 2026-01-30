@@ -14,10 +14,14 @@ from copy import deepcopy
 from PIL import Image
 from decord import VideoReader, cpu
 from transformers import AutoModel, AutoTokenizer, AutoProcessor
+from torch.utils.data import Dataset, DataLoader
 
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
 ### TO DO ###
-# accelerate with vLLM
-# video naration
+# try flash attn
+# video narration
 # do up DPO
 ### END OF TODO A###
 '''
@@ -28,13 +32,12 @@ async 409.36
 resolution 372.78
 step30  357.2
 yesno: 176.11
-'''
+dataloader:
+
 # --- REFERENCE CODE
 # https://huggingface.co/openbmb/MiniCPM-V-2_6-int4/blob/main/modeling_minicpmv.py
+# Link: http://127.0.0.1:7860/?__theme=dark
 
-'''
-Analyze these frames for text banners like '首胜', '2连胜', '3连胜', '4连胜', or '无敌'. If any of these are present, answer 'Yes'. Otherwise, answer 'No'. Do not provide any explanation.
-Analyze these frames for text banners in the upper right corner with player names indicating kills. If any of these are kills, answer 'Yes'. Otherwise, answer 'No'. Do not provide any explanation.
 '''
 # --- CONFIGURATION ---
 USE_BACKBONE = "Mini"
@@ -78,6 +81,7 @@ try:
         trust_remote_code=True, 
         dtype=torch.bfloat16,
         device_map=device,
+        _attn_implementation="flash_attention_2"
         #low_cpu_mem_usage=True
     )
     
@@ -116,6 +120,49 @@ async def async_cut_clip(input_path, start_sec, end_sec, output_path):
         stderr=asyncio.subprocess.DEVNULL
     )
     await process.wait()
+    return output_path
+
+async def async_stitch_videos(video_paths, output_path):
+    """Stitches multiple video files into one using ffmpeg concat."""
+    if not video_paths:
+        return None
+        
+    # 1. Create a text file list for ffmpeg
+    # FIX: Use Absolute Paths to avoid 'File not found' errors in subdirectories
+    list_path = output_path.replace(".mp4", ".txt")
+    with open(list_path, "w", encoding='utf-8') as f:
+        for v in video_paths:
+            abs_path = os.path.abspath(v)
+            # Escape single quotes in path
+            safe_path = abs_path.replace("'", "'\\''") 
+            f.write(f"file '{safe_path}'\n")
+    
+    # 2. Run FFmpeg Concat (Copy mode = Fast)
+    cmd = [
+        "ffmpeg", "-y",
+        "-f", "concat",
+        "-safe", "0",
+        "-i", list_path,
+        "-c", "copy",
+        output_path
+    ]
+    
+    process = await asyncio.create_subprocess_exec(
+        *cmd, 
+        stdout=asyncio.subprocess.PIPE, 
+        stderr=asyncio.subprocess.PIPE
+    )
+    stdout, stderr = await process.communicate()
+    
+    # 3. Cleanup text file
+    if os.path.exists(list_path):
+        os.remove(list_path)
+
+    # 4. Check for errors
+    if process.returncode != 0:
+        print(f"❌ Stitching Failed:\n{stderr.decode()}")
+        return None
+        
     return output_path
 
 def cut_clip(input_path, start_sec, end_sec, output_path):
@@ -214,6 +261,41 @@ def batched_minicpm_inference(
         confidence, response = probs.max(1)
         return response, confidence
 
+class VideoSegmentDataset(Dataset):
+    def __init__(self, video_path, segment_length, width=1280, height=720):
+        self.video_path = video_path
+        self.segment_length = segment_length
+        self.width = width
+        self.height = height
+        
+        vr = VideoReader(video_path, ctx=cpu(0))
+        self.fps = vr.get_avg_fps()
+        self.step = int(self.fps * 1) 
+        self.duration = len(vr) / self.fps
+        self.scan_range = list(range(0, int(self.duration), segment_length))
+        del vr
+
+    def __len__(self):
+        return len(self.scan_range)
+
+    def __getitem__(self, idx):
+        start_sec = self.scan_range[idx]
+        end_sec = min(start_sec + self.segment_length, self.duration)
+        
+        # Open NEW reader for this process (Thread-safe)
+        vr = VideoReader(self.video_path, ctx=cpu(0), width=self.width, height=self.height)
+        
+        start_frame = int(start_sec * self.fps)
+        end_frame = int(end_sec * self.fps)
+        indices = list(range(start_frame, end_frame, self.step))
+        
+        # Fast Decode + Convert to PIL
+        batch_npy = vr.get_batch(indices).asnumpy()
+        frames = [Image.fromarray(f, mode='RGB') for f in batch_npy]
+        
+        return frames, start_sec, end_sec
+
+
 # --- MAIN ---
 async def analyze_video(video_path, input_prompt):
     gr.Info("Starting Process ⏳ (开始)")
@@ -230,17 +312,16 @@ async def analyze_video(video_path, input_prompt):
     log_output = "Starting Analysis...\n"
     yield log_output, None, None, None, 0
 
-    # Setup Video Reader
-    vr = VideoReader(video_path,
-        ctx=cpu(0),
-        width=1280,
-        height=720
-        )
+    dataset = VideoSegmentDataset(video_path, segment_length=20)
+    dataloader = DataLoader(
+        dataset, 
+        batch_size=1, 
+        shuffle=False, 
+        num_workers=4, 
+        prefetch_factor=2,
+        collate_fn=lambda x: x[0]
+    )
 
-    fps = vr.get_avg_fps()
-    duration = len(vr) / fps
-    segment_length = 20
-    step = int(fps)      
     prev_start_sec = -100
     prev_end_sec = -100
 
@@ -251,29 +332,16 @@ async def analyze_video(video_path, input_prompt):
     else:
         system_prompt = "You are a video game expert identifier."
 
-    start_scan_time = 280 if duration > 280 else 0
-    scan_range = list(range(start_scan_time, int(duration), segment_length))
-    total_steps = len(scan_range)
+    total_steps = dataset.__len__()
     
     # Iterate
-    bg_tasks = []
+    all_detected_clips = [] # Keeps ALL clips for stitching
     recent_clips = []
-    slots = None
-    for i, start_sec in enumerate(scan_range):
+    slots = [None, None, None]
+    for i, (frames, start_sec, end_sec) in enumerate(dataloader):
                 
         slider_val = int((i / total_steps) * 100)
                 
-        # Prepare Frames
-        start_frame = int(start_sec * fps)
-        end_sec = min(start_sec + segment_length, duration)
-        end_frame = int(end_sec * fps)
-        indices = list(range(start_frame, end_frame, step))
-
-        #batch_frames = vr.get_batch(indices).asnumpy()
-        batch_frames = await asyncio.to_thread(vr.get_batch, indices)
-        batch_frames = batch_frames.asnumpy()
-        frames = [Image.fromarray(f) for f in batch_frames]
-
         # Inference
         with torch.inference_mode():
             answer, confidence = batched_minicpm_inference(
@@ -290,12 +358,11 @@ async def analyze_video(video_path, input_prompt):
     
         
         # HIT FOUND logic
-        if sum(answer == yes_token_id) > 0:
+        hit_mask = (answer.cpu() == yes_token_id)
+        timestamp_conf = confidence[hit_mask].mean().cpu().item()
+        if sum(hit_mask) > 0 and timestamp_conf > 0.65:
 
             hit_mask = (answer.cpu() == yes_token_id)
-            #timestamp = torch.tensor(list(range(int(start_sec), int(end_sec), 1)))[hit_mask]
-            # ✅ New Code (Dynamic Length)
-            # We generate exactly as many timestamps as we have mask items
             num_frames = hit_mask.shape[0]
             timestamp = torch.tensor([int(start_sec) + i for i in range(num_frames)])[hit_mask]
             timestamp_conf = confidence[hit_mask].mean().cpu().item()
@@ -314,13 +381,18 @@ async def analyze_video(video_path, input_prompt):
                 clip_path = os.path.join(OUTPUT_FOLDER, clip_name)
                 
                 # 4. Re-cut the video (Overwrite the visual experience)
-                await async_cut_clip(video_path, prev_start_sec, prev_end_sec, clip_path)
+                await async_cut_clip(video_path, prev_start_sec, timestamp.min().item() + 5, clip_path)
 
                 # 5. Update UI List (Replace the top item, DO NOT shift others)
                 if recent_clips:
                     recent_clips[0] = clip_path
                 else:
                     recent_clips.append(clip_path)
+
+                if all_detected_clips:
+                    all_detected_clips[-1] = clip_path
+                else:
+                    all_detected_clips.append(clip_path)
 
             # --- [CASE B] NO OVERLAP: NEW CLIP ---
             else:
@@ -334,31 +406,36 @@ async def analyze_video(video_path, input_prompt):
 
                 # 3. Generate filename
                 clip_name = f"highlight_{start_sec}_{end_sec}.mp4"
+                #clip_name = f"highlight_{timestamp.min().item()}_{end_sec}.mp4"
                 clip_path = os.path.join(OUTPUT_FOLDER, clip_name)
                 
                 # 4. Cut
-                await async_cut_clip(video_path, start_sec, end_sec, clip_path)
+                #await async_cut_clip(video_path, start_sec, end_sec, clip_path)
+                await async_cut_clip(video_path, timestamp.min().item() - 10, timestamp.min().item() + 5, clip_path)
 
                 # 5. Push to Stack (Insert at top)
                 recent_clips.insert(0, clip_path)
                 recent_clips = recent_clips[:3]
+
+                all_detected_clips.append(clip_path)
 
             # --- COMMON CLEANUP & YIELD ---
             
             # Pad slots with None if we have fewer than 3 clips
             slots = recent_clips + [None] * (3 - len(recent_clips))
 
-            # Yield updated state
-            yield log_output, slots[0], slots[1], slots[2], slider_val
-
-        else:
-            if slots is None:
-                yield log_output, None, None, None, slider_val
-            else:
-                yield log_output, slots[0], slots[1], slots[2], slider_val
+        # Yield updated state
+        yield log_output, slots[0], slots[1], slots[2], slider_val
         
     log_output += "\nAnalysis Complete."
 
+    if all_detected_clips:
+        compilation_name = f"full_highlights.mp4"
+        final_compilation_path = os.path.join(OUTPUT_FOLDER, compilation_name)
+        await async_stitch_videos(all_detected_clips, final_compilation_path)
+
+        slots = [final_compilation_path] + (recent_clips[:2] if recent_clips else [None, None])
+        log_output += "\n🎥 Final video compiled...\n"
     gr.Info("Process complete, you can download your videos! \n (切片成功，您可以下载视频了)")
     t2 = time.time()
     print("Total time:", t2 - t1)
