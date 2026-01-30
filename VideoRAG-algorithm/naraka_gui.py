@@ -13,17 +13,19 @@ import argparse
 from copy import deepcopy
 from PIL import Image
 from decord import VideoReader, cpu
-from transformers import AutoModel, AutoTokenizer, AutoProcessor
+from transformers import AutoModel, AutoTokenizer, AutoModelForSpeechSeq2Seq, AutoModelForVision2Seq, AutoProcessor, pipeline
 from torch.utils.data import Dataset, DataLoader
+from qwen_vl_utils import process_vision_info
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
+
 ### TO DO ###
-# try flash attn
 # video narration
 # do up DPO
-### END OF TODO A###
+### END OF TO DO ###
+
 '''
 GUI Experiments Times
 Start 786.3
@@ -70,6 +72,47 @@ if os.path.exists(OUTPUT_FOLDER):
 # Ensure output folder exists
 os.makedirs(OUTPUT_FOLDER, exist_ok=True)
 
+class QwenVLWrapper:
+    def __init__(self, model, tokenizer):
+        self.model = model
+        self.tokenizer = tokenizer
+
+    def chat(self, msgs: str, **kwargs):
+        image_inputs, video_inputs, video_kwargs = process_vision_info([msgs], return_video_kwargs=True, 
+                                                                       image_patch_size=16,
+                                                                       return_video_metadata=True)
+        text = self.tokenizer.apply_chat_template(
+            msgs,
+            tokenize=False,
+            add_generation_prompt=True
+        )
+
+        if video_inputs is not None:
+            video_inputs, video_metadatas = zip(*video_inputs)
+            video_inputs, video_metadatas = list(video_inputs), list(video_metadatas)
+        else:
+            video_metadatas = None
+
+        inputs = self.tokenizer(text=[text], images=image_inputs, videos=video_inputs, video_metadata=video_metadatas, **video_kwargs, do_resize=False, return_tensors="pt")
+        
+        #model_inputs = self.tokenizer([text], return_tensors="pt").to("cuda")
+        
+        with torch.no_grad():
+            generated_ids = self.model.generate(
+                **inputs.to("cuda"),
+                max_new_tokens=2048,
+                do_sample=False,
+                temperature=0.0
+            )
+        generated_ids_trimmed = [
+            out_ids[len(in_ids) :] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
+            ]
+        output_text = self.tokenizer.batch_decode(
+            generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
+            )
+
+        return output_text[0]
+
 # --- 1. SETUP MODEL (Global Load) ---
 print(f"Loading Caption Model ({USE_BACKBONE})... please wait.")
 try:
@@ -93,13 +136,23 @@ try:
     processor = AutoProcessor.from_pretrained(MODEL_PATH, trust_remote_code=True)
     yes_token_id = caption_tokenizer.encode("Yes", add_special_tokens=False)[0]
     no_token_id = caption_tokenizer.encode("No", add_special_tokens=False)[0]
-    
-    print("Model loaded successfully!")
+    print("Caption Model loaded successfully!")
+
+    final_model = AutoModelForVision2Seq.from_pretrained(
+            "Qwen/Qwen3-VL-8B-Instruct", 
+            device_map="auto", 
+            dtype=torch.bfloat16,
+            trust_remote_code=True).eval()
+    final_tokenizer = AutoProcessor.from_pretrained("Qwen/Qwen3-VL-8B-Instruct", pad_token='<|endoftext|>')
+    final_model = QwenVLWrapper(final_model, final_tokenizer)
+    print("Final QWEN3-VL Model loaded successfully!")
 
 except Exception as e:
     print(f"Error loading model: {e}")
     caption_model = None
     caption_tokenizer = None
+    final_model = None
+    final_tokenizer = None
 
 # --- HELPER: Cut Video Clip ---
 async def async_cut_clip(input_path, start_sec, end_sec, output_path):
@@ -186,6 +239,56 @@ def load_dummy_video():
         return DUMMY_VIDEO_PATH
     else:
         return None
+
+
+# --- HELPER: Generate Commentary ---
+async def generate_commentary(video_path):
+    """
+    Uses Qwen3-VL to generate an Esports Shoutcaster style commentary.
+    """
+    
+    PROMPT = """
+    Act as a world-class Esports Shoutcaster (like for Dota 2). 
+    Your job is to hype up the audience for the game Naraka Bladepoint!
+
+    Guidelines:
+    1. SCREAM (use caps) for big moments like 'Double Kill' or big hits.
+    2. Focus strictly on the ACTION and MECHANICS. Don't describe the colors of the trees.
+    3. Use gamer terminology: "Clutch," "Melted," "Jukes," "Frame perfect," "Loadout swap."
+    4. When the player opens the inventory, comment on their build strategy briefly, don't list every item.
+    5. Keep it punchy! Short sentences! Fast pace!
+    """
+
+    msgs = [
+            {
+                "role": "user", 
+                "content": [
+                    {
+                    "type": "video",
+                    "video": video_path,
+                    "total_pixels": 1280 * 28 * 28, # Reduced for speed (was 20480*32*32)
+                    "min_pixels": 256 * 28 * 28, 
+                    "fps": 1.0, # Use FPS instead of sample_fps for smoother control
+                   # "max_frames": 128, # Optional: Limit max frames if needed
+
+                    },
+                    {"type": "text", "text": PROMPT},
+                ]
+            },
+        ]
+    
+    answer = final_model.chat(
+                image=None,
+                msgs=msgs,
+                tokenizer=final_tokenizer,
+                sampling=False,
+                temperature=0.0,
+                max_slice_nums=1,
+                use_image_id=False
+        )
+    print(answer)
+    
+    return answer
 
 def batched_minicpm_inference(
         model, 
@@ -436,6 +539,15 @@ async def analyze_video(video_path, input_prompt):
 
         slots = [final_compilation_path] + (recent_clips[:2] if recent_clips else [None, None])
         log_output += "\n🎥 Final video compiled...\n"
+
+        # --- Qwen3 Commentary ---
+        log_output += "\n🎙️ Generating Commentary...\n"
+        yield log_output, slots[0], slots[1], slots[2], 100 
+        
+        #commentary = await generate_commentary(final_compilation_path)
+        #log_output += f"\n🗣️ [Shoutcaster]:\n{commentary}\n"
+
+
     gr.Info("Process complete, you can download your videos! \n (切片成功，您可以下载视频了)")
     t2 = time.time()
     print("Total time:", t2 - t1)
