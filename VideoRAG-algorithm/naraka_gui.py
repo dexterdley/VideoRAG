@@ -4,6 +4,7 @@ import logging
 import torch
 import tqdm
 import time
+import pandas as pd
 import numpy as np
 import asyncio
 import gradio as gr
@@ -23,6 +24,7 @@ torch.backends.cudnn.allow_tf32 = True
 
 ### TO DO ###
 # video narration
+# add confidence curves and analysis
 # do up DPO
 ### END OF TO DO ###
 
@@ -34,7 +36,7 @@ async 409.36
 resolution 372.78
 step30  357.2
 yesno: 176.11
-dataloader:
+dataloader: 101.3
 
 # --- REFERENCE CODE
 # https://huggingface.co/openbmb/MiniCPM-V-2_6-int4/blob/main/modeling_minicpmv.py
@@ -125,7 +127,6 @@ try:
         dtype=torch.bfloat16,
         device_map=device,
         _attn_implementation="flash_attention_2"
-        #low_cpu_mem_usage=True
     )
     
     caption_tokenizer = AutoTokenizer.from_pretrained(
@@ -138,14 +139,15 @@ try:
     no_token_id = caption_tokenizer.encode("No", add_special_tokens=False)[0]
     print("Caption Model loaded successfully!")
 
-    final_model = AutoModelForVision2Seq.from_pretrained(
-            "Qwen/Qwen3-VL-8B-Instruct", 
-            device_map="auto", 
-            dtype=torch.bfloat16,
-            trust_remote_code=True).eval()
-    final_tokenizer = AutoProcessor.from_pretrained("Qwen/Qwen3-VL-8B-Instruct", pad_token='<|endoftext|>')
-    final_model = QwenVLWrapper(final_model, final_tokenizer)
-    print("Final QWEN3-VL Model loaded successfully!")
+    if False:
+        final_model = AutoModelForVision2Seq.from_pretrained(
+                "Qwen/Qwen3-VL-8B-Instruct", 
+                device_map="auto", 
+                dtype=torch.bfloat16,
+                trust_remote_code=True).eval()
+        final_tokenizer = AutoProcessor.from_pretrained("Qwen/Qwen3-VL-8B-Instruct", pad_token='<|endoftext|>')
+        final_model = QwenVLWrapper(final_model, final_tokenizer)
+        print("Final QWEN3-VL Model loaded successfully!")
 
 except Exception as e:
     print(f"Error loading model: {e}")
@@ -361,7 +363,10 @@ def batched_minicpm_inference(
         
         # response = caption_tokenizer.batch_decode(probs.argmax(1))
         # confidence = probs.max(1).values
-        confidence, response = probs.max(1)
+        # import pdb; pdb.set_trace()
+        # confidence, response = probs.max(1)
+        response = probs.argmax(1)
+        confidence = probs[:,yes_token_id]
         return response, confidence
 
 class VideoSegmentDataset(Dataset):
@@ -371,7 +376,7 @@ class VideoSegmentDataset(Dataset):
         self.width = width
         self.height = height
         
-        vr = VideoReader(video_path, ctx=cpu(0))
+        vr = VideoReader(video_path, ctx=cpu(0), width=self.width, height=self.height)
         self.fps = vr.get_avg_fps()
         self.step = int(self.fps * 1) 
         self.duration = len(vr) / self.fps
@@ -404,21 +409,30 @@ async def analyze_video(video_path, input_prompt):
     gr.Info("Starting Process ⏳ (开始)")
     t1 = time.time()
     if not video_path:
-        yield "Please upload a video.", None, None, None, 0
+        yield "Please upload a video.", None, None, None, None, 0
         return
     
     if caption_model is None:
-        yield "Error: Model failed to load.", None, None, None, 0
+        yield "Error: Model failed to load.", None, None, None, None, 0
         return
 
     # --- Start and Initialize Log ---
     log_output = "Starting Analysis...\n"
-    yield log_output, None, None, None, 0
+    
+    # Initialize to store running data
+    plot_df = pd.DataFrame(columns=["Time (s)", "Confidence"])
+    history_time = []
+    history_conf = []
 
-    dataset = VideoSegmentDataset(video_path, segment_length=20)
+    yield log_output, None, None, None, None, 0
+
+    await asyncio.sleep(0.01)
+
+    dataset = await asyncio.to_thread(VideoSegmentDataset, video_path, segment_length=20)
+
     dataloader = DataLoader(
         dataset, 
-        batch_size=1, 
+        batch_size=1,
         shuffle=False, 
         num_workers=4, 
         prefetch_factor=2,
@@ -458,15 +472,20 @@ async def analyze_video(video_path, input_prompt):
                 msgs_template=[{"role": "user", "content": prompt}],
                 system_prompt=system_prompt
             )
-    
-        
+
+        num_frames = answer.shape[0]
+
+        batch_times = [int(start_sec) + k for k in range(num_frames)]
+        history_time.extend(batch_times)
+        history_conf.extend(confidence.tolist())
+        plot_df = pd.DataFrame({"Time (s)": history_time, "Confidence": history_conf})
+
         # HIT FOUND logic
         hit_mask = (answer.cpu() == yes_token_id)
         timestamp_conf = confidence[hit_mask].mean().cpu().item()
         if sum(hit_mask) > 0 and timestamp_conf > 0.65:
 
             hit_mask = (answer.cpu() == yes_token_id)
-            num_frames = hit_mask.shape[0]
             timestamp = torch.tensor([int(start_sec) + i for i in range(num_frames)])[hit_mask]
             timestamp_conf = confidence[hit_mask].mean().cpu().item()
 
@@ -528,7 +547,8 @@ async def analyze_video(video_path, input_prompt):
             slots = recent_clips + [None] * (3 - len(recent_clips))
 
         # Yield updated state
-        yield log_output, slots[0], slots[1], slots[2], slider_val
+        yield log_output, slots[0], slots[1], slots[2], plot_df, slider_val
+        await asyncio.sleep(0.001)
         
     log_output += "\nAnalysis Complete."
 
@@ -541,8 +561,8 @@ async def analyze_video(video_path, input_prompt):
         log_output += "\n🎥 Final video compiled...\n"
 
         # --- Qwen3 Commentary ---
-        log_output += "\n🎙️ Generating Commentary...\n"
-        yield log_output, slots[0], slots[1], slots[2], 100 
+        #log_output += "\n🎙️ Generating Commentary...\n"
+        #yield log_output, slots[0], slots[1], slots[2], plot_df, 100 
         
         #commentary = await generate_commentary(final_compilation_path)
         #log_output += f"\n🗣️ [Shoutcaster]:\n{commentary}\n"
@@ -551,7 +571,7 @@ async def analyze_video(video_path, input_prompt):
     gr.Info("Process complete, you can download your videos! \n (切片成功，您可以下载视频了)")
     t2 = time.time()
     print("Total time:", t2 - t1)
-    yield log_output, slots[0], slots[1], slots[2], 100
+    yield log_output, slots[0], slots[1], slots[2], plot_df, 100
 
 # --- 3. GUI LAYOUT ---
 
@@ -621,15 +641,26 @@ with gr.Blocks() as demo:
                         interactive=False,
                         height=210
                     )
-    
-            # The new video box for hits
+            
+            # The boxes for hits
+            score_plot = gr.LinePlot(
+                x="Time (s)",
+                y="Confidence",
+                title="Real-time Detection Confidence (大模分析自信)",
+                x_title="Time (Seconds)",
+                y_title="Confidence Score",
+                y_lim=[0, 1.05], # Fix y-axis range
+                tooltip=["Time (s)", "Confidence"],
+                height=300,
+            )
+
             output_log = gr.Textbox(label="5. Analysis Log (日志)", lines=15, interactive=False)
             
     # Action 1: Start Analysis
     btn.click(
         fn=analyze_video, 
         inputs=[video_input, prompt_input], 
-        outputs=[output_log, v1, v2, v3, progress_bar]
+        outputs=[output_log, v1, v2, v3, score_plot, progress_bar]
     )
 
 theme = gr.themes.Glass(primary_hue="sky", radius_size="lg", font=[gr.themes.GoogleFont("Inconsolata"), "Arial", "sans-serif"]).set(
@@ -639,7 +670,7 @@ theme = gr.themes.Glass(primary_hue="sky", radius_size="lg", font=[gr.themes.Goo
         )
 if __name__ == "__main__":
 
-    demo.queue().launch(server_name="0.0.0.0", 
+    demo.launch(server_name="0.0.0.0", 
         server_port=7860,
         theme=theme,
         allowed_paths=["/home/dexter/LLaVA-VLS/playground/demo/"]
