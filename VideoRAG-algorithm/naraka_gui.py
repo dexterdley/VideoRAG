@@ -329,7 +329,7 @@ def batched_minicpm_inference(
                     
             if system_prompt:
                 msgs.insert(0, {'role': 'system', 'content': system_prompt})
-        
+
             prompt_str = processor.tokenizer.apply_chat_template(
                 msgs, 
                 tokenize=False, 
@@ -338,7 +338,7 @@ def batched_minicpm_inference(
             
             prompts_lists.append(prompt_str)
             input_images_lists.append(current_images)
-                
+
         inputs = processor(
             prompts_lists, 
             input_images_lists, 
@@ -347,7 +347,7 @@ def batched_minicpm_inference(
             return_tensors="pt", 
             max_length=2048
         ).to(caption_model.device)
-        
+
         if "position_ids" not in inputs:
             batch_size, seq_len = inputs["input_ids"].shape
             # Create simple sequential positions [0, 1, 2, ... seq_len]
