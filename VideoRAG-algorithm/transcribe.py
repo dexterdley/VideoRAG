@@ -59,6 +59,13 @@ def save_transcript(transcript, output_path):
     with open(output_path, "w", encoding="utf-8") as f:
         f.write(transcript)
     print(f"💾 Transcript saved to: {output_path}")
+
+def read_transcript(file_path):
+    """Read transcript from a text file and return its content as a string."""
+    with open(file_path, "r", encoding="utf-8") as f:
+        transcript = f.read()
+    return transcript
+    
 ### End of Helper functions
 
 async def analyze_with_llm(transcript, prompt=None, analysis_mode="conservative"):
