@@ -1,7 +1,12 @@
 downloads/
 highlights_found/
+checkpoints/
+./VSLICE/checkpoints/
+processed_dataset/
 .MiniCPM-V-2_6-int4/
 MiniCPM-V-2_6-int4/
+VideoRAG-algorithm/asr_naraka_working.ipynb
+VideoRAG-algorithm/VSLICE_agent.ipynb
 .ipynb_checkpoints/
 *.json
 *.mp4
