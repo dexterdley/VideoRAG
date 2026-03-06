@@ -116,11 +116,71 @@ class TemporalTransformerHead(nn.Module):
         return scores
 
 
+class TemporalLSTMHead(nn.Module):
+    """
+    Bidirectional LSTM temporal head.
+    Captures both forward and backward temporal context.
+    ~5M parameters.
+    """
+    def __init__(self, feat_dim=4096, hidden=256, num_layers=2, dropout=0.1):
+        super().__init__()
+        self.proj = nn.Linear(feat_dim, hidden)
+        self.lstm = nn.LSTM(
+            input_size=hidden,
+            hidden_size=hidden,
+            num_layers=num_layers,
+            batch_first=True,
+            bidirectional=True,
+            dropout=dropout if num_layers > 1 else 0.0,
+        )
+        self.layer_norm = nn.LayerNorm(hidden * 2)  # *2 for bidirectional
+        self.dropout = nn.Dropout(dropout)
+        self.head = nn.Sequential(
+            nn.Linear(hidden * 2, 64),
+            nn.ReLU(),
+            nn.Linear(64, 1),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, features, mask=None):
+        """
+        Args:
+            features: [B, T, D] query-conditioned VLM features
+            mask: [B, T] bool, True for valid frames
+        Returns:
+            scores: [B, T] engagement scores in [0, 1]
+        """
+        x = self.proj(features)                      # [B, T, hidden]
+
+        # Pack padded sequences for efficient LSTM processing
+        if mask is not None:
+            lengths = mask.sum(dim=1).cpu()           # [B]
+            packed = nn.utils.rnn.pack_padded_sequence(
+                x, lengths, batch_first=True, enforce_sorted=False
+            )
+            packed_out, _ = self.lstm(packed)
+            x, _ = nn.utils.rnn.pad_packed_sequence(
+                packed_out, batch_first=True, total_length=features.shape[1]
+            )
+        else:
+            x, _ = self.lstm(x)                      # [B, T, hidden*2]
+
+        x = self.layer_norm(x)
+        x = self.dropout(x)
+        scores = self.head(x).squeeze(-1)            # [B, T]
+
+        if mask is not None:
+            scores = scores * mask.float()
+        return scores
+
+
 def build_model(arch="conv", feat_dim=4096, **kwargs):
     """Factory function to build a temporal engagement head."""
     if arch == "conv":
         return TemporalConvHead(feat_dim=feat_dim, **kwargs)
     elif arch == "transformer":
         return TemporalTransformerHead(feat_dim=feat_dim, **kwargs)
+    elif arch == "bi_lstm":
+        return TemporalLSTMHead(feat_dim=feat_dim, **kwargs)
     else:
         raise ValueError(f"Unknown architecture: {arch}")

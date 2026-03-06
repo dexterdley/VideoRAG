@@ -66,15 +66,37 @@ def check_heatmap(video_url, output_dir):
         "yt-dlp",
         "--skip-download",          # Don't download the video
         "--write-info-json",        # Just grab the metadata
-        "--no-overwrites",
-        "-o", os.path.join(output_dir, f"{video_id}.%(ext)s"),
+        "--no-overwrites", 
+        "-o", os.path.join(output_dir, video_id),
         video_url
     ]
     
     try:
-        subprocess.run(cmd, capture_output=True, check=True)
-    except subprocess.CalledProcessError:
-        return video_id, None
+        # Capture JSON directly from stdout
+        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        data = json.loads(result.stdout)
+        
+        heatmap = data.get('heatmap')
+        if heatmap and len(heatmap) > 0:
+            title = data.get('title', 'Unknown')
+            duration = data.get('duration') or 0 
+            return video_id, {"title": title, "duration": duration, "heatmap": heatmap}
+            
+    except subprocess.CalledProcessError as e:
+        # yt-dlp failed (likely a 403 Forbidden, PO Token error, or Bot Detection)
+        # Grab the last line of the stderr output to see the actual error
+        error_msg = e.stderr.strip().split('\n')[-1] if e.stderr else "Unknown error"
+        
+        # Only print the error if it's NOT a generic "Video unavailable"
+        if "Video unavailable" not in error_msg:
+             print(f"   ⚠️ yt-dlp blocked on {video_id}: {error_msg}")
+             
+    except json.JSONDecodeError:
+        pass
+    except Exception as e:
+        print(f"   ⚠️ Python error parsing {video_id}: {e}")
+        
+    return video_id, None
     
     # Check for heatmap in metadata
     if os.path.exists(info_json_path):
@@ -100,11 +122,11 @@ def download_video(video_url, video_id, output_dir):
     
     if has_ffmpeg:
         format_args = [
-            '-f', 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
+            '-f', 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best[vcodec!=av01]',
             '--merge-output-format', 'mp4'
         ]
     else:
-        format_args = ['-f', 'best[ext=mp4]']
+        format_args = ['-f', 'best[ext=mp4]/best[vcodec!=av01]']
     
     cmd = [
         "yt-dlp",

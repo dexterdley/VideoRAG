@@ -1,8 +1,9 @@
 #!/bin/bash
 set -e
+# dos2unix ./VSLICE/full_run.sh
 
-MODEL_PATH="./MiniCPM-V-2_6-int4"
-DOMAINS=("cat_vids" "naraka_vids" "trump_vids" "kamala_vids")
+MODEL_PATH=".checkpoints/MiniCPM-V-2_6-int4"
+DOMAINS=("cat_vids")
 COUNT=200
 # ============================================================
 # 1. Download videos with heatmaps
@@ -10,7 +11,7 @@ COUNT=200
 python ./VSLICE/yt_download.py "funniest cat videos" --count $COUNT --output ./downloads/cat_vids
 python ./VSLICE/yt_download.py "naraka bladepoint top expert gameplay" --count $COUNT --output ./downloads/naraka_vids
 python ./VSLICE/yt_download.py "president trump speech white house" --count $COUNT --output ./downloads/trump_vids
-python ./VSLICE/yt_download.py "president trump rally address" --count $COUNT --output ./downloads/trump_vids
+python ./VSLICE/yt_download.py "trump rally address" --count $COUNT --output ./downloads/trump_vids
 python ./VSLICE/yt_download.py "kamala harris speech rallies" --count $COUNT --output ./downloads/kamala_vids
 
 # ============================================================

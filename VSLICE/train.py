@@ -281,7 +281,7 @@ if __name__ == "__main__":
     parser.add_argument("--val_manifest", type=str, required=True)
     parser.add_argument("--features_dir", type=str, required=True)
     parser.add_argument("--output_dir", type=str, default="model_checkpoints")
-    parser.add_argument("--arch", type=str, default="transformer", choices=["conv", "transformer"])
+    parser.add_argument("--arch", type=str, default="transformer", choices=["conv", "bi_lstm", "transformer"])
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--lr", type=float, default=1e-3)

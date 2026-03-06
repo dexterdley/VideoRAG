@@ -12,9 +12,13 @@ import os
 import json
 import argparse
 import time
+import warnings
 import torch
 import numpy as np
 from PIL import Image
+
+warnings.filterwarnings("ignore", category=FutureWarning)
+warnings.filterwarnings("ignore", message=".*not a valid Python identifier.*")
 
 
 def load_vlm(model_path):
@@ -31,7 +35,6 @@ def load_vlm(model_path):
         dtype=dtype,
         device_map=device,
         attn_implementation="eager",
-        output_hidden_states=True,
     ).eval()
     
     tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
@@ -114,7 +117,8 @@ def extract_features_for_video(model, tokenizer, processor, device,
                 inputs["position_ids"] = torch.arange(seq_len, dtype=torch.long, device=device).unsqueeze(0).expand(batch_size_in, -1)
             
             with torch.inference_mode():
-                outputs = model(inputs, attention_mask=inputs.get("attention_mask"))
+                outputs = model(inputs, attention_mask=inputs.get("attention_mask"),
+                                output_hidden_states=True)
                 # Extract last hidden state, take mean over sequence
                 hidden = outputs.hidden_states[-1]  # [1, seq_len, D]
                 feat = hidden.mean(dim=1)            # [1, D]

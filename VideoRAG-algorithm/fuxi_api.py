@@ -22,8 +22,9 @@ DEFAULT_CONFIG = {
     "app_id": "fc35d142-5e91-4109-a94e-16a34460b6c6",
     "app_key": "petkqten1baaqrfre63i24msilll0l",
     "project_id": "big_world_agent_pid_for_flow_chart_tool",
-    "end_point": "http://aigc-api.apps-hangyan.danlu.netease.com/api/v2/text/chat",
-    "model_name": "gpt-4.1",
+    "bearer_app_key": "sk-g0v76xdnloEcXfp2jb9muWFuMphBt43T",
+    "end_point": "https://aigc-api.fuxi.netease.com/v1/chat/completions",
+    "model_name": "claude-opus-4-6",
     "max_answer_tokens": 32000,
 }
 
@@ -70,7 +71,7 @@ class FuxiAPI:
         request_body = {
             "messages": [{"role": "user", "content": prompt}],
             "model": model_name or self.model_name,
-            "maxTokens": self.max_answer_tokens,
+            "max_tokens": self.max_answer_tokens,
         }
 
         try:
@@ -79,12 +80,22 @@ class FuxiAPI:
                 if response.status == 200:
                     resp_data = await response.json()
                     status = resp_data.get("status", "")
+                    
+                    # Legacy Fuxi wrapper format
                     if status == "000000":
                         content = resp_data["detail"]["choices"][0]["message"]["content"]
                         usage = resp_data["detail"].get("usage", {})
                         print(f"✅ Tokens — prompt: {usage.get('promptTokens', '?')}, "
                               f"completion: {usage.get('completionTokens', '?')}, "
                               f"total: {usage.get('totalTokens', '?')}")
+                        return content
+                    # Standard OpenAI format (no wrapper)
+                    elif "choices" in resp_data:
+                        content = resp_data["choices"][0]["message"]["content"]
+                        usage = resp_data.get("usage", {})
+                        print(f"✅ Tokens — prompt: {usage.get('prompt_tokens', '?')}, "
+                              f"completion: {usage.get('completion_tokens', '?')}, "
+                              f"total: {usage.get('total_tokens', '?')}")
                         return content
                     else:
                         return f"❌ API error: {resp_data.get('desc', resp_data)}"
@@ -101,7 +112,7 @@ class FuxiAPI:
         request_body = {
             "messages": new_messages,
             "model": model_name or self.model_name,
-            "maxTokens": max_answer_tokens or self.max_answer_tokens,
+            "max_tokens": max_answer_tokens or self.max_answer_tokens,
         }
         request_body.update(kwargs)
 
@@ -111,6 +122,8 @@ class FuxiAPI:
                 if response.status == 200:
                     resp_data = await response.json()
                     status = resp_data.get("status", "")
+                    
+                    # Legacy Fuxi wrapper format
                     if status == "000000":
                         content = resp_data["detail"]["choices"][0]["message"]["content"]
                         tool_calls = resp_data["detail"]["choices"][0]["message"].get("tool_calls", [])
@@ -118,6 +131,15 @@ class FuxiAPI:
                         print(f"✅ Tokens — prompt: {usage.get('promptTokens', '?')}, "
                               f"completion: {usage.get('completionTokens', '?')}, "
                               f"total: {usage.get('totalTokens', '?')}")
+                        return content, tool_calls
+                    # Standard OpenAI format (no wrapper)
+                    elif "choices" in resp_data:
+                        content = resp_data["choices"][0]["message"]["content"]
+                        tool_calls = resp_data["choices"][0]["message"].get("tool_calls", [])
+                        usage = resp_data.get("usage", {})
+                        print(f"✅ Tokens — prompt: {usage.get('prompt_tokens', '?')}, "
+                              f"completion: {usage.get('completion_tokens', '?')}, "
+                              f"total: {usage.get('total_tokens', '?')}")
                         return content, tool_calls
                     else:
                         return f"❌ API error: {resp_data.get('desc', resp_data)}", []
