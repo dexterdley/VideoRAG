@@ -1,8 +1,8 @@
 #!/bin/bash
 set -e
 
-MODEL_PATH="./MiniCPM-V-2_6-int4/"
-DOMAINS=("cat_vids")
+MODEL_PATH=".checkpoints/MiniCPM-V-2_6-int4"
+DOMAINS=("rival_vids")
 COUNT=200
 
 # ============================================================
@@ -37,10 +37,10 @@ for domain in "${DOMAINS[@]}"; do
     echo "🏋️ Training conv on ${domain}"
     python ./VSLICE/train.py \
         --train_manifest="./processed_dataset/${domain}/train.json" \
-        --val_manifest="./processed_dataset/${domain}/val.json" \
+        --val_manifest="./processed_dataset/${domain}/train.json" \
         --features_dir="./processed_dataset/${domain}/features/" \
         --output_dir="./checkpoints/${domain}_conv" \
-        --arch conv --epochs 50 --lr 1e-3
+        --arch conv --epochs 100 --lr 5e-4
 done
 
 echo "✅ Full pipeline complete!"

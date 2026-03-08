@@ -91,14 +91,14 @@ def train_one_epoch(model, loader, optimizer, device, epoch):
         predicted = model(features, mask=mask)      # [B, T]
         
         # Regression loss (only on valid frames)
-        reg_loss = F.smooth_l1_loss(
+        reg_loss = F.mse_loss(
             predicted[mask], heatmap[mask], reduction="mean"
         )
         
         # Ranking loss
         rank_loss = ranking_loss(predicted, heatmap, mask, margin=0.2)
         
-        loss = reg_loss + 0.5 * rank_loss
+        loss = reg_loss + rank_loss
         
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -257,16 +257,6 @@ def train(args):
             "lr": f"{lr:.1e}",
         })
         
-        # Save checkpoint every 10 epochs
-        if epoch % 10 == 0:
-            torch.save({
-                "epoch": epoch,
-                "model_state_dict": model.state_dict(),
-                "optimizer_state_dict": optimizer.state_dict(),
-                "arch": args.arch,
-                "feat_dim": feat_dim,
-            }, os.path.join(args.output_dir, f"checkpoint_epoch{epoch}.pt"))
-    
     # Save training history
     with open(os.path.join(args.output_dir, "history.json"), "w") as f:
         json.dump(history, f, indent=2)
@@ -283,7 +273,7 @@ if __name__ == "__main__":
     parser.add_argument("--output_dir", type=str, default="model_checkpoints")
     parser.add_argument("--arch", type=str, default="transformer", choices=["conv", "bi_lstm", "transformer"])
     parser.add_argument("--epochs", type=int, default=50)
-    parser.add_argument("--batch_size", type=int, default=16)
+    parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--weight_decay", type=float, default=1e-4)
     parser.add_argument("--max_frames", type=int, default=300,

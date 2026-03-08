@@ -51,70 +51,48 @@ def search_youtube(topic, max_results=30):
 
 def check_heatmap(video_url, output_dir):
     """
-    Downloads ONLY the metadata JSON (no video) and checks for heatmap data.
-    Returns (video_id, heatmap_data) if heatmap exists, else (video_id, None).
+    Downloads ONLY the metadata JSON and checks for heatmap data.
     """
     video_id_match = re.search(r"(?:v=|\/|youtu\.be\/)([0-9A-Za-z_-]{11})", video_url)
     if not video_id_match:
         return None, None
     video_id = video_id_match.group(1)
     
+    # We define where the info json WILL be saved
     info_json_path = os.path.join(output_dir, f"{video_id}.info.json")
     
-    # Download metadata only (no video)
+    # cmd to write info json to disk
     cmd = [
         "yt-dlp",
-        "--skip-download",          # Don't download the video
-        "--write-info-json",        # Just grab the metadata
-        "--no-overwrites", 
+        "--skip-download",
+        "--write-info-json",
+        "--no-overwrites",
         "-o", os.path.join(output_dir, video_id),
         video_url
     ]
     
     try:
-        # Capture JSON directly from stdout
-        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
-        data = json.loads(result.stdout)
+        # Run silently
+        subprocess.run(cmd, capture_output=True, text=True, check=True)
         
-        heatmap = data.get('heatmap')
-        if heatmap and len(heatmap) > 0:
-            title = data.get('title', 'Unknown')
-            duration = data.get('duration') or 0 
-            return video_id, {"title": title, "duration": duration, "heatmap": heatmap}
-            
-    except subprocess.CalledProcessError as e:
-        # yt-dlp failed (likely a 403 Forbidden, PO Token error, or Bot Detection)
-        # Grab the last line of the stderr output to see the actual error
-        error_msg = e.stderr.strip().split('\n')[-1] if e.stderr else "Unknown error"
-        
-        # Only print the error if it's NOT a generic "Video unavailable"
-        if "Video unavailable" not in error_msg:
-             print(f"   ⚠️ yt-dlp blocked on {video_id}: {error_msg}")
-             
-    except json.JSONDecodeError:
-        pass
-    except Exception as e:
-        print(f"   ⚠️ Python error parsing {video_id}: {e}")
-        
-    return video_id, None
-    
-    # Check for heatmap in metadata
-    if os.path.exists(info_json_path):
-        try:
+        if os.path.exists(info_json_path):
             with open(info_json_path, 'r', encoding='utf-8') as f:
                 data = json.load(f)
+            
             heatmap = data.get('heatmap')
-            title = data.get('title', 'Unknown')
-            duration = data.get('duration', 0)
             if heatmap and len(heatmap) > 0:
-                return video_id, {"title": title, "duration": duration, "heatmap": heatmap}
-        except Exception:
-            pass
-        # Clean up info.json if no heatmap (we don't want it)
-        os.remove(info_json_path)
-    
+                return video_id, {
+                    "title": data.get('title', 'Unknown'),
+                    "duration": data.get('duration', 0),
+                    "heatmap": heatmap
+                }
+            else:
+                # Clean up if no heatmap found
+                os.remove(info_json_path)
+    except Exception:
+        pass
+             
     return video_id, None
-
 
 def download_video(video_url, video_id, output_dir):
     """Downloads the actual video file (MP4)."""
@@ -122,7 +100,7 @@ def download_video(video_url, video_id, output_dir):
     
     if has_ffmpeg:
         format_args = [
-            '-f', 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best[vcodec!=av01]',
+            '-f', 'bestvideo[vcodec^=avc1]+bestaudio[ext=m4a]/best[ext=mp4]/best[vcodec!=av01]',
             '--merge-output-format', 'mp4'
         ]
     else:
