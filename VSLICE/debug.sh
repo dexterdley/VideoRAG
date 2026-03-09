@@ -23,7 +23,7 @@ for domain in "${DOMAINS[@]}"; do
         manifest="./processed_dataset/${domain}/${split}.json"
         if [ -f "$manifest" ]; then
             echo "🔄 Extracting features: ${domain}/${split} (${NGPUS} GPUs)"
-            CUDA_VISIBLE_DEVICES=2,3,4,5,6,7 torchrun --nproc_per_node=${NGPUS} --master_port=29500 ./VSLICE/extract_features.py \
+            CUDA_VISIBLE_DEVICES=2,3,4,5,6,7 torchrun --nproc_per_node=${NGPUS} --master_port=29505 ./VSLICE/extract_features.py \
                 --manifest="$manifest" \
                 --output_dir="./processed_dataset/${domain}/features/" \
                 --model_path "$MODEL_PATH"
@@ -36,12 +36,12 @@ done
 # ============================================================
 for domain in "${DOMAINS[@]}"; do
     echo "🏋️ Training conv on ${domain} (${NGPUS} GPUs)"
-    CUDA_VISIBLE_DEVICES=2,3,4,5,6,7 torchrun --nproc_per_node=${NGPUS} --master_port=29501 ./VSLICE/train.py \
+    CUDA_VISIBLE_DEVICES=2,3,4,5,6,7 torchrun --nproc_per_node=${NGPUS} --master_port=29506 ./VSLICE/train.py \
         --train_manifest="./processed_dataset/${domain}/train.json" \
-        --val_manifest="./processed_dataset/${domain}/val.json" \
+        --val_manifest="./processed_dataset/${domain}/train.json" \
         --features_dir="./processed_dataset/${domain}/features/" \
         --output_dir="./checkpoints/${domain}_conv" \
-        --arch conv --epochs 100 --lr 5e-4
+        --arch conv --epochs 150 --lr 1e-3
 done
 
 echo "✅ Full pipeline complete!"

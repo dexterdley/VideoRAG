@@ -149,7 +149,7 @@ def train_one_epoch(model, loader, optimizer, device, epoch, sampler=None):
         # Ranking loss
         rank_loss = ranking_loss(predicted, heatmap, mask, margin=0.2)
         
-        loss = reg_loss + 0.1 * rank_loss
+        loss = reg_loss + 0.5 * rank_loss
         
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
