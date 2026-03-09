@@ -1,8 +1,8 @@
 import glob
 import json
 import os
-
-output_dir = "./downloads/rival_vids"
+domain = "kamala_vids"
+output_dir = f"./downloads/{domain}"
 
 downloaded_files = glob.glob(os.path.join(output_dir, "*.info.json"))
 downloaded_manifests = []
@@ -31,9 +31,9 @@ for info_json_path in downloaded_files:
 			count += 1
 
 
-if os.path.exists("./downloads/rival_vids/manifest_json"):
+if os.path.exists(f"./downloads/{domain}/manifest_json"):
 	print("Old JSON found, removing it")
-	os.remove("./downloads/rival_vids/manifest_json")
+	os.remove(f"./downloads/{domain}/manifest_json")
 
 manifest_path = os.path.join(output_dir, "manifest.json")
 with open(manifest_path, "w", encoding='utf-8') as f:

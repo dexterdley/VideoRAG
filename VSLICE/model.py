@@ -21,11 +21,11 @@ class TemporalConvHead(nn.Module):
             nn.Conv1d(hidden, 256, kernel_size=11, padding=5),
             nn.BatchNorm1d(256),
             nn.ReLU(),
-            nn.Dropout(0.1),
+            nn.Dropout(0.0),
             nn.Conv1d(256, 128, kernel_size=7, padding=3),
             nn.BatchNorm1d(128),
             nn.ReLU(),
-            nn.Dropout(0.1),
+            nn.Dropout(0.0),
             nn.Conv1d(128, 64, kernel_size=5, padding=2),
             nn.BatchNorm1d(64),
             nn.ReLU(),
@@ -76,7 +76,7 @@ class TemporalTransformerHead(nn.Module):
     ~8M parameters.
     """
     def __init__(self, feat_dim=4096, hidden=512, nhead=8, nlayers=4, 
-                 dim_feedforward=1024, dropout=0.1):
+                 dim_feedforward=1024, dropout=0.0):
         super().__init__()
         self.proj = nn.Linear(feat_dim, hidden)
         self.pos_enc = SinusoidalPE(hidden, max_len=7200)

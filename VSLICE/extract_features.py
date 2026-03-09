@@ -5,8 +5,20 @@ Loads a VLM (MiniCPM-V), samples video frames at 1 FPS, feeds them
 together with the query (YouTube title) into the VLM, and saves the
 resulting hidden-state features as .npz files.
 
-Usage:
-    python ./VSLICE/extract_features.py --manifest="./processed_dataset/trump_vids/train.json" --output_dir="./processed_dataset/trump_vids/features/" --model_path ./MiniCPM-V-2_6-int4
+Supports multi-GPU via torchrun — each GPU processes a disjoint shard
+of videos (embarrassingly parallel, no gradient sync needed).
+
+Single-GPU usage:
+    python ./VSLICE/extract_features.py \
+        --manifest="./processed_dataset/trump_vids/train.json" \
+        --output_dir="./processed_dataset/trump_vids/features/" \
+        --model_path ./MiniCPM-V-2_6-int4
+
+Multi-GPU usage (8 GPUs):
+    torchrun --nproc_per_node=8 ./VSLICE/extract_features.py \
+        --manifest="./processed_dataset/trump_vids/train.json" \
+        --output_dir="./processed_dataset/trump_vids/features/" \
+        --model_path ./MiniCPM-V-2_6-int4
 """
 import os
 import json
@@ -14,6 +26,7 @@ import argparse
 import time
 import warnings
 import torch
+import torch.distributed as dist
 import numpy as np
 from PIL import Image
 
@@ -21,14 +34,46 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", message=".*not a valid Python identifier.*")
 
 
-def load_vlm(model_path):
-    """Load MiniCPM-V model for feature extraction."""
+# ---------------------------------------------------------------------------
+# Multi-GPU helpers
+# ---------------------------------------------------------------------------
+
+def setup_distributed():
+    """Initialize distributed process group for multi-GPU extraction.
+    Returns (rank, local_rank, world_size). Falls back to (0, 0, 1)."""
+    if "RANK" in os.environ:
+        dist.init_process_group(backend="nccl")
+        rank = int(os.environ["RANK"])
+        local_rank = int(os.environ["LOCAL_RANK"])
+        world_size = int(os.environ["WORLD_SIZE"])
+        torch.cuda.set_device(local_rank)
+        return rank, local_rank, world_size
+    return 0, 0, 1
+
+
+def cleanup_distributed():
+    """Destroy the distributed process group if initialized."""
+    if dist.is_initialized():
+        dist.destroy_process_group()
+
+
+def shard_manifest(manifest, rank, world_size):
+    """Split manifest into disjoint shards — one per GPU.
+    GPU i gets items [i, i+W, i+2W, ...] (interleaved for balance)."""
+    return [item for i, item in enumerate(manifest) if i % world_size == rank]
+
+
+# ---------------------------------------------------------------------------
+# VLM & frame sampling
+# ---------------------------------------------------------------------------
+
+def load_vlm(model_path, device):
+    """Load MiniCPM-V model for feature extraction on a specific device."""
     from transformers import AutoModel, AutoTokenizer, AutoProcessor
     
-    device = "cuda" if torch.cuda.is_available() else "cpu"
     dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
     
-    print(f"Loading VLM from {model_path}...")
+    print(f"[GPU {device}] Loading VLM from {model_path}...")
     model = AutoModel.from_pretrained(
         model_path,
         trust_remote_code=True,
@@ -40,8 +85,8 @@ def load_vlm(model_path):
     tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
     processor = AutoProcessor.from_pretrained(model_path, trust_remote_code=True)
     
-    print(f"✅ VLM loaded on {device}")
-    return model, tokenizer, processor, device
+    print(f"[GPU {device}] ✅ VLM loaded")
+    return model, tokenizer, processor
 
 
 def sample_frames(video_path, fps=1.0, width=448, height=448):
@@ -133,19 +178,31 @@ def extract_features_for_video(model, tokenizer, processor, device,
     return features
 
 
+# ---------------------------------------------------------------------------
+# Main extraction loop
+# ---------------------------------------------------------------------------
+
 def extract_all(manifest_path, output_dir, model_path, batch_size=8, 
                 fps=1.0, skip_existing=True):
-    """Extract features for all videos in a manifest."""
+    """Extract features for all videos in a manifest, with multi-GPU support."""
+    rank, local_rank, world_size = setup_distributed()
+    device = f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu"
+
     os.makedirs(output_dir, exist_ok=True)
     
     with open(manifest_path, "r", encoding="utf-8") as f:
         manifest = json.load(f)
+
+    # Shard manifest across GPUs
+    my_manifest = shard_manifest(manifest, rank, world_size)
+
+    if rank == 0:
+        print(f"\n📂 Total videos: {len(manifest)} | World size: {world_size}")
+    print(f"[GPU {local_rank}] Processing {len(my_manifest)} / {len(manifest)} videos")
     
-    model, tokenizer, processor, device = load_vlm(model_path)
+    model, tokenizer, processor = load_vlm(model_path, device)
     
-    print(f"\n📂 Extracting features for {len(manifest)} videos")
-    
-    for idx, item in enumerate(manifest):
+    for idx, item in enumerate(my_manifest):
         video_id = item["video_id"]
         video_path = item["video_path"]
         query = item.get("title", "Describe this video")
@@ -154,14 +211,14 @@ def extract_all(manifest_path, output_dir, model_path, batch_size=8,
         output_path = os.path.join(output_dir, f"{video_id}.npz")
         
         if skip_existing and os.path.exists(output_path):
-            print(f"  [{idx+1}/{len(manifest)}] ⏭️ {video_id} — already extracted")
+            print(f"  [GPU {local_rank}] [{idx+1}/{len(my_manifest)}] ⏭️ {video_id} — already extracted")
             continue
         
         if not os.path.exists(video_path):
-            print(f"  [{idx+1}/{len(manifest)}] ❌ {video_id} — video not found")
+            print(f"  [GPU {local_rank}] [{idx+1}/{len(my_manifest)}] ❌ {video_id} — video not found")
             continue
         
-        print(f"  [{idx+1}/{len(manifest)}] 🔄 {video_id} — \"{query[:50]}\"")
+        print(f"  [GPU {local_rank}] [{idx+1}/{len(my_manifest)}] 🔄 {video_id} — \"{query[:50]}\"")
         t0 = time.time()
         
         try:
@@ -187,7 +244,7 @@ def extract_all(manifest_path, output_dir, model_path, batch_size=8,
                 frames, query, batch_size=batch_size
             )
             
-            # Save
+            # Save (each GPU writes to the same output_dir — filenames are disjoint)
             save_dict = {
                 "features": features,      # [T, D]
                 "times": times,            # [T]
@@ -203,8 +260,13 @@ def extract_all(manifest_path, output_dir, model_path, batch_size=8,
         except Exception as e:
             print(f"    ❌ Failed: {e}")
             continue
-    
-    print(f"\n🏁 Feature extraction complete → {output_dir}")
+
+    # No barrier needed — each GPU writes independently to unique files
+
+    if rank == 0:
+        print(f"\n🏁 Feature extraction complete → {output_dir}")
+
+    cleanup_distributed()
 
 
 if __name__ == "__main__":

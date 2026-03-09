@@ -3,6 +3,9 @@ PyTorch Dataset for pre-extracted engagement features.
 
 Loads .npz files created by extract_features.py and serves them
 for training the temporal engagement head.
+
+Uses SLIDING WINDOW chunking so that every part of every video is
+seen during training, even for videos longer than max_frames.
 """
 import os
 import json
@@ -15,18 +18,24 @@ class VSLICEDataset(Dataset):
     """
     Dataset of pre-extracted VLM features + heatmap labels.
     
+    Long videos are split into overlapping chunks of max_frames length
+    with a configurable stride, so the model learns engagement patterns
+    for the ENTIRE video — not just the first max_frames.
+    
     Each sample is a (features, heatmap, mask) tuple:
-        features: [T, D] query-conditioned VLM features
-        heatmap: [T] ground-truth engagement scores in [0, 1]
-        mask: [T] bool, True for valid frames
+        features: [max_frames, D] query-conditioned VLM features
+        heatmap: [max_frames] ground-truth engagement scores in [0, 1]
+        mask: [max_frames] bool, True for valid frames
     """
     def __init__(self, manifest_path, features_dir, max_frames=300,
-                 augment=False, heatmap_sigma=2.0):
+                 stride=None, augment=False, heatmap_sigma=2.0):
         """
         Args:
             manifest_path: path to split JSON (from prepare_dataset.py)
             features_dir: directory containing .npz feature files
-            max_frames: max sequence length (pad/crop longer videos)
+            max_frames: chunk size (window length)
+            stride: step between chunk starts (default: max_frames // 2 = 50% overlap)
+                    set stride=max_frames for no overlap
             augment: enable data augmentation
             heatmap_sigma: Gaussian smoothing for GT heatmap (reduce noise)
         """
@@ -35,48 +44,72 @@ class VSLICEDataset(Dataset):
         
         self.features_dir = features_dir
         self.max_frames = max_frames
+        self.stride = stride if stride is not None else max_frames // 2
         self.augment = augment
         self.heatmap_sigma = heatmap_sigma
         
-        # Filter to only include videos with extracted features
-        self.samples = []
+        # Build chunk index: (video_idx, chunk_start) for every chunk
+        self.videos = []
+        self.chunks = []
         for item in self.manifest:
             feat_path = os.path.join(features_dir, f"{item['video_id']}.npz")
             if os.path.exists(feat_path):
-                self.samples.append({**item, "feat_path": feat_path})
+                video_idx = len(self.videos)
+                self.videos.append({**item, "feat_path": feat_path})
+                
+                # Peek at feature length
+                data = np.load(feat_path, allow_pickle=True)
+                T = data["features"].shape[0]
+                
+                if T <= max_frames:
+                    # Short video: single chunk (will be padded)
+                    self.chunks.append((video_idx, 0))
+                else:
+                    # Sliding window chunks
+                    start = 0
+                    while start < T:
+                        self.chunks.append((video_idx, start))
+                        start += self.stride
+                        # Ensure last chunk doesn't start too late
+                        if start + max_frames > T and start < T:
+                            # Add a final chunk aligned to the end
+                            self.chunks.append((video_idx, max(0, T - max_frames)))
+                            break
         
-        print(f"📂 VSLICEDataset: {len(self.samples)}/{len(self.manifest)} "
-              f"videos with features (max_frames={max_frames})")
+        n_videos = len(self.videos)
+        n_chunks = len(self.chunks)
+        print(f"📂 VSLICEDataset: {n_videos}/{len(self.manifest)} videos "
+              f"→ {n_chunks} chunks (window={max_frames}, stride={self.stride})")
     
     def __len__(self):
-        return len(self.samples)
+        return len(self.chunks)
     
     def __getitem__(self, idx):
-        item = self.samples[idx]
+        video_idx, chunk_start = self.chunks[idx]
+        item = self.videos[video_idx]
         data = np.load(item["feat_path"], allow_pickle=True)
         
-        features = data["features"]    # [T, D]
-        heatmap = data["heatmap"]       # [T]
-        times = data["times"]           # [T]
+        features_full = data["features"]    # [T_full, D]
+        heatmap_full = data["heatmap"]       # [T_full]
+        times_full = data["times"]           # [T_full]
         
-        T, D = features.shape
+        T_full = features_full.shape[0]
         
-        # Smooth GT heatmap to reduce label noise
+        # Smooth GT heatmap
         if self.heatmap_sigma > 0:
             from scipy.ndimage import gaussian_filter1d
-            heatmap = gaussian_filter1d(heatmap, sigma=self.heatmap_sigma)
-            heatmap = np.clip(heatmap, 0, 1)
+            heatmap_full = gaussian_filter1d(heatmap_full, sigma=self.heatmap_sigma)
+            heatmap_full = np.clip(heatmap_full, 0, 1)
         
-        # Data augmentation
+        # Extract chunk
+        chunk_end = min(chunk_start + self.max_frames, T_full)
+        features = features_full[chunk_start:chunk_end]
+        heatmap = heatmap_full[chunk_start:chunk_end]
+        times = times_full[chunk_start:chunk_end]
+        T = features.shape[0]
+        
+        # Data augmentation (on the chunk)
         if self.augment:
-            # Random temporal crop (if video is longer than max_frames)
-            if T > self.max_frames:
-                start = np.random.randint(0, T - self.max_frames)
-                features = features[start:start + self.max_frames]
-                heatmap = heatmap[start:start + self.max_frames]
-                times = times[start:start + self.max_frames]
-                T = self.max_frames
-            
             # Temporal jitter: shift heatmap ±2 frames
             shift = np.random.randint(-2, 3)
             if shift != 0:
@@ -90,13 +123,6 @@ class VSLICEDataset(Dataset):
             if np.random.random() < 0.5:
                 drop_mask = np.random.random(T) < 0.1
                 features[drop_mask] = 0.0
-        else:
-            # No augmentation: deterministic crop from start
-            if T > self.max_frames:
-                features = features[:self.max_frames]
-                heatmap = heatmap[:self.max_frames]
-                times = times[:self.max_frames]
-                T = self.max_frames
         
         # Pad if shorter than max_frames
         mask = np.ones(self.max_frames, dtype=bool)

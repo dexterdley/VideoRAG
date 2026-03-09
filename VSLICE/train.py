@@ -5,11 +5,20 @@ Trains a lightweight temporal model on pre-extracted VLM features
 to predict per-frame engagement scores, supervised by YouTube
 Most Replayed heatmaps.
 
-Usage:
+Supports single-GPU and multi-GPU (DDP) training via torchrun.
+
+Single-GPU usage:
     python ./VSLICE/train.py --train_manifest="./processed_dataset/trump_vids/train.json" \
-    --val_manifest="./processed_dataset/trump_vids/train.json" \
+    --val_manifest="./processed_dataset/trump_vids/val.json" \
     --features_dir="./processed_dataset/trump_vids/features/" \
     --output_dir="./checkpoints" --arch conv --epochs 50 --lr 1e-3
+
+Multi-GPU usage (8 GPUs):
+    torchrun --nproc_per_node=8 ./VSLICE/train.py \
+    --train_manifest="./processed_dataset/trump_vids/train.json" \
+    --val_manifest="./processed_dataset/trump_vids/val.json" \
+    --features_dir="./processed_dataset/trump_vids/features/" \
+    --output_dir="./checkpoints" --arch conv --epochs 100 --lr 1e-3
 """
 import os
 import json
@@ -19,12 +28,47 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm
 
 from model import build_model
 from dataset import VSLICEDataset
 
+
+# ---------------------------------------------------------------------------
+# DDP helpers
+# ---------------------------------------------------------------------------
+
+def setup_ddp():
+    """Initialize distributed process group. Returns (rank, local_rank, world_size).
+    If not launched via torchrun, returns (0, 0, 1) for single-GPU mode."""
+    if "RANK" in os.environ:
+        dist.init_process_group(backend="nccl")
+        rank = int(os.environ["RANK"])
+        local_rank = int(os.environ["LOCAL_RANK"])
+        world_size = int(os.environ["WORLD_SIZE"])
+        torch.cuda.set_device(local_rank)
+        return rank, local_rank, world_size
+    return 0, 0, 1
+
+
+def cleanup_ddp():
+    """Destroy the distributed process group if it was initialized."""
+    if dist.is_initialized():
+        dist.destroy_process_group()
+
+
+def is_main_process(rank):
+    """Only rank 0 should log, save checkpoints, etc."""
+    return rank == 0
+
+
+# ---------------------------------------------------------------------------
+# Losses
+# ---------------------------------------------------------------------------
 
 def ranking_loss(predicted, target, mask, margin=0.2):
     """
@@ -73,9 +117,16 @@ def ranking_loss(predicted, target, mask, margin=0.2):
     return total_loss
 
 
-def train_one_epoch(model, loader, optimizer, device, epoch):
+# ---------------------------------------------------------------------------
+# Train / Validate
+# ---------------------------------------------------------------------------
+
+def train_one_epoch(model, loader, optimizer, device, epoch, sampler=None):
     """Train for one epoch."""
     model.train()
+    if sampler is not None:
+        sampler.set_epoch(epoch)  # ensure proper shuffling per epoch in DDP
+
     total_loss = 0
     total_reg = 0
     total_rank = 0
@@ -98,7 +149,7 @@ def train_one_epoch(model, loader, optimizer, device, epoch):
         # Ranking loss
         rank_loss = ranking_loss(predicted, heatmap, mask, margin=0.2)
         
-        loss = reg_loss + rank_loss
+        loss = reg_loss + 0.1 * rank_loss
         
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -118,7 +169,7 @@ def train_one_epoch(model, loader, optimizer, device, epoch):
 
 @torch.no_grad()
 def validate(model, loader, device):
-    """Run validation and return metrics."""
+    """Run validation and return metrics. Only runs on rank 0 in DDP."""
     model.eval()
     total_loss = 0
     all_predicted = []
@@ -130,7 +181,9 @@ def validate(model, loader, device):
         heatmap = batch["heatmap"].to(device)
         mask = batch["mask"].to(device)
         
-        predicted = model(features, mask=mask)
+        # If model is DDP-wrapped, access underlying module
+        m = model.module if hasattr(model, "module") else model
+        predicted = m(features, mask=mask)
         
         reg_loss = F.smooth_l1_loss(
             predicted[mask], heatmap[mask], reduction="mean"
@@ -161,108 +214,165 @@ def validate(model, loader, device):
     }
 
 
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
 def train(args):
-    """Main training function."""
-    os.makedirs(args.output_dir, exist_ok=True)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    
+    """Main training function with optional DDP support."""
+    rank, local_rank, world_size = setup_ddp()
+    distributed = world_size > 1
+    device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
+
+    if is_main_process(rank):
+        os.makedirs(args.output_dir, exist_ok=True)
+        print(f"🚀 World size: {world_size} | Device: {device}")
+
+    # ------------------------------------------------------------------
     # Datasets
+    # ------------------------------------------------------------------
     train_dataset = VSLICEDataset(
         args.train_manifest, args.features_dir,
-        max_frames=args.max_frames, augment=True, heatmap_sigma=2.0
+        max_frames=args.max_frames, augment=False, heatmap_sigma=0.0
     )
     val_dataset = VSLICEDataset(
         args.val_manifest, args.features_dir,
-        max_frames=args.max_frames, augment=False, heatmap_sigma=2.0
+        max_frames=args.max_frames, augment=False, heatmap_sigma=0.0
     )
     
     if len(train_dataset) == 0:
-        print("❌ No training data found!")
+        if is_main_process(rank):
+            print("❌ No training data found!")
+        cleanup_ddp()
         return
-    
-    actual_bs = min(args.batch_size, len(train_dataset))
+
+    # Samplers (DistributedSampler for DDP, None for single-GPU)
+    train_sampler = DistributedSampler(
+        train_dataset, num_replicas=world_size, rank=rank, shuffle=True
+    ) if distributed else None
+
+    # Per-GPU batch size — effective batch size = batch_size * world_size
+    per_gpu_bs = max(1, args.batch_size // world_size) if distributed else args.batch_size
+    per_gpu_bs = min(per_gpu_bs, len(train_dataset))
+
     train_loader = DataLoader(
-        train_dataset, batch_size=actual_bs, shuffle=True,
+        train_dataset, batch_size=per_gpu_bs,
+        shuffle=(train_sampler is None),  # shuffle only when no sampler
+        sampler=train_sampler,
         num_workers=args.num_workers, pin_memory=True, drop_last=False
     )
-    val_loader = DataLoader(
-        val_dataset, batch_size=args.batch_size, shuffle=False,
-        num_workers=args.num_workers, pin_memory=True
-    )
-    
-    # Determine feature dim from first sample
+
+    # Validation only on rank 0 (small dataset, not worth distributing)
+    val_loader = None
+    if is_main_process(rank):
+        val_loader = DataLoader(
+            val_dataset, batch_size=args.batch_size, shuffle=False,
+            num_workers=args.num_workers, pin_memory=True
+        )
+
+    # ------------------------------------------------------------------
+    # Model
+    # ------------------------------------------------------------------
     sample = train_dataset[0]
     feat_dim = sample["features"].shape[-1]
-    print(f"Feature dimension: {feat_dim}")
-    
-    # Model
+    if is_main_process(rank):
+        print(f"Feature dimension: {feat_dim}")
+
     model = build_model(arch=args.arch, feat_dim=feat_dim).to(device)
-    n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Model: {args.arch} — {n_params:,} trainable parameters")
-    
+
+    if distributed:
+        model = DDP(model, device_ids=[local_rank], output_device=local_rank)
+
+    raw_model = model.module if distributed else model
+    n_params = sum(p.numel() for p in raw_model.parameters() if p.requires_grad)
+    if is_main_process(rank):
+        print(f"Model: {args.arch} — {n_params:,} trainable parameters")
+        if distributed:
+            print(f"DDP: {world_size} GPUs, per-GPU batch size = {per_gpu_bs}, "
+                  f"effective batch size = {per_gpu_bs * world_size}")
+
+    # ------------------------------------------------------------------
     # Optimizer + Scheduler
+    # ------------------------------------------------------------------
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=args.lr, weight_decay=args.weight_decay
     )
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=args.epochs, eta_min=args.lr * 0.01
     )
-    
+
+    # ------------------------------------------------------------------
     # Training loop
+    # ------------------------------------------------------------------
     best_spearman = -1
     history = []
-    
-    print(f"\n{'='*60}")
-    print(f"Training: {args.arch} | {len(train_dataset)} train, {len(val_dataset)} val")
-    print(f"{'='*60}\n")
-    
-    pbar = tqdm(range(1, args.epochs + 1), desc="Training", unit="epoch")
+
+    if is_main_process(rank):
+        print(f"\n{'='*60}")
+        print(f"Training: {args.arch} | {len(train_dataset)} train, {len(val_dataset)} val")
+        print(f"{'='*60}\n")
+
+    pbar = tqdm(range(1, args.epochs + 1), desc="Training", unit="epoch",
+                disable=not is_main_process(rank))
+
     for epoch in pbar:
         t0 = time.time()
-        
-        train_metrics = train_one_epoch(model, train_loader, optimizer, device, epoch)
-        val_metrics = validate(model, val_loader, device)
+
+        train_metrics = train_one_epoch(
+            model, train_loader, optimizer, device, epoch,
+            sampler=train_sampler
+        )
+
+        # Validation only on rank 0
+        val_metrics = {"val_loss": 0.0, "spearman": 0.0, "n_videos": 0}
+        if is_main_process(rank) and val_loader is not None:
+            val_metrics = validate(model, val_loader, device)
+
         scheduler.step()
-        
-        elapsed = time.time() - t0
-        lr = optimizer.param_groups[0]["lr"]
-        
-        record = {
-            "epoch": epoch,
-            "lr": lr,
-            **train_metrics,
-            **val_metrics,
-        }
-        history.append(record)
-        
-        # Log
-        improved = ""
-        if val_metrics["spearman"] > best_spearman:
-            best_spearman = val_metrics["spearman"]
-            # Save best model
-            torch.save({
+
+        # --- Logging & checkpointing (rank 0 only) ---
+        if is_main_process(rank):
+            elapsed = time.time() - t0
+            lr = optimizer.param_groups[0]["lr"]
+
+            record = {
                 "epoch": epoch,
-                "model_state_dict": model.state_dict(),
-                "optimizer_state_dict": optimizer.state_dict(),
-                "spearman": best_spearman,
-                "arch": args.arch,
-                "feat_dim": feat_dim,
-            }, os.path.join(args.output_dir, "best_model.pt"))
-            improved = " ⭐"
-        
-        pbar.set_postfix({
-            "loss": f"{train_metrics['loss']:.4f}",
-            "val": f"{val_metrics['val_loss']:.4f}",
-            "ρ": f"{val_metrics['spearman']:.4f}{improved}",
-            "lr": f"{lr:.1e}",
-        })
-        
-    # Save training history
-    with open(os.path.join(args.output_dir, "history.json"), "w") as f:
-        json.dump(history, f, indent=2)
-    
-    print(f"\n🏁 Training complete! Best Spearman ρ = {best_spearman:.4f}")
-    print(f"   Best model saved to: {os.path.join(args.output_dir, 'best_model.pt')}")
+                "lr": lr,
+                **train_metrics,
+                **val_metrics,
+            }
+            history.append(record)
+
+            improved = ""
+            if val_metrics["spearman"] > best_spearman:
+                best_spearman = val_metrics["spearman"]
+                torch.save({
+                    "epoch": epoch,
+                    "model_state_dict": raw_model.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "spearman": best_spearman,
+                    "arch": args.arch,
+                    "feat_dim": feat_dim,
+                }, os.path.join(args.output_dir, "best_model.pt"))
+                improved = " ⭐"
+
+            pbar.set_postfix({
+                "loss": f"{train_metrics['loss']:.4f}",
+                "val": f"{val_metrics['val_loss']:.4f}",
+                "ρ": f"{val_metrics['spearman']:.4f}{improved}",
+                "lr": f"{lr:.1e}",
+            })
+
+    # ------------------------------------------------------------------
+    # Save history & cleanup
+    # ------------------------------------------------------------------
+    if is_main_process(rank):
+        with open(os.path.join(args.output_dir, "history.json"), "w") as f:
+            json.dump(history, f, indent=2)
+        print(f"\n🏁 Training complete! Best Spearman ρ = {best_spearman:.4f}")
+        print(f"   Best model saved to: {os.path.join(args.output_dir, 'best_model.pt')}")
+
+    cleanup_ddp()
 
 
 if __name__ == "__main__":
@@ -273,9 +383,10 @@ if __name__ == "__main__":
     parser.add_argument("--output_dir", type=str, default="model_checkpoints")
     parser.add_argument("--arch", type=str, default="transformer", choices=["conv", "bi_lstm", "transformer"])
     parser.add_argument("--epochs", type=int, default=50)
-    parser.add_argument("--batch_size", type=int, default=32)
+    parser.add_argument("--batch_size", type=int, default=32*8,
+                       help="Total effective batch size (split across GPUs in DDP)")
     parser.add_argument("--lr", type=float, default=1e-3)
-    parser.add_argument("--weight_decay", type=float, default=1e-4)
+    parser.add_argument("--weight_decay", type=float, default=1e-5)
     parser.add_argument("--max_frames", type=int, default=300,
                        help="Max frames per video (5 min at 1 FPS)")
     parser.add_argument("--num_workers", type=int, default=4)

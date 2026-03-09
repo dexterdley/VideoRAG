@@ -217,21 +217,40 @@ def extract_features(vlm_model, tokenizer, processor, device, frames, query):
 
 
 # ─── GT heatmap loader ──────────────────────────────────────────────
-def load_heatmap_json(heatmap_path, frame_times):
+def load_heatmap_json(heatmap_path, frame_times, sigma=0.0):
     """
     Load a YouTube heatmap JSON and interpolate to match frame timestamps.
-    The JSON is a list of dicts: [{"start_time": .., "end_time": .., "value": ..}, ...]
+    Applies the SAME processing as the training pipeline:
+      - midpoint-based interpolation (matches prepare_dataset.py)
+      - min-max normalization to [0, 1]
+      - Gaussian smoothing (matches dataset.py heatmap_sigma)
     """
     with open(heatmap_path, "r", encoding="utf-8") as f:
         heatmap_raw = json.load(f)
 
-    hm_times = np.array([pt["start_time"] for pt in heatmap_raw])
+    # Use midpoint of each segment (same as prepare_dataset.py)
+    hm_times = np.array([(pt["start_time"] + pt["end_time"]) / 2 for pt in heatmap_raw])
     hm_values = np.array([pt["value"] for pt in heatmap_raw])
+
+    # Min-max normalize to [0, 1] (same as prepare_dataset.py line 57-61)
+    v_min, v_max = hm_values.min(), hm_values.max()
+    if v_max > v_min:
+        hm_values = (hm_values - v_min) / (v_max - v_min)
+    else:
+        hm_values = np.zeros_like(hm_values)
 
     from scipy.interpolate import interp1d
     interp = interp1d(hm_times, hm_values, kind="linear",
                        fill_value="extrapolate", bounds_error=False)
-    return np.clip(interp(frame_times), 0, 1)
+    gt = np.clip(interp(frame_times), 0, 1)
+
+    # Apply same Gaussian smoothing as training dataset
+    if sigma > 0:
+        from scipy.ndimage import gaussian_filter1d
+        gt = gaussian_filter1d(gt, sigma=sigma)
+        gt = np.clip(gt, 0, 1)
+
+    return gt
 
 
 # ─── Plotting ────────────────────────────────────────────────────────
@@ -254,7 +273,7 @@ def plot_importance(times, predicted, gt_heatmap=None, title="", output_path=Non
     ax.set_xlim(times[0] / 60, times[-1] / 60)
     ax.legend(loc="upper right", fontsize=10)
 
-    plot_title = "Predicted Engagement / Importance Score"
+    plot_title = "Predicted Engagement Importance Score"
     if title:
         plot_title += f"\n{title}"
     ax.set_title(plot_title, fontsize=13, fontweight="bold")
@@ -273,6 +292,19 @@ def plot_importance(times, predicted, gt_heatmap=None, title="", output_path=Non
 
 
 # ─── Main ────────────────────────────────────────────────────────────
+
+def get_query_from_manifest(manifest_path, video_path):
+    """Look up the video's title from the manifest JSON, matching extract_features.py logic."""
+    video_id = os.path.splitext(os.path.basename(video_path))[0]
+    if manifest_path and os.path.exists(manifest_path):
+        with open(manifest_path, "r", encoding="utf-8") as f:
+            manifest = json.load(f)
+        for item in manifest:
+            if item.get("video_id") == video_id:
+                return item.get("title", "Describe this video")
+    return "Describe this video"
+
+
 def infer(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -287,68 +319,97 @@ def infer(args):
     temporal_model.eval()
     print(f"✅ Temporal head loaded: {arch} (epoch {checkpoint.get('epoch', '?')})")
 
-    # 2. Sample frames
+    # 2. Resolve query from manifest (same as extract_features.py)
+    query = get_query_from_manifest(args.manifest, args.video)
+    print(f"\n🏷️ Query (from manifest): \"{query}\"")
+
+    # 3. Sample frames
     print(f"\n🎬 Sampling frames from: {args.video}")
     frames, times, duration = sample_frames(args.video, fps=args.fps)
     print(f"   {len(frames)} frames sampled ({duration:.0f}s video at {args.fps} FPS)")
 
-    # 3. Extract VLM features
-    print(f"\n🧠 Extracting VLM features (query: '{args.query}')...")
+    # 4. Extract VLM features
+    print(f"\n🧠 Extracting VLM features...")
     vlm_model, tokenizer, processor, vlm_device = load_vlm(args.model_path)
     features = extract_features(vlm_model, tokenizer, processor, vlm_device,
-                                 frames, args.query)
+                                 frames, query)
     print(f"   Features shape: {features.shape}")
 
-    # Free VLM memory
     del vlm_model, tokenizer, processor
     torch.cuda.empty_cache() if torch.cuda.is_available() else None
 
-    # 4. Predict engagement
-    print(f"\n📈 Running temporal model...")
-    features_t = torch.from_numpy(features).unsqueeze(0).to(device)  # [1, T, D]
-    mask = torch.ones(1, features_t.shape[1], dtype=torch.bool, device=device)
+    # 5. Sliding window prediction (matches dataset.py chunking)
+    T_full = features.shape[0]
+    max_frames = args.max_frames
+    stride = max_frames // 2  # 50% overlap, same as dataset.py default
 
-    with torch.no_grad():
-        predicted = temporal_model(features_t, mask=mask)  # [1, T]
-    predicted_np = predicted[0].cpu().numpy()
+    print(f"\n📈 Running temporal model (sliding window: {max_frames}f, stride {stride}f)...")
 
+    # Accumulate predictions with overlap averaging
+    pred_sum = np.zeros(T_full, dtype=np.float64)
+    pred_count = np.zeros(T_full, dtype=np.float64)
+
+    chunk_starts = []
+    if T_full <= max_frames:
+        chunk_starts = [0]
+    else:
+        start = 0
+        while start + max_frames <= T_full:
+            chunk_starts.append(start)
+            start += stride
+        # Ensure last chunk covers the very end
+        if chunk_starts[-1] + max_frames < T_full:
+            chunk_starts.append(T_full - max_frames)
+
+    for chunk_start in chunk_starts:
+        chunk_end = min(chunk_start + max_frames, T_full)
+        chunk_feat = features[chunk_start:chunk_end]
+        T_chunk = chunk_feat.shape[0]
+
+        # Pad if needed
+        mask_np = np.ones(max_frames, dtype=bool)
+        if T_chunk < max_frames:
+            pad_len = max_frames - T_chunk
+            chunk_feat = np.pad(chunk_feat, ((0, pad_len), (0, 0)), mode="constant")
+            mask_np[T_chunk:] = False
+
+        feat_t = torch.from_numpy(chunk_feat).float().unsqueeze(0).to(device)
+        mask_t = torch.from_numpy(mask_np).unsqueeze(0).to(device)
+
+        with torch.no_grad():
+            pred = temporal_model(feat_t, mask=mask_t)
+        pred_chunk = pred[0].cpu().numpy()[:T_chunk]
+
+        pred_sum[chunk_start:chunk_start + T_chunk] += pred_chunk
+        pred_count[chunk_start:chunk_start + T_chunk] += 1.0
+
+    # Average overlapping predictions
+    predicted_np = pred_sum / np.maximum(pred_count, 1.0)
+
+    print(f"   {len(chunk_starts)} chunks → {T_full} frames stitched")
     print(f"   Scores: min={predicted_np.min():.3f}, max={predicted_np.max():.3f}, "
           f"mean={predicted_np.mean():.3f}")
 
-    # 5. Load GT heatmap (optional)
+    # 6. Load GT heatmap (optional) and compute Spearman correlation
     gt = None
     if args.heatmap_json and os.path.exists(args.heatmap_json):
         print(f"   Loading GT heatmap from: {args.heatmap_json}")
         gt = load_heatmap_json(args.heatmap_json, times)
 
-    # 6. Plot
+        from scipy.stats import spearmanr
+        rho, pval = spearmanr(predicted_np, gt)
+        print(f"   📊 Spearman ρ = {rho:.4f}  (p = {pval:.2e})")
+
+    # 7. Plot
     video_name = os.path.splitext(os.path.basename(args.video))[0]
     output_path = args.output or f"./results/{video_name}_importance.png"
 
     plot_importance(
         times, predicted_np,
         gt_heatmap=gt,
-        title=f"{video_name} — \"{args.query}\"",
+        title=f"{video_name} — \"{query}\"",
         output_path=output_path,
     )
-
-    # 7. Save raw scores as JSON
-    scores_path = output_path.replace(".png", "_scores.json")
-    scores_data = {
-        "video": args.video,
-        "query": args.query,
-        "checkpoint": args.checkpoint,
-        "duration": float(duration),
-        "n_frames": len(times),
-        "scores": [
-            {"time": float(t), "score": float(s)}
-            for t, s in zip(times, predicted_np)
-        ],
-    }
-    #with open(scores_path, "w", encoding="utf-8") as f:
-    #   json.dump(scores_data, f, indent=2)
-    #   pass
-    print(f"📋 Scores saved to: {scores_path}")
 
     print(f"\n✅ Inference complete!")
 
@@ -357,20 +418,23 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Run engagement inference on a single video and plot importance scores"
     )
-    parser.add_argument("--video", type=str, default="./downloads/rival_vids/12QYRi_SMSE.mp4", 
+    parser.add_argument("--video", type=str, default="./downloads/dog_vids/2WdxCVg76YE.mp4", 
                         help="Path to input video file (.mp4)")
-    parser.add_argument("--checkpoint", type=str, default="./checkpoints/rival_vids_conv/best_model.pt",
+    parser.add_argument("--manifest", type=str, default="./downloads/dog_vids/manifest.json",
+                        help="Path to manifest JSON (to look up video title as query)")
+    parser.add_argument("--checkpoint", type=str, default="./checkpoints/dog_vids_conv/best_model.pt",
                         help="Path to trained temporal model checkpoint (.pt)")
-    parser.add_argument("--model_path", type=str, default="./MiniCPM-V-2_6-int4",
+    parser.add_argument("--model_path", type=str, default=".checkpoints/MiniCPM-V-2_6-int4",
                         help="Path to VLM model for feature extraction")
-    parser.add_argument("--query", type=str, default="Describe this video",
-                        help="Query/topic to condition features on")
-    parser.add_argument("--heatmap_json", type=str, default="./downloads/rival_vids/12QYRi_SMSE_heatmap.json",
+    parser.add_argument("--heatmap_json", type=str, default="./downloads/dog_vids/2WdxCVg76YE_heatmap.json",
                         help="Optional: path to GT heatmap JSON for overlay comparison")
+    parser.add_argument("--max_frames", type=int, default=300,
+                        help="Max frames — must match training (default: 300)")
     parser.add_argument("--fps", type=float, default=1.0,
                         help="Frame sampling rate (default: 1 FPS)")
-    parser.add_argument("--output", type=str, default="./results/12QYRi_SMSE_importance.png",
-                        help="Output path for the plot (default: ./results/<video_id>_importance.png)")
+    parser.add_argument("--output", type=str, default="./results/2WdxCVg76YE_importance.png",
+                        help="Output path for the plot")
     args = parser.parse_args()
 
     infer(args)
+
