@@ -21,14 +21,15 @@ class TemporalConvHead(nn.Module):
             nn.Conv1d(hidden, 256, kernel_size=11, padding=5),
             nn.BatchNorm1d(256),
             nn.ReLU(),
-            nn.Dropout(0.0),
+            nn.Dropout(0.1),
             nn.Conv1d(256, 128, kernel_size=7, padding=3),
             nn.BatchNorm1d(128),
             nn.ReLU(),
-            nn.Dropout(0.0),
+            nn.Dropout(0.1),
             nn.Conv1d(128, 64, kernel_size=5, padding=2),
             nn.BatchNorm1d(64),
             nn.ReLU(),
+            nn.Dropout(0.1),
         )
         self.head = nn.Sequential(
             nn.Linear(64, 1),
@@ -75,20 +76,30 @@ class TemporalTransformerHead(nn.Module):
     Full video context — can reason about global narrative arc.
     ~8M parameters.
     """
-    def __init__(self, feat_dim=4096, hidden=512, nhead=8, nlayers=4, 
-                 dim_feedforward=1024, dropout=0.0):
+    def __init__(self, feat_dim=4096, hidden=256, nhead=8, nlayers=2, 
+                 dim_feedforward=512, dropout=0.3):
         super().__init__()
-        self.proj = nn.Linear(feat_dim, hidden)
+        self.proj = nn.Sequential(
+            nn.Linear(feat_dim, hidden),
+            nn.LayerNorm(hidden),
+            nn.GELU(),
+            nn.Dropout(dropout)
+        )
         self.pos_enc = SinusoidalPE(hidden, max_len=7200)
         
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=hidden, nhead=nhead,
             dim_feedforward=dim_feedforward,
             dropout=dropout, batch_first=True,
+            activation="gelu"
         )
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=nlayers)
+        self.layer_norm = nn.LayerNorm(hidden)
         self.head = nn.Sequential(
-            nn.Linear(hidden, 1),
+            nn.Linear(hidden, 64),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(64, 1),
             nn.Sigmoid(),
         )
     
@@ -109,6 +120,7 @@ class TemporalTransformerHead(nn.Module):
             src_key_padding_mask = ~mask  # transformer expects True=ignore
         
         x = self.transformer(x, src_key_padding_mask=src_key_padding_mask)
+        x = self.layer_norm(x)
         scores = self.head(x).squeeze(-1)  # [B, T]
         
         if mask is not None:
@@ -122,9 +134,14 @@ class TemporalLSTMHead(nn.Module):
     Captures both forward and backward temporal context.
     ~5M parameters.
     """
-    def __init__(self, feat_dim=4096, hidden=256, num_layers=2, dropout=0.1):
+    def __init__(self, feat_dim=4096, hidden=256, num_layers=1, dropout=0.4):
         super().__init__()
-        self.proj = nn.Linear(feat_dim, hidden)
+        self.proj = nn.Sequential(
+            nn.Linear(feat_dim, hidden),
+            nn.LayerNorm(hidden),
+            nn.GELU(),
+            nn.Dropout(dropout)
+        )
         self.lstm = nn.LSTM(
             input_size=hidden,
             hidden_size=hidden,
@@ -137,7 +154,8 @@ class TemporalLSTMHead(nn.Module):
         self.dropout = nn.Dropout(dropout)
         self.head = nn.Sequential(
             nn.Linear(hidden * 2, 64),
-            nn.ReLU(),
+            nn.GELU(),
+            nn.Dropout(dropout),
             nn.Linear(64, 1),
             nn.Sigmoid(),
         )

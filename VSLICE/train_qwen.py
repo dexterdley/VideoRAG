@@ -1,5 +1,5 @@
 """
-Train — training loop for the temporal engagement head.
+Train Qwen — training loop for the temporal engagement head using QWEN3-Omni features.
 
 Trains a lightweight temporal model on pre-extracted VLM features
 to predict per-frame engagement scores, supervised by YouTube
@@ -8,16 +8,16 @@ Most Replayed heatmaps.
 Supports single-GPU and multi-GPU (DDP) training via torchrun.
 
 Single-GPU usage:
-    python ./VSLICE/train.py --train_manifest="./processed_dataset/trump_vids/train.json" \
+    python ./VSLICE/train_qwen.py --train_manifest="./processed_dataset/trump_vids/train.json" \
     --val_manifest="./processed_dataset/trump_vids/val.json" \
-    --features_dir="./processed_dataset/trump_vids/features/" \
+    --features_dir="./processed_dataset/trump_vids/features_qwen/" \
     --output_dir="./checkpoints" --arch conv --epochs 50 --lr 1e-3
 
 Multi-GPU usage (8 GPUs):
-    torchrun --nproc_per_node=8 ./VSLICE/train.py \
+    torchrun --nproc_per_node=8 ./VSLICE/train_qwen.py \
     --train_manifest="./processed_dataset/trump_vids/train.json" \
     --val_manifest="./processed_dataset/trump_vids/val.json" \
-    --features_dir="./processed_dataset/trump_vids/features/" \
+    --features_dir="./processed_dataset/trump_vids/features_qwen/" \
     --output_dir="./checkpoints" --arch conv --epochs 100 --lr 1e-3
 """
 import os
@@ -151,7 +151,7 @@ def train_one_epoch(model, loader, optimizer, device, epoch, sampler=None):
         # Ranking loss
         rank_loss = ranking_loss(predicted, heatmap, mask, margin=0.2)
         
-        loss = reg_loss + 0.1 * rank_loss
+        loss = reg_loss + 0.5 * rank_loss
         
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -397,7 +397,7 @@ if __name__ == "__main__":
     parser.add_argument("--train_manifest", type=str, required=True)
     parser.add_argument("--val_manifest", type=str, required=True)
     parser.add_argument("--features_dir", type=str, required=True)
-    parser.add_argument("--output_dir", type=str, default="model_checkpoints")
+    parser.add_argument("--output_dir", type=str, default="model_checkpoints_qwen")
     parser.add_argument("--arch", type=str, default="transformer", choices=["conv", "bi_lstm", "transformer"])
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--batch_size", type=int, default=64,

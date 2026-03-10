@@ -51,15 +51,26 @@ class VSLICEDataset(Dataset):
         # Build chunk index: (video_idx, chunk_start) for every chunk
         self.videos = []
         self.chunks = []
+        self.cache = {}
         for item in self.manifest:
             feat_path = os.path.join(features_dir, f"{item['video_id']}.npz")
             if os.path.exists(feat_path):
                 video_idx = len(self.videos)
                 self.videos.append({**item, "feat_path": feat_path})
                 
-                # Peek at feature length
+                # Load features into RAM once
                 data = np.load(feat_path, allow_pickle=True)
-                T = data["features"].shape[0]
+                features_full = data["features"]
+                heatmap_full = data["heatmap"] if "heatmap" in data else np.zeros(features_full.shape[0], dtype=np.float32)
+                times_full = data["times"]
+                
+                T = features_full.shape[0]
+                
+                self.cache[video_idx] = {
+                    "features": features_full,
+                    "heatmap": heatmap_full,
+                    "times": times_full,
+                }
                 
                 if T <= max_frames:
                     # Short video: single chunk (will be padded)
@@ -87,11 +98,11 @@ class VSLICEDataset(Dataset):
     def __getitem__(self, idx):
         video_idx, chunk_start = self.chunks[idx]
         item = self.videos[video_idx]
-        data = np.load(item["feat_path"], allow_pickle=True)
         
-        features_full = data["features"]    # [T_full, D]
-        heatmap_full = data["heatmap"]       # [T_full]
-        times_full = data["times"]           # [T_full]
+        cached = self.cache[video_idx]
+        features_full = cached["features"]
+        heatmap_full = cached["heatmap"]
+        times_full = cached["times"]
         
         T_full = features_full.shape[0]
         
@@ -103,9 +114,9 @@ class VSLICEDataset(Dataset):
         
         # Extract chunk
         chunk_end = min(chunk_start + self.max_frames, T_full)
-        features = features_full[chunk_start:chunk_end]
-        heatmap = heatmap_full[chunk_start:chunk_end]
-        times = times_full[chunk_start:chunk_end]
+        features = features_full[chunk_start:chunk_end].copy()
+        heatmap = heatmap_full[chunk_start:chunk_end].copy()
+        times = times_full[chunk_start:chunk_end].copy()
         T = features.shape[0]
         
         # Data augmentation (on the chunk)
