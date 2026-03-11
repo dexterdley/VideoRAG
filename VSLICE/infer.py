@@ -418,7 +418,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Run engagement inference on a single video and plot importance scores"
     )
-    parser.add_argument("--video", type=str, default="./downloads/rival_vids/HTkOQrYr8DI.mp4", 
+    parser.add_argument("--video", type=str, default="./downloads/rival_vids/aAzcPEESXms.mp4", 
                         help="Path to input video file (.mp4)")
     parser.add_argument("--manifest", type=str, default="./downloads/rival_vids/manifest.json",
                         help="Path to manifest JSON (to look up video title as query)")
@@ -426,13 +426,13 @@ if __name__ == "__main__":
                         help="Path to trained temporal model checkpoint (.pt)")
     parser.add_argument("--model_path", type=str, default=".checkpoints/MiniCPM-V-2_6-int4",
                         help="Path to VLM model for feature extraction")
-    parser.add_argument("--heatmap_json", type=str, default="./downloads/rival_vids/HTkOQrYr8DI_heatmap.json",
+    parser.add_argument("--heatmap_json", type=str, default="./downloads/rival_vids/aAzcPEESXms_heatmap.json",
                         help="Optional: path to GT heatmap JSON for overlay comparison")
     parser.add_argument("--max_frames", type=int, default=300,
                         help="Max frames — must match training (default: 300)")
     parser.add_argument("--fps", type=float, default=1.0,
                         help="Frame sampling rate (default: 1 FPS)")
-    parser.add_argument("--output", type=str, default="./results/HTkOQrYr8DI_importance.png",
+    parser.add_argument("--output", type=str, default="./results/aAzcPEESXms_importance.png",
                         help="Output path for the plot")
     args = parser.parse_args()
 

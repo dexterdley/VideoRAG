@@ -94,7 +94,7 @@ def load_vlm(model_path, device):
     return model, tokenizer, processor
 
 
-def sample_frames_and_audio(video_path, fps=1.0, width=448, height=448, audio_sr=16000):
+def sample_frames_and_audio(video_path, fps=1.0, width=1280, height=720, audio_sr=16000):
     """Sample frames and aligned audio chunks from video at target FPS."""
     from decord import VideoReader, cpu
     import subprocess
