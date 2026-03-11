@@ -377,7 +377,7 @@ def infer(args):
         mask_t = torch.from_numpy(mask_np).unsqueeze(0).to(device)
 
         with torch.no_grad():
-            pred = temporal_model(feat_t, mask=mask_t)
+            pred, _ = temporal_model(feat_t, mask=mask_t)
         pred_chunk = pred[0].cpu().numpy()[:T_chunk]
 
         pred_sum[chunk_start:chunk_start + T_chunk] += pred_chunk

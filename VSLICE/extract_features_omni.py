@@ -13,6 +13,7 @@ Single-GPU usage:
         --manifest="./processed_dataset/trump_vids/train.json" \
         --output_dir="./processed_dataset/trump_vids/features_omni/" \
         --model_path ./MiniCPM-o-2_6
+    # python ./VSLICE/extract_features_omni.py --manifest="./processed_dataset/dog_vids/train.json" --output_dir="./processed_dataset/dog_vids/features_omni/" --model_path .checkpoints/MiniCPM-o-2_6-int4/
 
 Multi-GPU usage (8 GPUs):
     torchrun --nproc_per_node=8 ./VSLICE/extract_features_omni.py \
@@ -32,7 +33,6 @@ from PIL import Image
 
 warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", message=".*not a valid Python identifier.*")
-
 
 # ---------------------------------------------------------------------------
 # Multi-GPU helpers
@@ -69,17 +69,19 @@ def shard_manifest(manifest, rank, world_size):
 
 def load_vlm(model_path, device):
     """Load MiniCPM-o model for feature extraction on a specific device."""
-    from transformers import AutoModel, AutoTokenizer, AutoProcessor
-    
-    dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
+    from transformers import AutoTokenizer, AutoProcessor
+    from auto_gptq import AutoGPTQForCausalLM
     
     print(f"[GPU {device}] Loading VLM from {model_path}...")
-    model = AutoModel.from_pretrained(
+    
+    # Use the test script's exact loading logic for the quantized model
+    model = AutoGPTQForCausalLM.from_quantized(
         model_path,
+        torch_dtype=torch.bfloat16,
+        device=device,
         trust_remote_code=True,
-        dtype=dtype,
-        device_map=device,
-        attn_implementation="sdpa", # usually sdpa is preferred for newer models
+        disable_exllama=True,
+        disable_exllamav2=True,
         init_vision=True,
         init_audio=True,
         init_tts=True
@@ -92,81 +94,145 @@ def load_vlm(model_path, device):
     return model, tokenizer, processor
 
 
-def sample_frames(video_path, fps=1.0, width=448, height=448):
-    """Sample frames from video at target FPS."""
+def sample_frames_and_audio(video_path, fps=1.0, width=448, height=448, audio_sr=16000):
+    """Sample frames and aligned audio chunks from video at target FPS."""
     from decord import VideoReader, cpu
+    import subprocess
     
+    # 1. Sample Video Frames
     vr = VideoReader(video_path, ctx=cpu(0), width=width, height=height)
     video_fps = vr.get_avg_fps()
     total_frames = len(vr)
     duration = total_frames / video_fps
     
-    # Sample at target FPS
     step = max(1, int(video_fps / fps))
     indices = list(range(0, total_frames, step))
+    times = [idx / video_fps for idx in indices]
     
     frames_npy = vr.get_batch(indices).asnumpy()
     frames = [Image.fromarray(f, mode="RGB") for f in frames_npy]
-    times = np.array([idx / video_fps for idx in indices])
-    
     del vr
-    return frames, times, duration
+
+    # 2. Sample Audio Chunks (centered on each frame)
+    try:
+        # Fast FFmpeg audio rip (16kHz, mono, 32-bit float PCM)
+        command = [
+            "ffmpeg",
+            "-i", video_path,
+            "-f", "s16le", # MiniCPM-o uses 16-bit PCM for audio, not 32-bit float like Qwen!
+            "-ac", "1",
+            "-ar", str(audio_sr),
+            "pipe:1"
+        ]
+        
+        # Run FFmpeg and capture stdout, suppress stderr
+        result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        
+        if result.returncode != 0 or len(result.stdout) == 0:
+            raise RuntimeError("FFmpeg failed to extract audio or video has no audio track")
+            
+        # Convert raw PCM bytes to numpy array (16-bit integer for MiniCPM)
+        audio_full = np.frombuffer(result.stdout, dtype=np.int16).astype(np.float32) / 32768.0
+        
+        audio_chunks = []
+        chunk_samples = int(audio_sr / fps)
+        
+        for t in times:
+            # Create a 1-second window around the frame timestamp
+            start_sample = int(max(0, (t - 0.5/fps) * audio_sr))
+            end_sample = int(start_sample + chunk_samples)
+            
+            chunk = audio_full[start_sample:end_sample]
+            
+            # Pad with silence if we hit the end of the video
+            if len(chunk) < chunk_samples:
+                chunk = np.pad(chunk, (0, chunk_samples - len(chunk)))
+            audio_chunks.append(chunk)
+            
+    except Exception as e:
+        print(f"    ⚠️ Audio missing or failed to extract via ffmpeg: {e}")
+        # Fallback to silent arrays if the video has no audio track
+        audio_chunks = [np.zeros(int(audio_sr / fps), dtype=np.float32)] * len(frames)
+
+    return frames, audio_chunks, times, duration
 
 
 def extract_features_for_video(model, tokenizer, processor, device,
-                                frames, query, batch_size=8):
+                                frames, audio_chunks, query, batch_size=32):
     """
     Extract query-conditioned VLM features for a list of frames using MiniCPM-o.
     
-    Feeds each frame WITH the query into the VLM, extracts the last 
+    Feeds each frame+audio WITH the query into the VLM, extracts the last 
     hidden state as the feature vector.
     
     Args:
         model, tokenizer, processor: VLM components
         device: torch device
         frames: list of PIL Images
+        audio_chunks: list of np.array (16kHz audio)
         query: text query string
         batch_size: frames per batch
     
     Returns:
         features: np.array [T, D] — hidden state features
     """
+    from tqdm import tqdm
+    
     system_prompt = "You are an expert video analyst focusing on human engagement."
-    user_prompt = f"Analyze this frame in the context of the title: '{query}'. Describe the level of action, emotional weight, or key events happening in this exact moment that would make a viewer rewind and watch it again."
+    user_prompt = f"Analyze this moment in the context of the title: '{query}'. Describe the level of action, sound, emotional weight, or key events happening right now that would make a viewer rewind and watch it again."
     
     all_features = []
     
-    for i in range(0, len(frames), batch_size):
+    for i in tqdm(range(0, len(frames), batch_size), desc="Extracting", leave=False):
         batch_frames = frames[i:i + batch_size]
+        batch_audios = audio_chunks[i:i + batch_size]
         batch_features = []
         
-        for frame in batch_frames:
-            msgs = [
-                {"role": "user", "content": [frame, user_prompt]},
-            ]
+        for frame, audio in zip(batch_frames, batch_audios):
             
-            # MiniCPM-o processor handles the template
+            # 1. Format the text prompt with explicitly placed Omni tags
+            text_prompt = f"{system_prompt}\n(<audio>./</audio>)\n(<image>./</image>)\n{user_prompt}"
+            conversation = [{"role": "user", "content": text_prompt}]
+            
+            # Use the tokenizer to wrap it in the proper ChatML tags
+            prompt = tokenizer.apply_chat_template(
+                conversation, 
+                tokenize=False, 
+                add_generation_prompt=True
+            )
+            
+            # 2. Pass the explicitly separated modalities into the processor
+            # Note: MiniCPM-o expects `audios` to be a list-of-lists for temporally tracked audio chunks
             inputs = processor(
-                msgs,
+                text=prompt,
+                images=[frame],
+                audios=[[audio]],
+                sampling_rate=16000,
                 return_tensors="pt",
                 max_slice_nums=1,
-            ).to(device)
+            )
             
+            seq_len = inputs["input_ids"].shape[1]
+            inputs["position_ids"] = torch.arange(seq_len, device=device).unsqueeze(0)
+            inputs = inputs.to(device)
+
             with torch.inference_mode():
                 outputs = model(
-                    **inputs,
-                    output_hidden_states=True
+                    inputs,
+                    attention_mask=inputs.get("attention_mask"),
+                    output_hidden_states=True,
+                    use_cache=False
                 )
-                # Extract last hidden state, take mean over sequence
+                # Extract last hidden state sequence for the image/audio/text tokens
                 hidden = outputs.hidden_states[-1]  # [1, seq_len, D]
                 feat = hidden.mean(dim=1)            # [1, D]
                 batch_features.append(feat.cpu().float().numpy())
-        
+                
+            # 3. Explicitly clear VRAM after every frame to prevent OOM crashes!
+            del inputs, outputs, hidden, feat
+            torch.cuda.empty_cache()
+            
         all_features.extend(batch_features)
-        
-        if (i // batch_size) % 10 == 0:
-            print(f"    Processed {min(i + batch_size, len(frames))}/{len(frames)} frames")
-    
     features = np.concatenate(all_features, axis=0)  # [T, D]
     return features
 
@@ -216,7 +282,7 @@ def extract_all(manifest_path, output_dir, model_path, batch_size=8,
         
         try:
             # Sample frames
-            frames, times, duration = sample_frames(video_path, fps=fps)
+            frames, audio_chunks, times, duration = sample_frames_and_audio(video_path, fps=fps)
             print(f"    Sampled {len(frames)} frames ({duration:.0f}s video at {fps} FPS)")
             
             # Load heatmap
@@ -234,7 +300,7 @@ def extract_all(manifest_path, output_dir, model_path, batch_size=8,
             # Extract features
             features = extract_features_for_video(
                 model, tokenizer, processor, device,
-                frames, query, batch_size=batch_size
+                frames, audio_chunks, query, batch_size=batch_size
             )
             
             # Save (each GPU writes to the same output_dir — filenames are disjoint)
@@ -270,7 +336,7 @@ if __name__ == "__main__":
                        help="Directory to save extracted features")
     parser.add_argument("--model_path", type=str, default="openbmb/MiniCPM-o-2_6",
                        help="Path to VLM model")
-    parser.add_argument("--batch_size", type=int, default=8)
+    parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--fps", type=float, default=1.0)
     parser.add_argument("--skip_existing", action="store_true", default=True)
     args = parser.parse_args()

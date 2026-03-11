@@ -12,13 +12,13 @@ Single-GPU usage:
     python ./VSLICE/extract_features_qwen.py \
         --manifest="./processed_dataset/trump_vids/train.json" \
         --output_dir="./processed_dataset/trump_vids/features_qwen/" \
-        --model_path Qwen/Qwen3-Omni-30B-A3B-Instruct
+        --model_path ./Qwen3-Omni-30B-A3B-Instruct
 
 Multi-GPU usage (8 GPUs):
     torchrun --nproc_per_node=8 ./VSLICE/extract_features_qwen.py \
         --manifest="./processed_dataset/trump_vids/train.json" \
         --output_dir="./processed_dataset/trump_vids/features_qwen/" \
-        --model_path Qwen/Qwen3-Omni-30B-A3B-Instruct
+        --model_path./Qwen3-Omni-30B-A3B-Instruct
 """
 import os
 import json
@@ -27,12 +27,26 @@ import time
 import warnings
 import torch
 import torch.distributed as dist
+import librosa
 import numpy as np
 from PIL import Image
 
+# 1. Suppress the internal librosa FutureWarnings to keep your console clean
+warnings.filterwarnings("ignore", category=FutureWarning, module="librosa")
 warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", message=".*not a valid Python identifier.*")
 
+import transformers
+transformers.logging.set_verbosity_error()
+
+from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import Qwen3OmniMoeTalkerCodePredictorConfig
+
+# Manually add the missing default if it's absent
+if not hasattr(Qwen3OmniMoeTalkerCodePredictorConfig, 'use_sliding_window'):
+    Qwen3OmniMoeTalkerCodePredictorConfig.use_sliding_window = False
+
+from transformers import Qwen3OmniMoeForConditionalGeneration, Qwen3OmniMoeProcessor
+from qwen_omni_utils import process_mm_info
 
 # ---------------------------------------------------------------------------
 # Multi-GPU helpers
@@ -70,14 +84,15 @@ def shard_manifest(manifest, rank, world_size):
 def load_vlm(model_path, device):
     """Load QWEN3-Omni model for feature extraction on a specific device."""
     try:
-        from transformers import Qwen3OmniMoeForConditionalGeneration, Qwen3OmniMoeProcessor
+        from transformers import Qwen3OmniMoeThinkerForConditionalGeneration, Qwen3OmniMoeProcessor
     except ImportError:
         raise ImportError("Please ensure you have a transformers version supporting Qwen3-Omni installed.")
         
     print(f"[GPU {device}] Loading VLM from {model_path}...")
-    model = Qwen3OmniMoeForConditionalGeneration.from_pretrained(
+    
+    model = Qwen3OmniMoeThinkerForConditionalGeneration.from_pretrained(
         model_path,
-        dtype="auto",
+        torch_dtype=torch.bfloat16,
         device_map=device,
         attn_implementation="flash_attention_2" if torch.cuda.is_available() else "eager",
     ).eval()
@@ -87,115 +102,122 @@ def load_vlm(model_path, device):
     print(f"[GPU {device}] ✅ VLM loaded")
     return model, processor
 
-
-def sample_frames(video_path, fps=1.0, width=448, height=448):
-    """Sample frames from video at target FPS."""
+def sample_frames_and_audio(video_path, fps=1.0, width=448, height=448, audio_sr=16000):
+    """Sample frames and aligned audio chunks from video at target FPS."""
     from decord import VideoReader, cpu
     
+    # 1. Sample Video Frames
     vr = VideoReader(video_path, ctx=cpu(0), width=width, height=height)
     video_fps = vr.get_avg_fps()
     total_frames = len(vr)
     duration = total_frames / video_fps
     
-    # Sample at target FPS
     step = max(1, int(video_fps / fps))
     indices = list(range(0, total_frames, step))
+    times = [idx / video_fps for idx in indices]
     
     frames_npy = vr.get_batch(indices).asnumpy()
     frames = [Image.fromarray(f, mode="RGB") for f in frames_npy]
-    times = np.array([idx / video_fps for idx in indices])
-    
     del vr
-    return frames, times, duration
 
+    # 2. Sample Audio Chunks (centered on each frame)
+    try:
+        import subprocess
+        
+        # Fast FFmpeg audio rip (16kHz, mono, 32-bit float PCM)
+        command = [
+            "ffmpeg",
+            "-i", video_path,
+            "-f", "f32le",
+            "-ac", "1",
+            "-ar", str(audio_sr),
+            "pipe:1"
+        ]
+        
+        # Run FFmpeg and capture stdout, suppress stderr
+        result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        
+        if result.returncode != 0 or len(result.stdout) == 0:
+            raise RuntimeError("FFmpeg failed to extract audio or video has no audio track")
+            
+        # Convert raw PCM bytes to numpy array
+        audio_full = np.frombuffer(result.stdout, dtype=np.float32)
+        
+        audio_chunks = []
+        chunk_samples = int(audio_sr / fps)
+        
+        for t in times:
+            # Create a 1-second window around the frame timestamp
+            start_sample = int(max(0, (t - 0.5/fps) * audio_sr))
+            end_sample = int(start_sample + chunk_samples)
+            
+            chunk = audio_full[start_sample:end_sample]
+            
+            # Pad with silence if we hit the end of the video
+            if len(chunk) < chunk_samples:
+                chunk = np.pad(chunk, (0, chunk_samples - len(chunk)))
+            audio_chunks.append(chunk)
+            
+    except Exception as e:
+        print(f"    ⚠️ Audio missing or failed to extract via ffmpeg: {e}")
+        # Fallback to silent arrays if the video has no audio track
+        audio_chunks = [np.zeros(int(audio_sr / fps))] * len(frames)
 
-def extract_features_for_video(model, processor, device, frames, query, batch_size=4):
-    """
-    Extract query-conditioned VLM features for a list of frames using QWEN3-Omni.
-    
-    Feeds each frame WITH the query into the VLM, extracts the last 
-    hidden state as the feature vector.
-    
-    Args:
-        model, processor: VLM components
-        device: torch device
-        frames: list of PIL Images
-        query: text query string
-        batch_size: frames per batch (keep small for 30B model)
-    
-    Returns:
-        features: np.array [T, D] — hidden state features
-    """
-    from qwen_omni_utils import process_mm_info
+    return frames, audio_chunks, times, duration
+
+def extract_features_for_video(model, processor, device, frames, audio_chunks, query, batch_size=4):
+    from tqdm import tqdm
 
     system_prompt = "You are an expert video analyst focusing on human engagement."
-    user_prompt = f"Analyze this frame in the context of the title: '{query}'. Describe the level of action, emotional weight, or key events happening in this exact moment that would make a viewer rewind and watch it again."
+    user_prompt = f"Analyze this moment in the context of the title: '{query}'. Describe the level of action, sound, emotional weight, or key events happening right now that would make a viewer rewind and watch it again."
     
     all_features = []
     
-    for i in range(0, len(frames), batch_size):
+    # Use tqdm for the batch loop
+    for i in tqdm(range(0, len(frames), batch_size), desc="Extracting", leave=False):
         batch_frames = frames[i:i + batch_size]
-        batch_features = []
+        batch_audios = audio_chunks[i:i + batch_size]
+        batch_texts = []
         
-        # Qwen-Omni processes inputs sequentially or through packed batches, 
-        # but to maintain per-frame independent features we process them in a loop
-        # within the batch, or pass them as a valid batch if the processor supports it.
-        # Here we process frame-by-frame inside the batch loop to avoid mixed embedding dimensions.
-        for frame in batch_frames:
-            conversation = [
-                {"role": "system", "content": [{"type": "text", "text": system_prompt}]},
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "image", "image": frame},
-                        {"type": "text", "text": user_prompt}
-                    ],
-                },
-            ]
+        # 1. Format the multi-modal conversation for the batch ONCE
+        conversation = [
+            {"role": "system", "content": [{"type": "text", "text": system_prompt}]},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image"}, # Image placeholder
+                    {"type": "audio"}, # Audio placeholder
+                    {"type": "text", "text": user_prompt}
+                ],
+            },
+        ]
+        text_template = processor.apply_chat_template(conversation, add_generation_prompt=True, tokenize=False)
+        batch_texts = [text_template] * len(batch_frames)
             
-            # Formulate text and process multimodal info
-            text = processor.apply_chat_template(conversation, add_generation_prompt=True, tokenize=False)
-            audios, images, videos = process_mm_info(conversation, use_audio_in_video=False)
-            
-            # Prepare inputs
-            inputs = processor(
-                text=text, 
-                audio=audios, 
-                images=images, 
-                videos=videos, 
-                return_tensors="pt", 
-                padding=True, 
-                use_audio_in_video=False
-            )
-            
-            # Send to model device/dtype
-            inputs = inputs.to(model.device)
-            # Make sure float tensors match model dtype
-            for k, v in inputs.items():
-                if torch.is_floating_point(v):
-                    inputs[k] = v.to(model.dtype)
-            
-            with torch.inference_mode():
-                # We want the hidden states from the forward pass
-                outputs = model(
-                    **inputs,
-                    output_hidden_states=True,
-                    return_dict=True
-                )
-                
-                # Extract last hidden state, take mean over sequence length dimension
-                hidden = outputs.hidden_states[-1]  # [1, seq_len, D]
-                feat = hidden.mean(dim=1)            # [1, D]
-                batch_features.append(feat.cpu().float().numpy())
+        # 2. Process the text, images, and raw audio arrays together
+        inputs = processor(
+            text=batch_texts, 
+            images=batch_frames, 
+            audio=batch_audios,          # Pass our chunked arrays directly
+            sampling_rate=16000,         # Tell the processor our audio sample rate
+            return_tensors="pt", 
+            padding=True
+        )
         
-        all_features.extend(batch_features)
+        inputs = inputs.to(model.device, non_blocking=True)
+        for k, v in inputs.items():
+            if torch.is_floating_point(v):
+                inputs[k] = v.to(model.dtype, non_blocking=True)
         
-        if (i // batch_size) % 10 == 0:
-            print(f"    Processed {min(i + batch_size, len(frames))}/{len(frames)} frames")
-    
-    features = np.concatenate(all_features, axis=0)  # [T, D]
+        # 3. Extract the fused hidden states
+        with torch.inference_mode():
+            outputs = model(**inputs, output_hidden_states=True, return_dict=True, use_cache=False)
+            hidden = outputs.hidden_states[-1] 
+            feats = hidden.mean(dim=1) 
+            all_features.extend(feats.cpu().float().numpy())
+            
+    features = np.concatenate([f[None, :] for f in all_features], axis=0)  # [T, D]
     return features
-
 
 # ---------------------------------------------------------------------------
 # Main extraction loop
@@ -242,7 +264,14 @@ def extract_all(manifest_path, output_dir, model_path, batch_size=4,
         
         try:
             # Sample frames
-            frames, times, duration = sample_frames(video_path, fps=fps)
+            # frames, times, duration = sample_frames(video_path, fps=fps)
+            frames, audio_chunks, times, duration = sample_frames_and_audio(video_path, fps=fps)
+
+            # And pass it to the extractor:
+            features = extract_features_for_video(
+                model, processor, device,
+                frames, audio_chunks, query, batch_size=batch_size
+            )
             print(f"    Sampled {len(frames)} frames ({duration:.0f}s video at {fps} FPS)")
             
             # Load heatmap
@@ -256,12 +285,6 @@ def extract_all(manifest_path, output_dir, model_path, batch_size=4,
                 interp = interp1d(hm_times, hm_values, kind="linear",
                                  fill_value="extrapolate", bounds_error=False)
                 heatmap_values = np.clip(interp(times), 0, 1)
-            
-            # Extract features
-            features = extract_features_for_video(
-                model, processor, device,
-                frames, query, batch_size=batch_size
-            )
             
             # Save (each GPU writes to the same output_dir — filenames are disjoint)
             save_dict = {
@@ -298,8 +321,8 @@ if __name__ == "__main__":
                        help="Directory to save extracted features")
     parser.add_argument("--model_path", type=str, default="Qwen/Qwen3-Omni-30B-A3B-Instruct",
                        help="Path to VLM model")
-    parser.add_argument("--batch_size", type=int, default=4,
-                       help="Frames processed per batch. Keep small for 30B models to avoid OOM.")
+    parser.add_argument("--batch_size", type=int, default=16,
+                       help="Frames processed per batch.")
     parser.add_argument("--fps", type=float, default=1.0)
     parser.add_argument("--skip_existing", action="store_true", default=True)
     args = parser.parse_args()

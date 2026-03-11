@@ -134,6 +134,11 @@ class VSLICEDataset(Dataset):
             if np.random.random() < 0.5:
                 drop_mask = np.random.random(T) < 0.1
                 features[drop_mask] = 0.0
+                
+            # Feature continuous noise: prevent memorization of VLM exact outputs
+            # Forced noise on EVERY sample to prevent the model from hyper-focusing on small dataset floats
+            noise = np.random.normal(loc=0.0, scale=0.1, size=features.shape)
+            features += noise
         
         # Pad if shorter than max_frames
         mask = np.ones(self.max_frames, dtype=bool)

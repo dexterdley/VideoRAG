@@ -35,6 +35,7 @@ class TemporalConvHead(nn.Module):
             nn.Linear(64, 1),
             nn.Sigmoid(),
         )
+        self.class_head = nn.Linear(64, 3)
     
     def forward(self, features, mask=None):
         """
@@ -49,10 +50,11 @@ class TemporalConvHead(nn.Module):
         x = self.convs(x)                # [B, 64, T]
         x = x.permute(0, 2, 1)           # [B, T, 64]
         scores = self.head(x).squeeze(-1)  # [B, T]
+        logits = self.class_head(x)        # [B, T, 3]
         
         if mask is not None:
             scores = scores * mask.float()
-        return scores
+        return scores, logits
 
 
 class SinusoidalPE(nn.Module):
@@ -102,6 +104,12 @@ class TemporalTransformerHead(nn.Module):
             nn.Linear(64, 1),
             nn.Sigmoid(),
         )
+        self.class_head = nn.Sequential(
+            nn.Linear(hidden, 64),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(64, 3),
+        )
     
     def forward(self, features, mask=None):
         """
@@ -122,10 +130,11 @@ class TemporalTransformerHead(nn.Module):
         x = self.transformer(x, src_key_padding_mask=src_key_padding_mask)
         x = self.layer_norm(x)
         scores = self.head(x).squeeze(-1)  # [B, T]
+        logits = self.class_head(x)        # [B, T, 3]
         
         if mask is not None:
             scores = scores * mask.float()
-        return scores
+        return scores, logits
 
 
 class TemporalLSTMHead(nn.Module):
@@ -159,6 +168,12 @@ class TemporalLSTMHead(nn.Module):
             nn.Linear(64, 1),
             nn.Sigmoid(),
         )
+        self.class_head = nn.Sequential(
+            nn.Linear(hidden * 2, 64),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(64, 3),
+        )
 
     def forward(self, features, mask=None):
         """
@@ -186,10 +201,11 @@ class TemporalLSTMHead(nn.Module):
         x = self.layer_norm(x)
         x = self.dropout(x)
         scores = self.head(x).squeeze(-1)            # [B, T]
+        logits = self.class_head(x)                  # [B, T, 3]
 
         if mask is not None:
             scores = scores * mask.float()
-        return scores
+        return scores, logits
 
 
 def build_model(arch="conv", feat_dim=4096, **kwargs):

@@ -117,6 +117,37 @@ def ranking_loss(predicted, target, mask, margin=0.2):
     return total_loss
 
 
+def region_aware_loss(predicted, logits, target, mask, n_classes=3):
+    """
+    Region-Aware Classification-Regression Loss
+    Discretizes the continuous target [0, 1] into n_classes.
+    Computes CE loss on logits.
+    Computes Boundary loss on predicted bounded by the class its logits predict.
+    """
+    valid_logits = logits[mask]       # [N, 3]
+    valid_target = target[mask]       # [N]
+    valid_predicted = predicted[mask] # [N]
+    
+    if len(valid_target) == 0:
+        return torch.tensor(0.0, device=predicted.device), torch.tensor(0.0, device=predicted.device)
+
+    # Discretize GT target into classes (e.g., 0-0.33 -> 0)
+    target_class = torch.clamp((valid_target * n_classes).long(), 0, n_classes - 1)
+    ce_loss = F.cross_entropy(valid_logits, target_class)
+    
+    # Boundary Loss
+    # Bind the regular regression score to the bounds of the PREDICTED class region
+    pred_class = torch.argmax(valid_logits, dim=-1) # [N]
+    lower_bound = pred_class.float() / n_classes
+    upper_bound = (pred_class.float() + 1.0) / n_classes
+    
+    # Penalize only if predicted score is strictly outside [lower_bound, upper_bound]
+    boundary_penalty = F.relu(lower_bound - valid_predicted) + F.relu(valid_predicted - upper_bound)
+    boundary_loss = boundary_penalty.mean()
+
+    return ce_loss, boundary_loss
+
+
 # ---------------------------------------------------------------------------
 # Train / Validate
 # ---------------------------------------------------------------------------
@@ -130,6 +161,8 @@ def train_one_epoch(model, loader, optimizer, device, epoch, sampler=None):
     total_loss = 0
     total_reg = 0
     total_rank = 0
+    total_ce = 0
+    total_bound = 0
     n_batches = 0
     all_predicted = []
     all_target = []
@@ -141,7 +174,7 @@ def train_one_epoch(model, loader, optimizer, device, epoch, sampler=None):
         
         optimizer.zero_grad()
         
-        predicted = model(features, mask=mask)      # [B, T]
+        predicted, logits = model(features, mask=mask)      # [B, T], [B, T, 3]
         
         # Regression loss (only on valid frames)
         reg_loss = F.mse_loss(
@@ -151,7 +184,10 @@ def train_one_epoch(model, loader, optimizer, device, epoch, sampler=None):
         # Ranking loss
         rank_loss = ranking_loss(predicted, heatmap, mask, margin=0.2)
         
-        loss = reg_loss + 0.1 * rank_loss
+        # Region-Aware Loss
+        ce_loss, bound_loss = region_aware_loss(predicted, logits, heatmap, mask, n_classes=3)
+        
+        loss = reg_loss + args.rank_weight * rank_loss + args.region_weight * (ce_loss + bound_loss)
         
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -160,6 +196,8 @@ def train_one_epoch(model, loader, optimizer, device, epoch, sampler=None):
         total_loss += loss.item()
         total_reg += reg_loss.item()
         total_rank += rank_loss.item()
+        total_ce += ce_loss.item()
+        total_bound += bound_loss.item()
         n_batches += 1
         
         # Collect per-video predictions and targets for correlation
@@ -181,6 +219,8 @@ def train_one_epoch(model, loader, optimizer, device, epoch, sampler=None):
         "reg_loss": total_reg / max(n_batches, 1),
         "spearman": np.mean(spearman_scores) if spearman_scores else 0.0,
         "rank_loss": total_rank / max(n_batches, 1),
+        "ce_loss": total_ce / max(n_batches, 1),
+        "bound_loss": total_bound / max(n_batches, 1),
     }
 
 
@@ -200,7 +240,7 @@ def validate(model, loader, device):
         
         # If model is DDP-wrapped, access underlying module
         m = model.module if hasattr(model, "module") else model
-        predicted = m(features, mask=mask)
+        predicted, logits = m(features, mask=mask)
         
         reg_loss = F.smooth_l1_loss(
             predicted[mask], heatmap[mask], reduction="mean"
@@ -249,8 +289,9 @@ def train(args):
     # ------------------------------------------------------------------
     train_dataset = VSLICEDataset(
         args.train_manifest, args.features_dir,
-        max_frames=args.max_frames, augment=False, heatmap_sigma=0.0
+        max_frames=args.max_frames, augment=args.augment, heatmap_sigma=args.heatmap_sigma
     )
+    # Validation must never be augmented and should be evaluated on sharp labels
     val_dataset = VSLICEDataset(
         args.val_manifest, args.features_dir,
         max_frames=args.max_frames, augment=False, heatmap_sigma=0.0
@@ -294,7 +335,12 @@ def train(args):
     if is_main_process(rank):
         print(f"Feature dimension: {feat_dim}")
 
-    model = build_model(arch=args.arch, feat_dim=feat_dim).to(device)
+    model = build_model(
+        arch=args.arch, 
+        feat_dim=feat_dim,
+        hidden=args.hidden_dim,
+        dropout=args.dropout
+    ).to(device)
 
     if distributed:
         model = DDP(model, device_ids=[local_rank], output_device=local_rank)
@@ -375,8 +421,10 @@ def train(args):
             pbar.set_postfix({
                 "loss": f"{train_metrics['loss']:.4f}",
                 "val": f"{val_metrics['val_loss']:.4f}",
+                "ce": f"{train_metrics['ce_loss']:.4f}",
                 "train_ρ": f"{train_metrics['spearman']:.4f}",
                 "val_ρ": f"{val_metrics['spearman']:.4f}{improved}",
+                "best val_ρ": f"{best_spearman:.4f}{' ✅'}",
                 "lr": f"{lr:.1e}",
             })
 
@@ -404,8 +452,14 @@ if __name__ == "__main__":
                        help="Total effective batch size (split across GPUs in DDP)")
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--weight_decay", type=float, default=1e-5)
+    parser.add_argument("--dropout", type=float, default=0.4, help="Dropout probability for regularization")
+    parser.add_argument("--hidden_dim", type=int, default=256, help="Hidden dimension size for models")
     parser.add_argument("--max_frames", type=int, default=300,
                        help="Max frames per video (5 min at 1 FPS)")
+    parser.add_argument("--augment", action="store_true", help="Enable dataset temporal augmentation")
+    parser.add_argument("--heatmap_sigma", type=float, default=2.0, help="Gaussian smoothing for GT heatmaps")
+    parser.add_argument("--rank_weight", type=float, default=2.0, help="Weight for the Margin Ranking Loss (higher values optimize Spearman directly)")
+    parser.add_argument("--region_weight", type=float, default=5.0, help="Weight for the Multi-Task Region-Aware Boundary Loss")
     parser.add_argument("--num_workers", type=int, default=2)
     args = parser.parse_args()
     
