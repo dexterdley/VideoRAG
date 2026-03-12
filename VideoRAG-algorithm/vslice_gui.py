@@ -18,7 +18,7 @@ from PIL import Image
 from decord import VideoReader, cpu
 from transformers import AutoModel, AutoTokenizer, AutoModelForSpeechSeq2Seq, AutoModelForImageTextToText, AutoProcessor, pipeline
 from torch.utils.data import Dataset, DataLoader
-#from qwen_vl_utils import process_vision_info
+from qwen_vl_utils import process_vision_info
 
 from transcribe import (
     transcribe_video,
