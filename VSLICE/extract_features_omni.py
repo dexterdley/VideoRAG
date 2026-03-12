@@ -30,9 +30,25 @@ import torch
 import torch.distributed as dist
 import numpy as np
 from PIL import Image
-
+import scipy.io.wavfile as wav
 warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", message=".*not a valid Python identifier.*")
+
+
+def debug_save_audio_int16(chunk, filename="check.wav", sr=16000):
+    """Saves a float32 audio chunk to a standard 16-bit PCM .wav file."""
+    # 1. Ensure it's a 1D numpy array
+    audio_data = np.array(chunk).flatten()
+    
+    # 2. Normalize/Clip to [-1.0, 1.0] to prevent distortion
+    audio_data = np.clip(audio_data, -1.0, 1.0)
+    
+    # 3. Scale to 16-bit range and cast
+    audio_data = (audio_data * 32767).astype(np.int16)
+    
+    # 4. Write
+    wav.write(filename, sr, audio_data)
+    print(f"✅ Saved standard 16-bit WAV to {filename}")
 
 # ---------------------------------------------------------------------------
 # Multi-GPU helpers
@@ -84,7 +100,7 @@ def load_vlm(model_path, device):
         disable_exllamav2=True,
         init_vision=True,
         init_audio=True,
-        init_tts=True
+        init_tts=False
     ).eval()
     
     tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
@@ -178,8 +194,10 @@ def extract_features_for_video(model, tokenizer, processor, device,
     """
     from tqdm import tqdm
     
-    system_prompt = "You are an expert video analyst focusing on human engagement."
-    user_prompt = f"Analyze this moment in the context of the title: '{query}'. Describe the level of action, sound, emotional weight, or key events happening right now that would make a viewer rewind and watch it again."
+    #system_prompt = "You are an expert video analyst focusing on human engagement."
+    #user_prompt = f"Analyze this moment in the context of the title: '{query}'. Describe the level of action, sound, emotional weight, or key events happening right now that would make a viewer rewind and watch it again."
+    system_prompt = "You are an EXPERT video analyst."
+    user_prompt = f"Analyze this moment in the context of the title: '{query}'. Focus on the ACTIONS, SOUNDS, and KEY EVENTS."
     
     all_features = []
     
@@ -233,6 +251,81 @@ def extract_features_for_video(model, tokenizer, processor, device,
             torch.cuda.empty_cache()
             
         all_features.extend(batch_features)
+    features = np.concatenate(all_features, axis=0)  # [T, D]
+    return features
+
+def extract_temporal_features_for_video(model, tokenizer, processor, device,
+                                frames, audio_chunks, query, batch_size=32, window_size=5):
+    """
+    Extract query-conditioned VLM features using a TEMPORAL SLIDING WINDOW.
+    
+    For each frame 't', feeds frames [t-window_size+1 ... t] into the model 
+    so the embedding for frame 't' contains historical motion context.
+    """
+    from tqdm import tqdm
+    
+    system_prompt = "You are an expert video analyst specializing in human engagement, temporal dynamics, and audio-visual cues"
+    user_prompt = f"Analyze this sequence in the context of the title: '{query}'. Based on the key actions and audio, classify this sequence's engagement as a 'peak' (highlight), 'build', or 'valley' (lull), and justify your choice."
+    
+    all_features = []
+    
+    # Process frame by frame (batching is tricky with variable sliding windows, 
+    # so we process sequentially, but it gives you perfect temporal embeddings)
+    for i in tqdm(range(len(frames)), desc="Extracting Temporal Windows", leave=False):
+        
+        # 1. Determine the sliding window indices
+        start_idx = max(0, i - window_size + 1)
+        window_frames = frames[start_idx : i + 1]
+        window_audios = audio_chunks[start_idx : i + 1]
+        
+        # 2. Dynamically build the prompt with the correct number of media tags
+        media_tags = ""
+        for _ in range(len(window_frames)):
+            media_tags += "(<audio>./</audio>)\n(<image>./</image>)\n"
+            
+        text_prompt = f"{system_prompt}\n{media_tags}{user_prompt}"
+        conversation = [{"role": "user", "content": text_prompt}]
+        
+        # 3. Apply ChatML template
+        prompt = tokenizer.apply_chat_template(
+            conversation, 
+            tokenize=False, 
+            add_generation_prompt=True
+        )
+
+        # debug_save_audio_int16(window_audios)
+        # 4. Pass the sequence of frames and audio into the processor
+        inputs = processor(
+            text=prompt,
+            images=window_frames,
+            # MiniCPM-o expects a list of lists for temporally tracked audio chunks in a single turn
+            audios=[window_audios], 
+            sampling_rate=16000,
+            return_tensors="pt",
+            max_slice_nums=1,
+        )
+        
+        seq_len = inputs["input_ids"].shape[1]
+        inputs["position_ids"] = torch.arange(seq_len, device=device).unsqueeze(0)
+        inputs = inputs.to(device)
+
+        with torch.inference_mode():
+            outputs = model(
+                inputs,
+                attention_mask=inputs.get("attention_mask"),
+                output_hidden_states=True,
+                use_cache=False
+            )
+            # The last hidden state now represents the LAST frame in the window,
+            # having attended to all previous frames in the prompt.
+            hidden = outputs.hidden_states[-1]  # [1, seq_len, D]
+            feat = hidden.mean(dim=1)            # [1, D]
+            all_features.append(feat.cpu().float().numpy())
+            
+        # Clear VRAM
+        del inputs, outputs, hidden, feat
+        torch.cuda.empty_cache()
+            
     features = np.concatenate(all_features, axis=0)  # [T, D]
     return features
 
@@ -298,7 +391,11 @@ def extract_all(manifest_path, output_dir, model_path, batch_size=8,
                 heatmap_values = np.clip(interp(times), 0, 1)
             
             # Extract features
-            features = extract_features_for_video(
+            #features = extract_features_for_video(
+            #    model, tokenizer, processor, device,
+            #    frames, audio_chunks, query, batch_size=batch_size
+            #)
+            features = extract_temporal_features_for_video(
                 model, tokenizer, processor, device,
                 frames, audio_chunks, query, batch_size=batch_size
             )

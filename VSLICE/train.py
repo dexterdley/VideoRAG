@@ -159,7 +159,7 @@ def train_one_epoch(model, loader, optimizer, device, epoch, sampler=None):
         sampler.set_epoch(epoch)  # ensure proper shuffling per epoch in DDP
 
     total_loss = 0
-    total_reg = 0
+    total_mse = 0
     total_rank = 0
     total_ce = 0
     total_bound = 0
@@ -177,7 +177,7 @@ def train_one_epoch(model, loader, optimizer, device, epoch, sampler=None):
         predicted, logits = model(features, mask=mask)      # [B, T], [B, T, 3]
         
         # Regression loss (only on valid frames)
-        reg_loss = F.mse_loss(
+        mse_loss = F.mse_loss(
             predicted[mask], heatmap[mask], reduction="mean"
         )
         
@@ -187,14 +187,14 @@ def train_one_epoch(model, loader, optimizer, device, epoch, sampler=None):
         # Region-Aware Loss
         ce_loss, bound_loss = region_aware_loss(predicted, logits, heatmap, mask, n_classes=3)
         
-        loss = reg_loss + args.rank_weight * rank_loss + args.region_weight * (ce_loss + bound_loss)
+        loss = mse_loss + args.rank_weight * rank_loss + 0.0 * (ce_loss + bound_loss)
         
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
         
         total_loss += loss.item()
-        total_reg += reg_loss.item()
+        total_mse += mse_loss.item()
         total_rank += rank_loss.item()
         total_ce += ce_loss.item()
         total_bound += bound_loss.item()
@@ -216,7 +216,7 @@ def train_one_epoch(model, loader, optimizer, device, epoch, sampler=None):
                 spearman_scores.append(rho)
     return {
         "loss": total_loss / max(n_batches, 1),
-        "reg_loss": total_reg / max(n_batches, 1),
+        "mse_loss": total_mse / max(n_batches, 1),
         "spearman": np.mean(spearman_scores) if spearman_scores else 0.0,
         "rank_loss": total_rank / max(n_batches, 1),
         "ce_loss": total_ce / max(n_batches, 1),
@@ -415,6 +415,7 @@ def train(args):
                     "spearman": best_spearman,
                     "arch": args.arch,
                     "feat_dim": feat_dim,
+                    "hidden": args.hidden_dim,
                 }, os.path.join(args.output_dir, "best_model.pt"))
                 improved = " ⭐"
 
@@ -457,7 +458,7 @@ if __name__ == "__main__":
     parser.add_argument("--max_frames", type=int, default=300,
                        help="Max frames per video (5 min at 1 FPS)")
     parser.add_argument("--augment", action="store_true", help="Enable dataset temporal augmentation")
-    parser.add_argument("--heatmap_sigma", type=float, default=2.0, help="Gaussian smoothing for GT heatmaps")
+    parser.add_argument("--heatmap_sigma", type=float, default=1.0, help="Gaussian smoothing for GT heatmaps")
     parser.add_argument("--rank_weight", type=float, default=2.0, help="Weight for the Margin Ranking Loss (higher values optimize Spearman directly)")
     parser.add_argument("--region_weight", type=float, default=5.0, help="Weight for the Multi-Task Region-Aware Boundary Loss")
     parser.add_argument("--num_workers", type=int, default=2)

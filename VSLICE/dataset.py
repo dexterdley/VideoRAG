@@ -136,7 +136,6 @@ class VSLICEDataset(Dataset):
                 features[drop_mask] = 0.0
                 
             # Feature continuous noise: prevent memorization of VLM exact outputs
-            # Forced noise on EVERY sample to prevent the model from hyper-focusing on small dataset floats
             noise = np.random.normal(loc=0.0, scale=0.1, size=features.shape)
             features += noise
         
