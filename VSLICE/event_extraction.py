@@ -60,7 +60,7 @@ def extract_events(scores, times, min_duration=5.0, merge_gap=3.0,
         if duration >= min_duration:
             region_scores = smoothed[s_idx:e_idx]
             region_times = times[s_idx:e_idx]
-            auc = float(np.trapz(region_scores, region_times))
+            auc = float(np.trapezoid(region_scores, region_times))
             peak = float(np.max(region_scores))
             events.append({
                 "start": float(start_time),
@@ -76,7 +76,7 @@ def extract_events(scores, times, min_duration=5.0, merge_gap=3.0,
     for ev in events:
         mask = (times >= ev["start"]) & (times <= ev["end"])
         if np.any(mask):
-            ev["score"] = float(np.trapz(smoothed[mask], times[mask]))
+            ev["score"] = float(np.trapezoid(smoothed[mask], times[mask]))
             ev["peak_score"] = float(np.max(smoothed[mask]))
     
     events.sort(key=lambda e: e["score"], reverse=True)

@@ -25,7 +25,7 @@ for domain in "${DOMAINS[@]}"; do
         manifest="./processed_dataset/${domain}/${split}.json"
         if [ -f "$manifest" ]; then
             echo "🔄 Extracting omni features: ${domain}/${split} (${NGPUS} GPUs)"
-            CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 torchrun --nproc_per_node=8 --master_port=29501 ./VSLICE/extract_features_omni.py \
+            CUDA_VISIBLE_DEVICES=6,7 torchrun --nproc_per_node=2 --master_port=29501 ./VSLICE/extract_features_omni.py \
                 --manifest="$manifest" \
                 --output_dir="./processed_dataset/${domain}/features_omni_res_tempo/" \
                 --model_path "$MODEL_PATH"
@@ -53,10 +53,10 @@ for domain in "${DOMAINS[@]}"; do
         --lr 1e-3 \
         --weight_decay 1e-4\
         --augment \
-        --rank_weight 5 \
-        --region_weight 1.0
+        --rank_weight 5
 done
 
 echo "✅ Full Omni multi-architecture pipeline complete!"
 
 # python ./VSLICE/infer_omni.py --model_path=".checkpoints/MiniCPM-o-2_6-int4/" --checkpoint="./checkpoints/rival_vids_omni_bi_lstm/best_model.pt"
+# python ./VSLICE/evaluate.py --test_manifest="./processed_dataset/rival_vids/test.json" --checkpoint="./checkpoints/rival_vids_omni_bi_lstm/best_model.pt" --features_dir="./processed_dataset/rival_vids/features_omni_res_tempo/"

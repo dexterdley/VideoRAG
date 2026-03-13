@@ -132,32 +132,117 @@ def compute_ece(predicted, ground_truth, n_bins=15):
 
 
 # ─── Plotting ────────────────────────────────────────────────────────
-def plot_importance(times, predicted, gt_heatmap=None, title="", output_path=None):
-    """Plot predicted importance scores (and optionally GT heatmap)."""
+import scipy.signal
+
+def plot_importance(times, predicted, features=None, gt_heatmap=None, title="", output_path=None):
+    """Plot predicted importance scores and project the Top 3 scene clusters into 2D PCA space."""
     times = np.array(times) if isinstance(times, list) else times
-    fig, ax = plt.subplots(figsize=(14, 4))
+    
+    n_plots = 2 if features is not None else 1
+    # Give the PCA plot a bit more vertical breathing room to be square-ish
+    height_ratios = [1, 1.5] if features is not None else [1]
+    
+    fig, axes = plt.subplots(n_plots, 1, figsize=(14, 4 * n_plots), 
+                             gridspec_kw={'height_ratios': height_ratios})
+    
+    if n_plots == 1:
+        axes = [axes]
 
-    # Predicted
-    ax.plot(times / 60, predicted, color="#4A90D9", linewidth=1.8, label="Predicted")
-    ax.fill_between(times / 60, 0, predicted, alpha=0.15, color="#4A90D9")
+    # Reference scores dictate the "ground truth" for finding peaks
+    reference_scores = gt_heatmap if gt_heatmap is not None else predicted
 
-    # GT heatmap overlay
+    # ---------------------------------------------------------
+    # Row 1: Engagement Scores (Predicted vs GT)
+    # ---------------------------------------------------------
+    ax1 = axes[0]
+    ax1.plot(times / 60, predicted, color="#4A90D9", linewidth=1.8, label="Predicted")
+    ax1.fill_between(times / 60, 0, predicted, alpha=0.15, color="#4A90D9")
+
     if gt_heatmap is not None:
-        ax.plot(times / 60, gt_heatmap, color="#E74C3C", linewidth=1.2,
-                alpha=0.7, linestyle="--", label="YouTube Heatmap (GT)")
+        ax1.plot(times / 60, gt_heatmap, color="#E74C3C", linewidth=1.2,
+                 alpha=0.7, linestyle="--", label="YouTube Heatmap (GT)")
 
-    ax.set_xlabel("Time (minutes)", fontsize=12)
-    ax.set_ylabel("Engagement Score", fontsize=12)
-    ax.set_ylim(-0.05, 1.05)
-    ax.set_xlim(times[0] / 60, times[-1] / 60)
-    ax.legend(loc="upper right", fontsize=10)
+    ax1.set_ylabel("Engagement Score", fontsize=12)
+    ax1.set_ylim(-0.05, 1.05)
+    ax1.set_xlim(times[0] / 60, times[-1] / 60)
+    ax1.legend(loc="upper right", fontsize=10)
+    ax1.grid(True, alpha=0.3)
 
     plot_title = "Predicted Engagement Importance Score"
     if title:
         plot_title += f"\n{title}"
-    ax.set_title(plot_title, fontsize=13, fontweight="bold")
+    ax1.set_title(plot_title, fontsize=13, fontweight="bold")
+    
+    if n_plots == 1:
+        ax1.set_xlabel("Time (minutes)", fontsize=12)
 
-    ax.grid(True, alpha=0.3)
+    if features is not None:
+        from sklearn.decomposition import PCA
+        
+        # Pre-process features (Normalize for cosine similarity)
+        norms = np.linalg.norm(features, axis=1, keepdims=True)
+        norms[norms == 0] = 1e-10
+        feat_norm = features / norms
+
+        # ---------------------------------------------------------
+        # Row 2: 2D PCA Scene Clusters
+        # ---------------------------------------------------------
+        ax2 = axes[1]
+        
+        # 1. Project features to 2D
+        pca = PCA(n_components=2)
+        pca_coords = pca.fit_transform(feat_norm)
+        
+        # Plot the "timeline trajectory" of the whole video in the background
+        ax2.plot(pca_coords[:, 0], pca_coords[:, 1], color="gray", alpha=0.3, linewidth=0.8, zorder=1)
+        ax2.scatter(pca_coords[:, 0], pca_coords[:, 1], color="lightgray", s=15, alpha=0.5, label="Other Frames", zorder=2)
+        
+        # 2. Find distinct peaks (spaced by at least 10 frames/seconds)
+        peaks, _ = scipy.signal.find_peaks(reference_scores, distance=10)
+        if len(peaks) == 0:
+            peaks = np.argsort(reference_scores)[-3:]
+            
+        # 3. Sort peaks by engagement score and grab the Top 3
+        top_peaks = sorted(peaks, key=lambda x: reference_scores[x], reverse=True)[:3]
+        
+        colors = ["#2ECC71", "#9B59B6", "#F1C40F"] 
+        
+        # 4. Cluster the contiguous frames around each peak
+        for i, p in enumerate(top_peaks):
+            key_frame_feat = feat_norm[p]
+            sims = np.dot(feat_norm, key_frame_feat)
+            
+            # Define scene boundary: expand left and right from peak until similarity drops < 0.85
+            # (0.85 is a strong baseline for same-scene VLM cosine similarity)
+            cluster_indices = [p]
+            
+            # Look backwards
+            for j in range(p - 1, -1, -1):
+                if sims[j] > 0.85: cluster_indices.append(j)
+                else: break
+                
+            # Look forwards
+            for j in range(p + 1, len(sims)):
+                if sims[j] > 0.85: cluster_indices.append(j)
+                else: break
+                
+            cluster_indices = sorted(list(set(cluster_indices)))
+            
+            # Plot the cluster "cloud" (The GMM probability mass)
+            ax2.scatter(pca_coords[cluster_indices, 0], pca_coords[cluster_indices, 1], 
+                        color=colors[i], s=60, alpha=0.7, edgecolors='none',
+                        label=f"Cluster {i+1} (Peak at {times[p]/60:.2f}m)", zorder=3)
+            
+            # Mark the exact Key Frame with a large Star
+            ax2.scatter(pca_coords[p, 0], pca_coords[p, 1], 
+                        color=colors[i], marker='*', s=350, edgecolor='black', linewidth=1.5, zorder=4)
+
+        ax2.set_xlabel(f"Principal Component 1 ({pca.explained_variance_ratio_[0]*100:.1f}% Variance)", fontsize=12)
+        ax2.set_ylabel(f"Principal Component 2 ({pca.explained_variance_ratio_[1]*100:.1f}% Variance)", fontsize=12)
+        ax2.set_title("Top 3 Engaging Scenes Projected in VLM Feature Space (PCA)", fontsize=13, fontweight="bold")
+        ax2.legend(loc="upper right", fontsize=10)
+        ax2.grid(True, alpha=0.3)
+
     fig.tight_layout()
 
     if output_path:
@@ -168,7 +253,6 @@ def plot_importance(times, predicted, gt_heatmap=None, title="", output_path=Non
         plt.show()
 
     plt.close(fig)
-
 
 # ─── Main ────────────────────────────────────────────────────────────
 def get_query_from_manifest(manifest_path, video_path):
@@ -207,21 +291,26 @@ def infer(args):
     query = get_query_from_manifest(args.manifest, args.video)
     print(f"\n🏷️ Query (from manifest): \"{query}\"")
 
-    # 3. Sample frames
-    print(f"\n🎬 Sampling frames from: {args.video}")
-    frames, audio_chunks, times, duration  = sample_frames_and_audio(args.video, fps=args.fps)
-    print(f"   {len(frames)} frames sampled ({duration:.0f}s video at {args.fps} FPS)")
+    # 3. Skip if features exist
+    if os.path.exists(args.features_dir):
+        print(f"\n Loading VLM features...")
+        data = np.load(args.features_dir, allow_pickle=True)
+        features = data["features"]
+        times = data["times"]
+    else:
+        # 3. Sample frames & Extract VLM features
+        print(f"\n🎬 Sampling frames from: {args.video}")
+        frames, audio_chunks, times, duration  = sample_frames_and_audio(args.video, fps=args.fps)
+        print(f"   {len(frames)} frames sampled ({duration:.0f}s video at {args.fps} FPS)")
 
-    # 4. Extract VLM features
-    print(f"\n🧠 Extracting VLM features...")
-    vlm_model, tokenizer, processor = load_vlm(args.model_path, device="cuda:0")
-    features = extract_temporal_features_for_video(vlm_model, tokenizer, processor, device,
-                                 frames, audio_chunks, query)
+        print(f"\n🧠 Extracting VLM features...")
+        vlm_model, tokenizer, processor = load_vlm(args.model_path, device="cuda:0")
+        features = extract_temporal_features_for_video(vlm_model, tokenizer, processor, device,
+                                     frames, audio_chunks, query)
+        del vlm_model, tokenizer, processor
+        torch.cuda.empty_cache() if torch.cuda.is_available() else None
 
     print(f"   Features shape: {features.shape}")
-
-    del vlm_model, tokenizer, processor
-    torch.cuda.empty_cache() if torch.cuda.is_available() else None
 
     # 5. Sliding window prediction (matches dataset.py chunking)
     T_full = features.shape[0]
@@ -262,7 +351,7 @@ def infer(args):
         mask_t = torch.from_numpy(mask_np).unsqueeze(0).to(device)
 
         with torch.no_grad():
-            pred, _ = temporal_model(feat_t, mask=mask_t)
+            pred = temporal_model(feat_t, mask=mask_t)
         pred_chunk = pred[0].cpu().numpy()[:T_chunk]
 
         pred_sum[chunk_start:chunk_start + T_chunk] += pred_chunk
@@ -292,6 +381,7 @@ def infer(args):
 
     plot_importance(
         times, predicted_np,
+        features=features,
         gt_heatmap=gt,
         title=f"{video_name} — \"{query}\"",
         output_path=output_path,
@@ -320,6 +410,7 @@ if __name__ == "__main__":
                         help="Frame sampling rate (default: 1 FPS)")
     parser.add_argument("--output", type=str, default="./results/aAzcPEESXms_importance_omni.png",
                         help="Output path for the plot")
+    parser.add_argument("--features_dir", type=str, default="./processed_dataset/rival_vids/features_omni_res_tempo/aAzcPEESXms.npz")
     args = parser.parse_args()
 
     infer(args)

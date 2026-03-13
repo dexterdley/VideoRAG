@@ -235,14 +235,6 @@ def cut_clip(input_path, start_sec, end_sec, output_path):
     subprocess.run(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     return output_path
 
-# --- HELPER: Load Dummy Video ---
-def load_dummy_video():
-    if os.path.exists(DUMMY_VIDEO_PATH):
-        return DUMMY_VIDEO_PATH
-    else:
-        return None
-
-
 # --- HELPER: Generate Commentary ---
 async def generate_commentary(video_path):
     """
