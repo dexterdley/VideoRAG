@@ -5,6 +5,8 @@ import os
 import shutil
 import sys
 
+COOKIE_FILE = "../cookies.txt"  # Set this path
+
 def check_ffmpeg():
     """Checks if ffmpeg is available in the system PATH."""
     return shutil.which("ffmpeg") is not None
@@ -37,6 +39,7 @@ def download_video_and_heatmap(video_url):
     # 3. Construct the command
     cmd = [
         "yt-dlp",
+        "--cookies-from-browser", "chrome",
         *format_args,
         "--write-info-json",  # Grab metadata/heatmap
         "-o", f"{video_id}.%(ext)s",

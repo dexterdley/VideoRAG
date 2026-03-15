@@ -19,6 +19,7 @@ from decord import VideoReader, cpu
 from transformers import AutoModel, AutoTokenizer, AutoModelForSpeechSeq2Seq, AutoModelForImageTextToText, AutoProcessor, pipeline
 from torch.utils.data import Dataset, DataLoader
 from qwen_vl_utils import process_vision_info
+from scipy.ndimage import gaussian_filter1d
 
 from transcribe import (
     transcribe_video,
@@ -325,38 +326,43 @@ async def async_slice_highlight(video_path, h, index):
 
 
 # ─────────────────────── SCORE CALIBRATION ───────────────────────
-
-def calibrate_bitemporal(scores, decay=0.9):
+def calibrate_bitemporal(scores, decay=0.9, sigma=2.0):
     """
-    Performs two passes (Forward and Backward) to spread confidence
-    into the past (anticipation) and future (lingering hype).
+    Performs bitemporal decay and applies a Gaussian filter 
+    to create smooth, bell-shaped confidence curves.
     """
     n = len(scores)
+    if n == 0:
+        return scores
+        
     forward = np.zeros(n)
     backward = np.zeros(n)
 
     # --- Forward Pass (Past -> Future) ---
-    # If we saw a hit recently, we maintain high confidence with decay
     curr_score = 0
     for i in range(n):
         curr_score = max(scores[i], curr_score * decay)
         forward[i] = curr_score
 
     # --- Backward Pass (Future -> Past) ---
-    # If a hit is coming up, we start ramping up confidence now
     curr_score = 0
     for i in range(n - 1, -1, -1):
         curr_score = max(scores[i], curr_score * decay)
         backward[i] = curr_score
 
-    # --- Aggregate ---
-    # Average of two passes creates a "Tent" / "Bell" shape around peaks
-    calibrated = (forward + backward) / 2
+    # --- Aggregate & Smooth ---
+    # Use max() instead of mean() to keep the peak at 1.0 even after smoothing
+    calibrated = np.maximum(forward, backward)
 
-    # Normalize to max 1.0
-    calibrated = np.clip(calibrated, 0, 1)
+    # Apply Gaussian smoothing
+    # sigma=2.0 is a good starting point for 1fps data
+    calibrated = gaussian_filter1d(calibrated, sigma=sigma)
 
-    return calibrated
+    # Normalize to ensure peaks still hit 1.0 if the original model was confident
+    if calibrated.max() > 0:
+        calibrated = calibrated / calibrated.max() * np.max(scores)
+
+    return np.clip(calibrated, 0, 1)
 
 
 # ─────────────────────── SMART SLICING TOOLS ───────────────────────

@@ -14,7 +14,7 @@ import argparse
 from copy import deepcopy
 from PIL import Image
 from decord import VideoReader, cpu
-from transformers import AutoModel, AutoTokenizer, AutoModelForSpeechSeq2Seq, AutoModelForVision2Seq, AutoProcessor, pipeline
+from transformers import AutoModel, AutoTokenizer, AutoModelForSpeechSeq2Seq, AutoModelForImageTextToText, AutoProcessor, pipeline
 from torch.utils.data import Dataset, DataLoader
 from qwen_vl_utils import process_vision_info
 
@@ -96,9 +96,7 @@ class QwenVLWrapper:
             video_metadatas = None
 
         inputs = self.tokenizer(text=[text], images=image_inputs, videos=video_inputs, video_metadata=video_metadatas, **video_kwargs, do_resize=False, return_tensors="pt")
-        
-        #model_inputs = self.tokenizer([text], return_tensors="pt").to("cuda")
-        
+                
         with torch.no_grad():
             generated_ids = self.model.generate(
                 **inputs.to("cuda"),
@@ -395,6 +393,44 @@ class VideoSegmentDataset(Dataset):
         
         return frames, start_sec, end_sec
 
+# ─────────────────────── SCORE CALIBRATION ───────────────────────
+def calibrate_bitemporal(scores, decay=0.9, sigma=2.0):
+    """
+    Performs bitemporal decay and applies a Gaussian filter 
+    to create smooth, bell-shaped confidence curves.
+    """
+    n = len(scores)
+    if n == 0:
+        return scores
+        
+    forward = np.zeros(n)
+    backward = np.zeros(n)
+
+    # --- Forward Pass (Past -> Future) ---
+    curr_score = 0
+    for i in range(n):
+        curr_score = max(scores[i], curr_score * decay)
+        forward[i] = curr_score
+
+    # --- Backward Pass (Future -> Past) ---
+    curr_score = 0
+    for i in range(n - 1, -1, -1):
+        curr_score = max(scores[i], curr_score * decay)
+        backward[i] = curr_score
+
+    # --- Aggregate & Smooth ---
+    # Use max() instead of mean() to keep the peak at 1.0 even after smoothing
+    calibrated = np.maximum(forward, backward)
+
+    # Apply Gaussian smoothing
+    # sigma=2.0 is a good starting point for 1fps data
+    calibrated = gaussian_filter1d(calibrated, sigma=sigma)
+
+    # Normalize to ensure peaks still hit 1.0 if the original model was confident
+    if calibrated.max() > 0:
+        calibrated = calibrated / calibrated.max() * np.max(scores)
+
+    return np.clip(calibrated, 0, 1)
 
 # --- MAIN ---
 async def analyze_video(video_path, input_prompt):
@@ -470,7 +506,13 @@ async def analyze_video(video_path, input_prompt):
         batch_times = [int(start_sec) + k for k in range(num_frames)]
         history_time.extend(batch_times)
         history_conf.extend(confidence.tolist())
-        plot_df = pd.DataFrame({"Time (s)": history_time, "Confidence": history_conf})
+
+        # --- APPLY CALIBRATION HERE ---
+        # We convert to a numpy array, calibrate, then back to a list for the DataFrame
+        raw_scores = np.array(history_conf)
+        calibrated_scores = calibrate_bitemporal(raw_scores, decay=0.9)
+
+        plot_df = pd.DataFrame({"Time (s)": history_time, "Confidence": calibrated_scores.tolist()})
 
         # HIT FOUND logic
         hit_mask = (answer.cpu() == yes_token_id)

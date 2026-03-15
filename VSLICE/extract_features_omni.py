@@ -3,23 +3,22 @@ Extract Features — query-conditioned VLM feature extraction for MiniCPM-o.
 
 Loads a VLM (MiniCPM-o), samples video frames at 1 FPS, feeds them
 together with the query (YouTube title) into the VLM, and saves the
-resulting hidden-state features as .npz files.
+resulting hidden-state features OR Yes/No logits as .npz files.
 
-Supports multi-GPU via torchrun — each GPU processes a disjoint shard
-of videos (embarrassingly parallel, no gradient sync needed).
+Supports multi-GPU via torchrun.
 
-Single-GPU usage:
+Single-GPU usage (Hidden States):
     python ./VSLICE/extract_features_omni.py \
         --manifest="./processed_dataset/trump_vids/train.json" \
         --output_dir="./processed_dataset/trump_vids/features_omni/" \
         --model_path ./MiniCPM-o-2_6
-    # python ./VSLICE/extract_features_omni.py --manifest="./processed_dataset/dog_vids/train.json" --output_dir="./processed_dataset/dog_vids/features_omni/" --model_path .checkpoints/MiniCPM-o-2_6-int4/
 
-Multi-GPU usage (8 GPUs):
-    torchrun --nproc_per_node=8 ./VSLICE/extract_features_omni.py \
+Single-GPU usage (Logits for 1D CNN Training):
+    python ./VSLICE/extract_features_omni.py \
         --manifest="./processed_dataset/trump_vids/train.json" \
-        --output_dir="./processed_dataset/trump_vids/features_omni/" \
-        --model_path ./MiniCPM-o-2_6
+        --output_dir="./processed_dataset/trump_vids/logit_features/" \
+        --model_path ./MiniCPM-o-2_6 \
+        --use_logits
 """
 import os
 import json
@@ -37,16 +36,9 @@ warnings.filterwarnings("ignore", message=".*not a valid Python identifier.*")
 
 def debug_save_audio_int16(chunk, filename="check.wav", sr=16000):
     """Saves a float32 audio chunk to a standard 16-bit PCM .wav file."""
-    # 1. Ensure it's a 1D numpy array
     audio_data = np.array(chunk).flatten()
-    
-    # 2. Normalize/Clip to [-1.0, 1.0] to prevent distortion
     audio_data = np.clip(audio_data, -1.0, 1.0)
-    
-    # 3. Scale to 16-bit range and cast
     audio_data = (audio_data * 32767).astype(np.int16)
-    
-    # 4. Write
     wav.write(filename, sr, audio_data)
     print(f"✅ Saved standard 16-bit WAV to {filename}")
 
@@ -55,8 +47,6 @@ def debug_save_audio_int16(chunk, filename="check.wav", sr=16000):
 # ---------------------------------------------------------------------------
 
 def setup_distributed():
-    """Initialize distributed process group for multi-GPU extraction.
-    Returns (rank, local_rank, world_size). Falls back to (0, 0, 1)."""
     if "RANK" in os.environ:
         dist.init_process_group(backend="nccl")
         rank = int(os.environ["RANK"])
@@ -66,31 +56,22 @@ def setup_distributed():
         return rank, local_rank, world_size
     return 0, 0, 1
 
-
 def cleanup_distributed():
-    """Destroy the distributed process group if initialized."""
     if dist.is_initialized():
         dist.destroy_process_group()
 
-
 def shard_manifest(manifest, rank, world_size):
-    """Split manifest into disjoint shards — one per GPU.
-    GPU i gets items [i, i+W, i+2W, ...] (interleaved for balance)."""
     return [item for i, item in enumerate(manifest) if i % world_size == rank]
-
 
 # ---------------------------------------------------------------------------
 # VLM & frame sampling
 # ---------------------------------------------------------------------------
 
 def load_vlm(model_path, device):
-    """Load MiniCPM-o model for feature extraction on a specific device."""
     from transformers import AutoTokenizer, AutoProcessor
     from auto_gptq import AutoGPTQForCausalLM
     
     print(f"[GPU {device}] Loading VLM from {model_path}...")
-    
-    # Use the test script's exact loading logic for the quantized model
     model = AutoGPTQForCausalLM.from_quantized(
         model_path,
         torch_dtype=torch.bfloat16,
@@ -111,7 +92,6 @@ def load_vlm(model_path, device):
 
 
 def sample_frames_and_audio(video_path, fps=1.0, width=1280, height=720, audio_sr=16000):
-    """Sample frames and aligned audio chunks from video at target FPS."""
     from decord import VideoReader, cpu
     import subprocess
     
@@ -129,76 +109,49 @@ def sample_frames_and_audio(video_path, fps=1.0, width=1280, height=720, audio_s
     frames = [Image.fromarray(f, mode="RGB") for f in frames_npy]
     del vr
 
-    # 2. Sample Audio Chunks (centered on each frame)
+    # 2. Sample Audio Chunks
     try:
-        # Fast FFmpeg audio rip (16kHz, mono, 32-bit float PCM)
         command = [
-            "ffmpeg",
-            "-i", video_path,
-            "-f", "s16le", # MiniCPM-o uses 16-bit PCM for audio, not 32-bit float like Qwen!
-            "-ac", "1",
-            "-ar", str(audio_sr),
-            "pipe:1"
+            "ffmpeg", "-i", video_path, "-f", "s16le", 
+            "-ac", "1", "-ar", str(audio_sr), "pipe:1"
         ]
-        
-        # Run FFmpeg and capture stdout, suppress stderr
         result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
         
         if result.returncode != 0 or len(result.stdout) == 0:
-            raise RuntimeError("FFmpeg failed to extract audio or video has no audio track")
+            raise RuntimeError("FFmpeg failed to extract audio")
             
-        # Convert raw PCM bytes to numpy array (16-bit integer for MiniCPM)
         audio_full = np.frombuffer(result.stdout, dtype=np.int16).astype(np.float32) / 32768.0
-        
         audio_chunks = []
         chunk_samples = int(audio_sr / fps)
         
         for t in times:
-            # Create a 1-second window around the frame timestamp
             start_sample = int(max(0, (t - 0.5/fps) * audio_sr))
             end_sample = int(start_sample + chunk_samples)
-            
             chunk = audio_full[start_sample:end_sample]
-            
-            # Pad with silence if we hit the end of the video
             if len(chunk) < chunk_samples:
                 chunk = np.pad(chunk, (0, chunk_samples - len(chunk)))
             audio_chunks.append(chunk)
             
     except Exception as e:
-        print(f"    ⚠️ Audio missing or failed to extract via ffmpeg: {e}")
-        # Fallback to silent arrays if the video has no audio track
+        print(f"   ⚠️ Audio missing or failed: {e}")
         audio_chunks = [np.zeros(int(audio_sr / fps), dtype=np.float32)] * len(frames)
 
     return frames, audio_chunks, times, duration
 
 
 def extract_features_for_video(model, tokenizer, processor, device,
-                                frames, audio_chunks, query, batch_size=32):
-    """
-    Extract query-conditioned VLM features for a list of frames using MiniCPM-o.
-    
-    Feeds each frame+audio WITH the query into the VLM, extracts the last 
-    hidden state as the feature vector.
-    
-    Args:
-        model, tokenizer, processor: VLM components
-        device: torch device
-        frames: list of PIL Images
-        audio_chunks: list of np.array (16kHz audio)
-        query: text query string
-        batch_size: frames per batch
-    
-    Returns:
-        features: np.array [T, D] — hidden state features
-    """
+                               frames, audio_chunks, query, batch_size=32, use_logits=False):
     from tqdm import tqdm
     
-    #system_prompt = "You are an expert video analyst focusing on human engagement."
-    #user_prompt = f"Analyze this moment in the context of the title: '{query}'. Describe the level of action, sound, emotional weight, or key events happening right now that would make a viewer rewind and watch it again."
-    system_prompt = "You are an EXPERT video analyst."
-    user_prompt = f"Analyze this moment in the context of the title: '{query}'. Focus on the ACTIONS, SOUNDS, and KEY EVENTS."
-    
+    if use_logits:
+        system_prompt = "You are an expert video analyst."
+        user_prompt = f"Analyze this sequence in the context of the title: '{query}'. Is a highly exciting moment, a major event, or a highlight happening right now? Answer 'Yes' or 'No'. Do not provide any explanation."
+        yes_token_id = tokenizer.encode("Yes", add_special_tokens=False)[0]
+        no_token_id = tokenizer.encode("No", add_special_tokens=False)[0]
+    else:
+        system_prompt = "You are an expert video analyst specializing in human engagement, temporal dynamics, and audio-visual cues"
+        user_prompt = f"Analyze this sequence in the context of the title: '{query}'. Based on the key actions and audio, classify this sequence's engagement as a 'peak' (highlight), 'build', or 'valley' (lull), and justify your choice."
+
     all_features = []
     
     for i in tqdm(range(0, len(frames), batch_size), desc="Extracting", leave=False):
@@ -207,20 +160,15 @@ def extract_features_for_video(model, tokenizer, processor, device,
         batch_features = []
         
         for frame, audio in zip(batch_frames, batch_audios):
-            
-            # 1. Format the text prompt with explicitly placed Omni tags
             text_prompt = f"{system_prompt}\n(<audio>./</audio>)\n(<image>./</image>)\n{user_prompt}"
             conversation = [{"role": "user", "content": text_prompt}]
             
-            # Use the tokenizer to wrap it in the proper ChatML tags
             prompt = tokenizer.apply_chat_template(
                 conversation, 
                 tokenize=False, 
                 add_generation_prompt=True
             )
             
-            # 2. Pass the explicitly separated modalities into the processor
-            # Note: MiniCPM-o expects `audios` to be a list-of-lists for temporally tracked audio chunks
             inputs = processor(
                 text=prompt,
                 images=[frame],
@@ -235,108 +183,41 @@ def extract_features_for_video(model, tokenizer, processor, device,
             inputs = inputs.to(device)
 
             with torch.inference_mode():
+                # If we only need logits, we turn off output_hidden_states to save VRAM and compute
                 outputs = model(
                     inputs,
                     attention_mask=inputs.get("attention_mask"),
-                    output_hidden_states=True,
+                    output_hidden_states=not use_logits,
                     use_cache=False
                 )
-                # Extract last hidden state sequence for the image/audio/text tokens
-                hidden = outputs.hidden_states[-1]  # [1, seq_len, D]
-                feat = hidden.mean(dim=1)            # [1, D]
-                batch_features.append(feat.cpu().float().numpy())
                 
-            # 3. Explicitly clear VRAM after every frame to prevent OOM crashes!
-            del inputs, outputs, hidden, feat
+                if use_logits:
+                    logits = outputs.logits[:, -1, :]
+                    probs = torch.nn.functional.softmax(logits, dim=-1)
+                    p_yes = probs[:, yes_token_id].cpu().float().numpy()
+                    p_no = probs[:, no_token_id].cpu().float().numpy()
+                    # Contrastive Score
+                    score = p_yes / (p_yes + p_no + 1e-8)
+                    batch_features.append(score)
+                else:
+                    hidden = outputs.hidden_states[-1]  # [1, seq_len, D]
+                    feat = hidden.mean(dim=1)            # [1, D]
+                    batch_features.append(feat.cpu().float().numpy())
+                
+            del inputs, outputs
             torch.cuda.empty_cache()
             
         all_features.extend(batch_features)
-    features = np.concatenate(all_features, axis=0)  # [T, D]
+        
+    features = np.concatenate(all_features, axis=0)
     return features
-
-def extract_temporal_features_for_video(model, tokenizer, processor, device,
-                                frames, audio_chunks, query, batch_size=32, window_size=5):
-    """
-    Extract query-conditioned VLM features using a TEMPORAL SLIDING WINDOW.
-    
-    For each frame 't', feeds frames [t-window_size+1 ... t] into the model 
-    so the embedding for frame 't' contains historical motion context.
-    """
-    from tqdm import tqdm
-    
-    system_prompt = "You are an expert video analyst specializing in human engagement, temporal dynamics, and audio-visual cues"
-    user_prompt = f"Analyze this sequence in the context of the title: '{query}'. Based on the key actions and audio, classify this sequence's engagement as a 'peak' (highlight), 'build', or 'valley' (lull), and justify your choice."
-    
-    all_features = []
-    
-    # Process frame by frame (batching is tricky with variable sliding windows, 
-    # so we process sequentially, but it gives you perfect temporal embeddings)
-    for i in tqdm(range(len(frames)), desc="Extracting Temporal Windows", leave=False):
-        
-        # 1. Determine the sliding window indices
-        start_idx = max(0, i - window_size + 1)
-        window_frames = frames[start_idx : i + 1]
-        window_audios = audio_chunks[start_idx : i + 1]
-        
-        # 2. Dynamically build the prompt with the correct number of media tags
-        media_tags = ""
-        for _ in range(len(window_frames)):
-            media_tags += "(<audio>./</audio>)\n(<image>./</image>)\n"
-            
-        text_prompt = f"{system_prompt}\n{media_tags}{user_prompt}"
-        conversation = [{"role": "user", "content": text_prompt}]
-        
-        # 3. Apply ChatML template
-        prompt = tokenizer.apply_chat_template(
-            conversation, 
-            tokenize=False, 
-            add_generation_prompt=True
-        )
-
-        # debug_save_audio_int16(window_audios)
-        # 4. Pass the sequence of frames and audio into the processor
-        inputs = processor(
-            text=prompt,
-            images=window_frames,
-            # MiniCPM-o expects a list of lists for temporally tracked audio chunks in a single turn
-            audios=[window_audios], 
-            sampling_rate=16000,
-            return_tensors="pt",
-            max_slice_nums=1,
-        )
-        
-        seq_len = inputs["input_ids"].shape[1]
-        inputs["position_ids"] = torch.arange(seq_len, device=device).unsqueeze(0)
-        inputs = inputs.to(device)
-
-        with torch.inference_mode():
-            outputs = model(
-                inputs,
-                attention_mask=inputs.get("attention_mask"),
-                output_hidden_states=True,
-                use_cache=False
-            )
-            # The last hidden state now represents the LAST frame in the window,
-            # having attended to all previous frames in the prompt.
-            hidden = outputs.hidden_states[-1]  # [1, seq_len, D]
-            feat = hidden.mean(dim=1)            # [1, D]
-            all_features.append(feat.cpu().float().numpy())
-            
-        # Clear VRAM
-        del inputs, outputs, hidden, feat
-        torch.cuda.empty_cache()
-            
-    features = np.concatenate(all_features, axis=0)  # [T, D]
-    return features
-
 
 # ---------------------------------------------------------------------------
 # Main extraction loop
 # ---------------------------------------------------------------------------
 
 def extract_all(manifest_path, output_dir, model_path, batch_size=8, 
-                fps=1.0, skip_existing=True):
-    """Extract features for all videos in a manifest, with multi-GPU support."""
+                fps=1.0, skip_existing=True, use_logits=False):
     rank, local_rank, world_size = setup_distributed()
     device = f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu"
 
@@ -345,11 +226,12 @@ def extract_all(manifest_path, output_dir, model_path, batch_size=8,
     with open(manifest_path, "r", encoding="utf-8") as f:
         manifest = json.load(f)
 
-    # Shard manifest across GPUs
     my_manifest = shard_manifest(manifest, rank, world_size)
 
     if rank == 0:
         print(f"\n📂 Total videos: {len(manifest)} | World size: {world_size}")
+        print(f"🎯 Mode: {'Logits (Contrastive Yes/No)' if use_logits else 'Hidden States (Features)'}")
+        
     print(f"[GPU {local_rank}] Processing {len(my_manifest)} / {len(manifest)} videos")
     
     model, tokenizer, processor = load_vlm(model_path, device)
@@ -374,50 +256,47 @@ def extract_all(manifest_path, output_dir, model_path, batch_size=8,
         t0 = time.time()
         
         try:
-            # Sample frames
             frames, audio_chunks, times, duration = sample_frames_and_audio(video_path, fps=fps)
             print(f"    Sampled {len(frames)} frames ({duration:.0f}s video at {fps} FPS)")
             
-            # Load heatmap
             heatmap_values = None
             if heatmap_path and os.path.exists(heatmap_path):
                 hm = np.load(heatmap_path)
                 hm_times = hm["times"]
                 hm_values = hm["values"]
-                # Interpolate heatmap to match frame times
                 from scipy.interpolate import interp1d
-                interp = interp1d(hm_times, hm_values, kind="linear",
-                                 fill_value="extrapolate", bounds_error=False)
+                interp = interp1d(hm_times, hm_values, kind="linear", fill_value="extrapolate", bounds_error=False)
                 heatmap_values = np.clip(interp(times), 0, 1)
             
-            # Extract features
-            #features = extract_features_for_video(
-            #    model, tokenizer, processor, device,
-            #    frames, audio_chunks, query, batch_size=batch_size
-            #)
-            features = extract_temporal_features_for_video(
+            features = extract_features_for_video(
                 model, tokenizer, processor, device,
-                frames, audio_chunks, query, batch_size=batch_size
+                frames, audio_chunks, query, batch_size=batch_size, use_logits=use_logits
             )
             
-            # Save (each GPU writes to the same output_dir — filenames are disjoint)
-            save_dict = {
-                "features": features,      # [T, D]
-                "times": times,            # [T]
-                "query": np.array([query]),  # store as array for npz compat
-            }
+            # Save dict depends on extraction mode
+            if use_logits:
+                save_dict = {
+                    "logits": features,        # [T]
+                    "times": times,            # [T]
+                    "query": np.array([query]) # [1]
+                }
+            else:
+                save_dict = {
+                    "features": features,      # [T, D]
+                    "times": times,            # [T]
+                    "query": np.array([query]) # [1]
+                }
+                
             if heatmap_values is not None:
-                save_dict["heatmap"] = heatmap_values  # [T]
+                save_dict["heatmap"] = heatmap_values
             
             np.savez_compressed(output_path, **save_dict)
             
             elapsed = time.time() - t0
-            print(f"    ✅ {features.shape} features saved ({elapsed:.1f}s)")
+            print(f"    ✅ {features.shape} shape saved ({elapsed:.1f}s)")
         except Exception as e:
             print(f"    ❌ Failed: {e}")
             continue
-
-    # No barrier needed — each GPU writes independently to unique files
 
     if rank == 0:
         print(f"\n🏁 Feature extraction complete → {output_dir}")
@@ -427,17 +306,21 @@ def extract_all(manifest_path, output_dir, model_path, batch_size=8,
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Extract query-conditioned VLM features using MiniCPM-o")
-    parser.add_argument("--manifest", type=str, required=True,
-                       help="Path to dataset manifest JSON (from prepare_dataset.py)")
-    parser.add_argument("--output_dir", type=str, required=True,
-                       help="Directory to save extracted features")
-    parser.add_argument("--model_path", type=str, default="openbmb/MiniCPM-o-2_6",
-                       help="Path to VLM model")
+    parser.add_argument("--manifest", type=str, required=True, help="Path to dataset manifest JSON")
+    parser.add_argument("--output_dir", type=str, required=True, help="Directory to save extracted features")
+    parser.add_argument("--model_path", type=str, default="openbmb/MiniCPM-o-2_6", help="Path to VLM model")
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--fps", type=float, default=1.0)
     parser.add_argument("--skip_existing", action="store_true", default=True)
+    parser.add_argument("--use_logits", action="store_true", help="Extract Yes/No contrastive probabilities instead of hidden state features.")
     args = parser.parse_args()
     
-    extract_all(args.manifest, args.output_dir, args.model_path,
-               batch_size=args.batch_size, fps=args.fps, 
-               skip_existing=args.skip_existing)
+    extract_all(
+        args.manifest, 
+        args.output_dir, 
+        args.model_path,
+        batch_size=args.batch_size, 
+        fps=args.fps, 
+        skip_existing=args.skip_existing,
+        use_logits=args.use_logits
+    )

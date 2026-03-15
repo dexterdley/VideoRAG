@@ -2,23 +2,16 @@
 Train — training loop for the temporal engagement head.
 
 Trains a lightweight temporal model on pre-extracted VLM features
-to predict per-frame engagement scores, supervised by YouTube
-Most Replayed heatmaps.
+(or 1D VLM yes/no logits) to predict per-frame engagement scores, 
+supervised by YouTube Most Replayed heatmaps.
 
 Supports single-GPU and multi-GPU (DDP) training via torchrun.
 
-Single-GPU usage:
+Single-GPU usage (Logits Mode):
     python ./VSLICE/train.py --train_manifest="./processed_dataset/trump_vids/train.json" \
     --val_manifest="./processed_dataset/trump_vids/val.json" \
-    --features_dir="./processed_dataset/trump_vids/features/" \
-    --output_dir="./checkpoints" --arch conv --epochs 50 --lr 1e-3
-
-Multi-GPU usage (8 GPUs):
-    torchrun --nproc_per_node=8 ./VSLICE/train.py \
-    --train_manifest="./processed_dataset/trump_vids/train.json" \
-    --val_manifest="./processed_dataset/trump_vids/val.json" \
-    --features_dir="./processed_dataset/trump_vids/features/" \
-    --output_dir="./checkpoints" --arch conv --epochs 100 --lr 1e-3
+    --features_dir="./processed_dataset/trump_vids/logit_features/" \
+    --output_dir="./checkpoints_logits" --use_logits --epochs 50 --lr 1e-3
 """
 import os
 import json
@@ -30,7 +23,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Dataset
 from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm
 from scipy.stats import spearmanr
@@ -43,8 +36,6 @@ from dataset import VSLICEDataset
 # ---------------------------------------------------------------------------
 
 def setup_ddp():
-    """Initialize distributed process group. Returns (rank, local_rank, world_size).
-    If not launched via torchrun, returns (0, 0, 1) for single-GPU mode."""
     if "RANK" in os.environ:
         dist.init_process_group(backend="nccl")
         rank = int(os.environ["RANK"])
@@ -54,16 +45,87 @@ def setup_ddp():
         return rank, local_rank, world_size
     return 0, 0, 1
 
-
 def cleanup_ddp():
-    """Destroy the distributed process group if it was initialized."""
     if dist.is_initialized():
         dist.destroy_process_group()
 
-
 def is_main_process(rank):
-    """Only rank 0 should log, save checkpoints, etc."""
     return rank == 0
+
+
+# ---------------------------------------------------------------------------
+# Custom Logit Components (Dataset & Model)
+# ---------------------------------------------------------------------------
+
+class LogitDataset(Dataset):
+    """A lightweight dataset strictly for 1D Contrastive Logits."""
+    def __init__(self, manifest_path, features_dir, max_frames=300):
+        with open(manifest_path, 'r', encoding='utf-8') as f:
+            self.manifest = json.load(f)
+        self.features_dir = features_dir
+        self.max_frames = max_frames
+
+    def __len__(self):
+        return len(self.manifest)
+
+    def __getitem__(self, idx):
+        item = self.manifest[idx]
+        vid = item["video_id"]
+        npz_path = os.path.join(self.features_dir, f"{vid}.npz")
+        
+        try:
+            data = np.load(npz_path)
+            logits = data["logits"]  # [T]
+            heatmap = data["heatmap"]  # [T]
+        except Exception as e:
+            # Fallback for missing/corrupted files during data loading
+            logits = np.zeros(self.max_frames, dtype=np.float32)
+            heatmap = np.zeros(self.max_frames, dtype=np.float32)
+
+        T = len(logits)
+        valid_len = min(T, self.max_frames)
+        
+        # We shape logits as [max_frames, 1] so it acts like feat_dim=1 
+        # for compatibility with the existing training loop
+        out_logits = np.zeros((self.max_frames, 1), dtype=np.float32)
+        out_heatmap = np.zeros((self.max_frames,), dtype=np.float32)
+        out_mask = np.zeros((self.max_frames,), dtype=bool)
+        
+        out_logits[:valid_len, 0] = logits[:valid_len]
+        out_heatmap[:valid_len] = heatmap[:valid_len]
+        out_mask[:valid_len] = True
+        
+        return {
+            "features": torch.from_numpy(out_logits),
+            "heatmap": torch.from_numpy(out_heatmap),
+            "mask": torch.from_numpy(out_mask)
+        }
+
+class LogitTemporalCalibrator(nn.Module):
+    """1D CNN designed to learn temporal smoothing and engagement delays."""
+    def __init__(self, window_size=15):
+        super().__init__()
+        # Padding ensures output length perfectly matches input length
+        self.conv1 = nn.Conv1d(
+            in_channels=1, 
+            out_channels=1, 
+            kernel_size=window_size, 
+            padding=window_size // 2, 
+            padding_mode='replicate'
+        )
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x, mask=None):
+        # Incoming x is [B, T, 1]. Conv1d expects [B, C, T]
+        x = x.transpose(1, 2)
+        out = self.sigmoid(self.conv1(x))
+        # Revert back to [B, T] for loss calculation
+        out = out.squeeze(1)
+        
+        if mask is not None:
+            out = out * mask.float()
+            
+        return out
 
 
 # ---------------------------------------------------------------------------
@@ -71,12 +133,6 @@ def is_main_process(rank):
 # ---------------------------------------------------------------------------
 
 def ranking_loss(predicted, target, mask, margin=0.2):
-    """
-    Pairwise ranking loss: ensure predicted scores preserve the 
-    relative ordering of GT heatmap values.
-    
-    Samples pairs from top/bottom quartiles within each batch item.
-    """
     B, T = predicted.shape
     total_loss = torch.tensor(0.0, device=predicted.device)
     n_pairs = 0
@@ -89,7 +145,6 @@ def ranking_loss(predicted, target, mask, margin=0.2):
         if len(t) < 10:
             continue
         
-        # Top and bottom quartiles
         q75 = torch.quantile(t, 0.75)
         q25 = torch.quantile(t, 0.25)
         
@@ -99,7 +154,6 @@ def ranking_loss(predicted, target, mask, margin=0.2):
         if len(high_idx) == 0 or len(low_idx) == 0:
             continue
         
-        # Sample pairs (up to 64 pairs per sample for efficiency)
         n_sample = min(64, len(high_idx), len(low_idx))
         hi = high_idx[torch.randperm(len(high_idx))[:n_sample]]
         lo = low_idx[torch.randperm(len(low_idx))[:n_sample]]
@@ -116,41 +170,45 @@ def ranking_loss(predicted, target, mask, margin=0.2):
         return total_loss / n_pairs
     return total_loss
 
+class FocalMSELoss(nn.Module):
+    def __init__(self, gamma=2.0, alpha=0.8, threshold=0.1):
+        super().__init__()
+        self.gamma = gamma
+        self.alpha = alpha
+        self.threshold = threshold
+
+    def forward(self, preds, targets):
+        mse = F.mse_loss(preds, targets, reduction='none')
+        error = torch.abs(preds - targets)
+        focal_weight = error ** self.gamma
+        alpha_weight = torch.where(targets > self.threshold, self.alpha, 1.0 - self.alpha)
+        loss = alpha_weight * focal_weight * mse
+        return loss.mean()
+
 # ---------------------------------------------------------------------------
 # Train / Validate
 # ---------------------------------------------------------------------------
+criterion = FocalMSELoss(gamma=2.0, alpha=0.8, threshold=0.15)
 
 def train_one_epoch(model, loader, optimizer, device, epoch, sampler=None):
-    """Train for one epoch."""
     model.train()
     if sampler is not None:
-        sampler.set_epoch(epoch)  # ensure proper shuffling per epoch in DDP
+        sampler.set_epoch(epoch)
 
-    total_loss = 0
-    total_mse = 0
-    total_rank = 0
+    total_loss, total_mse, total_rank = 0, 0, 0
     n_batches = 0
-    all_predicted = []
-    all_target = []
+    all_predicted, all_target = [], []
     
     for batch in loader:
-        features = batch["features"].to(device)    # [B, T, D]
+        features = batch["features"].to(device)    # [B, T, D] or [B, T, 1]
         heatmap = batch["heatmap"].to(device)       # [B, T]
         mask = batch["mask"].to(device)             # [B, T]
         
         optimizer.zero_grad()
+        predicted = model(features, mask=mask)      # [B, T]
         
-        predicted = model(features, mask=mask)      # [B, T], [B, T, 3]
-        
-        # Regression loss (only on valid frames)
-        mse_loss = F.mse_loss(
-            predicted[mask], heatmap[mask], reduction="mean"
-        )
-        
-        # Ranking loss
+        mse_loss = criterion(predicted[mask], heatmap[mask])
         rank_loss = ranking_loss(predicted, heatmap, mask, margin=0.2)
-                
-        #loss = mse_loss + args.rank_weight * rank_loss
         loss = 0.5 * mse_loss + 0.5 * rank_loss
         
         loss.backward()
@@ -162,20 +220,19 @@ def train_one_epoch(model, loader, optimizer, device, epoch, sampler=None):
         total_rank += rank_loss.item()
         n_batches += 1
         
-        # Collect per-video predictions and targets for correlation
         B = features.shape[0]
         for b in range(B):
             valid = mask[b]
             all_predicted.append(predicted[b][valid].detach().cpu().numpy())
             all_target.append(heatmap[b][valid].detach().cpu().numpy())
 
-    # Compute Spearman correlation (averaged over videos)
     spearman_scores = []
     for p, t in zip(all_predicted, all_target):
         if len(p) > 5 and np.std(t) > 1e-6:
             rho, _ = spearmanr(p, t)
             if not np.isnan(rho):
                 spearman_scores.append(rho)
+                
     return {
         "loss": total_loss / max(n_batches, 1),
         "mse_loss": total_mse / max(n_batches, 1),
@@ -183,14 +240,11 @@ def train_one_epoch(model, loader, optimizer, device, epoch, sampler=None):
         "rank_loss": total_rank / max(n_batches, 1)
     }
 
-
 @torch.no_grad()
 def validate(model, loader, device):
-    """Run validation and return metrics. Only runs on rank 0 in DDP."""
     model.eval()
     total_loss = 0
-    all_predicted = []
-    all_target = []
+    all_predicted, all_target = [], []
     n_batches = 0
     
     for batch in loader:
@@ -198,24 +252,19 @@ def validate(model, loader, device):
         heatmap = batch["heatmap"].to(device)
         mask = batch["mask"].to(device)
         
-        # If model is DDP-wrapped, access underlying module
         m = model.module if hasattr(model, "module") else model
         predicted = m(features, mask=mask)
         
-        reg_loss = F.smooth_l1_loss(
-            predicted[mask], heatmap[mask], reduction="mean"
-        )
+        reg_loss = F.smooth_l1_loss(predicted[mask], heatmap[mask], reduction="mean")
         total_loss += reg_loss.item()
         n_batches += 1
         
-        # Collect per-video predictions for correlation
         B = features.shape[0]
         for b in range(B):
             valid = mask[b]
             all_predicted.append(predicted[b][valid].cpu().numpy())
             all_target.append(heatmap[b][valid].cpu().numpy())
     
-    # Compute Spearman correlation (averaged over videos)
     spearman_scores = []
     for p, t in zip(all_predicted, all_target):
         if len(p) > 5 and np.std(t) > 1e-6:
@@ -235,45 +284,62 @@ def validate(model, loader, device):
 # ---------------------------------------------------------------------------
 
 def train(args):
-    """Main training function with optional DDP support."""
     rank, local_rank, world_size = setup_ddp()
     distributed = world_size > 1
     device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
 
     if is_main_process(rank):
         os.makedirs(args.output_dir, exist_ok=True)
-        print(f"🚀 World size: {world_size} | Device: {device}")
+        print(f"🚀 World size: {world_size} | Device: {device} | Logit Mode: {args.use_logits}")
 
     # ------------------------------------------------------------------
-    # Datasets
+    # Datasets & Models Swap based on mode
     # ------------------------------------------------------------------
-    train_dataset = VSLICEDataset(
-        args.train_manifest, args.features_dir,
-        max_frames=args.max_frames, augment=args.augment, heatmap_sigma=args.heatmap_sigma
-    )
-    # Validation must never be augmented and should be evaluated on sharp labels
-    val_dataset = VSLICEDataset(
-        args.val_manifest, args.features_dir,
-        max_frames=args.max_frames, augment=False, heatmap_sigma=0.0
-    )
-    
-    # Samplers (DistributedSampler for DDP, None for single-GPU)
+    if args.use_logits:
+        train_dataset = LogitDataset(args.train_manifest, args.features_dir, max_frames=args.max_frames)
+        val_dataset = LogitDataset(args.val_manifest, args.features_dir, max_frames=args.max_frames)
+        
+        model = LogitTemporalCalibrator(window_size=15).to(device)
+        feat_dim = 1
+        arch_name = "1D_Logit_CNN"
+    else:
+        train_dataset = VSLICEDataset(
+            args.train_manifest, args.features_dir,
+            max_frames=args.max_frames, augment=args.augment, heatmap_sigma=args.heatmap_sigma
+        )
+        val_dataset = VSLICEDataset(
+            args.val_manifest, args.features_dir,
+            max_frames=args.max_frames, augment=False, heatmap_sigma=0.0
+        )
+        
+        sample = train_dataset[0]
+        feat_dim = sample["features"].shape[-1]
+        
+        model = build_model(
+            arch=args.arch, 
+            feat_dim=feat_dim,
+            hidden=args.hidden_dim,
+            dropout=args.dropout
+        ).to(device)
+        arch_name = args.arch
+
+    if is_main_process(rank):
+        print(f"Feature dimension: {feat_dim}")
+
     train_sampler = DistributedSampler(
         train_dataset, num_replicas=world_size, rank=rank, shuffle=True
     ) if distributed else None
 
-    # Per-GPU batch size — effective batch size = batch_size * world_size
     per_gpu_bs = max(1, args.batch_size // world_size) if distributed else args.batch_size
     per_gpu_bs = min(per_gpu_bs, len(train_dataset))
 
     train_loader = DataLoader(
         train_dataset, batch_size=per_gpu_bs,
-        shuffle=(train_sampler is None),  # shuffle only when no sampler
+        shuffle=(train_sampler is None),
         sampler=train_sampler,
         num_workers=args.num_workers, pin_memory=True, drop_last=False
     )
 
-    # Validation only on rank 0 (small dataset, not worth distributing)
     val_loader = None
     if is_main_process(rank):
         val_loader = DataLoader(
@@ -281,82 +347,41 @@ def train(args):
             num_workers=args.num_workers, pin_memory=True
         )
 
-    # ------------------------------------------------------------------
-    # Model
-    # ------------------------------------------------------------------
-    sample = train_dataset[0]
-    feat_dim = sample["features"].shape[-1]
-    if is_main_process(rank):
-        print(f"Feature dimension: {feat_dim}")
-
-    model = build_model(
-        arch=args.arch, 
-        feat_dim=feat_dim,
-        hidden=args.hidden_dim,
-        dropout=args.dropout
-    ).to(device)
-
     if distributed:
         model = DDP(model, device_ids=[local_rank], output_device=local_rank)
 
     raw_model = model.module if distributed else model
     n_params = sum(p.numel() for p in raw_model.parameters() if p.requires_grad)
+    
     if is_main_process(rank):
-        print(f"Model: {args.arch} — {n_params:,} trainable parameters")
-        if distributed:
-            print(f"DDP: {world_size} GPUs, per-GPU batch size = {per_gpu_bs}, "
-                  f"effective batch size = {per_gpu_bs * world_size}")
+        print(f"Model: {arch_name} — {n_params:,} trainable parameters")
 
-    # ------------------------------------------------------------------
-    # Optimizer + Scheduler
-    # ------------------------------------------------------------------
-    optimizer = torch.optim.AdamW(
-        model.parameters(), lr=args.lr, weight_decay=args.weight_decay
-    )
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=args.epochs, eta_min=args.lr * 0.01
-    )
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=args.lr * 0.01)
 
-    # ------------------------------------------------------------------
-    # Training loop
-    # ------------------------------------------------------------------
     best_spearman = -1
     history = []
 
     if is_main_process(rank):
         print(f"\n{'='*60}")
-        print(f"Training: {args.arch} | {len(train_dataset)} train, {len(val_dataset)} val")
+        print(f"Training: {arch_name} | {len(train_dataset)} train, {len(val_dataset)} val")
         print(f"{'='*60}\n")
 
-    pbar = tqdm(range(1, args.epochs + 1), desc="Training", unit="epoch",
-                disable=not is_main_process(rank))
+    pbar = tqdm(range(1, args.epochs + 1), desc="Training", unit="epoch", disable=not is_main_process(rank))
 
     for epoch in pbar:
         t0 = time.time()
-
-        train_metrics = train_one_epoch(
-            model, train_loader, optimizer, device, epoch,
-            sampler=train_sampler
-        )
-
-        # Validation only on rank 0
+        train_metrics = train_one_epoch(model, train_loader, optimizer, device, epoch, sampler=train_sampler)
+        
         val_metrics = {"val_loss": 0.0, "spearman": 0.0, "n_videos": 0}
         if is_main_process(rank) and val_loader is not None:
             val_metrics = validate(model, val_loader, device)
 
         scheduler.step()
 
-        # --- Logging & checkpointing (rank 0 only) ---
         if is_main_process(rank):
-            elapsed = time.time() - t0
             lr = optimizer.param_groups[0]["lr"]
-
-            record = {
-                "epoch": epoch,
-                "lr": lr,
-                **train_metrics,
-                **val_metrics,
-            }
+            record = {"epoch": epoch, "lr": lr, **train_metrics, **val_metrics}
             history.append(record)
 
             improved = ""
@@ -367,9 +392,10 @@ def train(args):
                     "model_state_dict": raw_model.state_dict(),
                     "optimizer_state_dict": optimizer.state_dict(),
                     "spearman": best_spearman,
-                    "arch": args.arch,
+                    "arch": arch_name,
                     "feat_dim": feat_dim,
                     "hidden": args.hidden_dim,
+                    "is_logit_model": args.use_logits
                 }, os.path.join(args.output_dir, "best_model.pt"))
                 improved = " ⭐"
 
@@ -379,12 +405,8 @@ def train(args):
                 "train_ρ": f"{train_metrics['spearman']:.4f}",
                 "val_ρ": f"{val_metrics['spearman']:.4f}{improved}",
                 "best val_ρ": f"{best_spearman:.4f}{' ✅'}",
-                "lr": f"{lr:.1e}",
             })
 
-    # ------------------------------------------------------------------
-    # Save history & cleanup
-    # ------------------------------------------------------------------
     if is_main_process(rank):
         with open(os.path.join(args.output_dir, "history.json"), "w") as f:
             json.dump(history, f, indent=2)
@@ -392,7 +414,6 @@ def train(args):
         print(f"   Best model saved to: {os.path.join(args.output_dir, 'best_model.pt')}")
 
     cleanup_ddp()
-
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train temporal head")
@@ -402,18 +423,17 @@ if __name__ == "__main__":
     parser.add_argument("--output_dir", type=str, default="model_checkpoints")
     parser.add_argument("--arch", type=str, default="transformer", choices=["conv", "bi_lstm", "transformer"])
     parser.add_argument("--epochs", type=int, default=50)
-    parser.add_argument("--batch_size", type=int, default=64,
-                       help="Total effective batch size (split across GPUs in DDP)")
+    parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--weight_decay", type=float, default=1e-5)
-    parser.add_argument("--dropout", type=float, default=0.4, help="Dropout probability for regularization")
-    parser.add_argument("--hidden_dim", type=int, default=256, help="Hidden dimension size for models")
-    parser.add_argument("--max_frames", type=int, default=300,
-                       help="Max frames per video (5 min at 1 FPS)")
-    parser.add_argument("--augment", action="store_true", help="Enable dataset temporal augmentation")
-    parser.add_argument("--heatmap_sigma", type=float, default=2.0, help="Gaussian smoothing for GT heatmaps")
-    parser.add_argument("--rank_weight", type=float, default=2.0, help="Weight for the Margin Ranking Loss (higher values optimize Spearman directly)")
+    parser.add_argument("--dropout", type=float, default=0.4)
+    parser.add_argument("--hidden_dim", type=int, default=256)
+    parser.add_argument("--max_frames", type=int, default=300)
+    parser.add_argument("--augment", action="store_true")
+    parser.add_argument("--heatmap_sigma", type=float, default=2.0)
+    parser.add_argument("--rank_weight", type=float, default=2.0)
     parser.add_argument("--num_workers", type=int, default=2)
+    parser.add_argument("--use_logits", action="store_true", help="Bypass VSLICEDataset to train purely on 1D contrastive logits.")
     args = parser.parse_args()
     
     train(args)

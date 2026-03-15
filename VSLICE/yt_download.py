@@ -14,7 +14,10 @@ import os
 import shutil
 import sys
 import argparse
+import time
+import random
 
+COOKIE_FILE = "cookies.txt"  # Set this path
 
 def check_ffmpeg():
     """Checks if ffmpeg is available in the system PATH."""
@@ -30,6 +33,7 @@ def search_youtube(topic, max_results=30):
     
     cmd = [
         "yt-dlp",
+        "--cookies-from-browser", "chrome",
         f"ytsearch{max_results}:{topic}",
         "--flat-playlist",      # Don't download, just list
         "--print", "url",       # Print only URLs
@@ -64,6 +68,7 @@ def check_heatmap(video_url, output_dir):
     # cmd to write info json to disk
     cmd = [
         "yt-dlp",
+        "--cookies-from-browser", "chrome",
         "--skip-download",
         "--write-info-json",
         "--no-overwrites",
@@ -108,6 +113,7 @@ def download_video(video_url, video_id, output_dir):
     
     cmd = [
         "yt-dlp",
+        "--cookies-from-browser", "chrome",
         *format_args,
         "--no-overwrites",
         "-o", os.path.join(output_dir, f"{video_id}.%(ext)s"),
@@ -148,6 +154,13 @@ def crawl_topic(topic, target_count=10, output_dir=None):
     for i, url in enumerate(candidate_urls):
         if len(collected) >= target_count:
             break
+
+        # --- RATE LIMITING LOGIC ---
+        if i > 0:
+            # Sleep between 3 to 7 seconds to avoid triggering "429 Too Many Requests"
+            sleep_time = random.uniform(3, 7)
+            #print(f"⏳ Sleeping {sleep_time:.1f}s to prevent rate limiting...")
+            time.sleep(sleep_time)
         
         video_id, heatmap_data = check_heatmap(url, output_dir)
         

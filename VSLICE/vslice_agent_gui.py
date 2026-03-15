@@ -19,11 +19,159 @@ from scipy.stats import spearmanr
 import matplotlib
 matplotlib.use('Agg') # Required for Gradio to prevent GUI thread crashing
 import matplotlib.pyplot as plt
+from PIL import Image
 
 # Allow imports from the same directory
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from model import build_model
-from extract_features_omni import sample_frames_and_audio, extract_temporal_features_for_video
+#from extract_features_omni import sample_frames_and_audio, extract_temporal_features_for_video
+
+def setup_video_stream(video_path, fps=1.0, audio_sr=16000):
+    """Initializes the Decord reader and extracts the full audio track upfront."""
+    from decord import VideoReader, cpu
+    import subprocess
+    
+    vr = VideoReader(video_path, ctx=cpu(0), width=1280, height=720)
+    video_fps = vr.get_avg_fps()
+    total_frames_vr = len(vr)
+    duration = total_frames_vr / video_fps
+    
+    step = max(1, int(video_fps / fps))
+    indices = list(range(0, total_frames_vr, step))
+    times = [idx / video_fps for idx in indices]
+    
+    # Fast FFmpeg audio rip for the whole video
+    try:
+        command = [
+            "ffmpeg", "-i", video_path, "-f", "s16le", "-ac", "1",
+            "-ar", str(audio_sr), "pipe:1"
+        ]
+        result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        if result.returncode != 0 or len(result.stdout) == 0:
+            raise RuntimeError("FFmpeg failed")
+            
+        audio_full = np.frombuffer(result.stdout, dtype=np.int16).astype(np.float32) / 32768.0
+    except Exception as e:
+        print(f"    ⚠️ Audio extraction failed: {e}")
+        audio_full = None
+
+    return vr, indices, times, duration, audio_full
+
+def fetch_media_chunk(vr, chunk_indices, chunk_times, audio_full, audio_sr=16000, fps=1.0):
+    """Lazily loads a chunk of frames and their corresponding audio."""
+    # 1. Sample Video Frames
+    frames_npy = vr.get_batch(chunk_indices).asnumpy()
+    frame_chunk = [Image.fromarray(f, mode="RGB") for f in frames_npy]
+    
+    # 2. Sample Audio Chunks
+    audio_chunks = []
+    chunk_samples = int(audio_sr / fps)
+    
+    for t in chunk_times:
+        if audio_full is not None:
+            start_sample = int(max(0, (t - 0.5/fps) * audio_sr))
+            end_sample = int(start_sample + chunk_samples)
+            chunk = audio_full[start_sample:end_sample]
+            if len(chunk) < chunk_samples:
+                chunk = np.pad(chunk, (0, chunk_samples - len(chunk)))
+        else:
+            chunk = np.zeros(chunk_samples, dtype=np.float32)
+        audio_chunks.append(chunk)
+        
+    return frame_chunk, audio_chunks
+
+def extract_temporal_features_for_video(model, tokenizer, processor, device,
+                                        frames, audio_chunks, query, batch_size=32, window_size=5):
+    """
+    Extract query-conditioned VLM features using a TEMPORAL SLIDING WINDOW.
+    Fully batched for maximum GPU utilization while respecting MiniCPM-o's forward signature.
+    """
+    from tqdm import tqdm
+    
+    system_prompt = "You are an expert video analyst specializing in human engagement, temporal dynamics, and audio-visual cues"
+    user_prompt = f"Analyze this sequence in the context of the title: '{query}'. Based on the key actions and audio, classify this sequence's engagement as a 'peak' (highlight), 'build', or 'valley' (lull), and justify your choice."
+    
+    all_features = []
+    
+    # Process in chunks to maximize GPU parallelism
+    for i in tqdm(range(0, len(frames), batch_size), desc="Extracting Temporal Batches", leave=False):
+        batch_end = min(i + batch_size, len(frames))
+        
+        batch_texts = []
+        batch_images = []
+        batch_audios = []
+        
+        # 1. Build the prompts and media lists for the current batch
+        for j in range(i, batch_end):
+            start_idx = max(0, j - window_size + 1)
+            window_frames = frames[start_idx : j + 1]
+            window_audios = audio_chunks[start_idx : j + 1]
+            
+            media_tags = "(<audio>./</audio>)\n(<image>./</image>)\n" * len(window_frames)
+            text_prompt = f"{system_prompt}\n{media_tags}{user_prompt}"
+            
+            conversation = [{"role": "user", "content": text_prompt}]
+            prompt = tokenizer.apply_chat_template(
+                conversation, 
+                tokenize=False, 
+                add_generation_prompt=True
+            )
+            
+            batch_texts.append(prompt)
+            batch_images.append(window_frames)
+            batch_audios.append(window_audios)
+
+        # 2. Pass the entire batch of sequences into the processor
+        inputs = processor(
+            text=batch_texts,
+            images=batch_images,
+            audios=batch_audios, 
+            sampling_rate=16000,
+            return_tensors="pt",
+            padding=True, # Critical for batching variable window lengths
+            max_slice_nums=1,
+        )
+        
+        # 3. Handle position IDs for the batched sequences
+        seq_len = inputs["input_ids"].shape[1]
+        batch_curr_size = len(batch_texts)
+        inputs["position_ids"] = torch.arange(seq_len, device=device).unsqueeze(0).expand(batch_curr_size, -1)
+        
+        # Keep it as a BatchFeature to properly handle nested lists internally
+        inputs = inputs.to(device)
+
+        # 4. Model Execution (Passing inputs positionally)
+        with torch.inference_mode():
+            outputs = model(
+                inputs,
+                attention_mask=inputs.get("attention_mask"),
+                output_hidden_states=True,
+                use_cache=False
+            )
+            
+            hidden = outputs.hidden_states[-1]  # [B, seq_len, D]
+            attention_mask = inputs.get("attention_mask")
+            
+            # 5. Masked Mean Pooling: Ignore zero-padding when averaging the hidden states
+            if attention_mask is not None:
+                mask_expanded = attention_mask.unsqueeze(-1).float()
+                sum_hidden = torch.sum(hidden * mask_expanded, dim=1)
+                sum_mask = torch.clamp(mask_expanded.sum(dim=1), min=1e-9)
+                feat = sum_hidden / sum_mask  # [B, D]
+            else:
+                feat = hidden.mean(dim=1)
+                
+            all_features.append(feat.cpu().float().numpy())
+            
+        # 6. Clear VRAM
+        del inputs, outputs, hidden, feat
+        if attention_mask is not None:
+            del mask_expanded, sum_hidden, sum_mask
+        torch.cuda.empty_cache()
+            
+    features = np.concatenate(all_features, axis=0)  # [T, D]
+    return features
+
 
 # ─────────────────────── CONFIG ───────────────────────
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -230,7 +378,6 @@ def plot_engagement_dynamics(times, pred_scores, pred_events, gt_scores=None):
 
     ax.set_xlabel("Time (mm:ss)")
     ax.set_ylabel("Engagement Score")
-    ax.set_title("OMNI Infer — Predictions vs. Ground Truth")
     ax.legend(loc="upper right", fontsize=8)
     ax.xaxis.set_major_formatter(plt.FuncFormatter(lambda x, _: f"{int(max(0, x)//60)}:{int(max(0, x)%60):02d}"))
     plt.tight_layout()
@@ -241,6 +388,7 @@ def plot_engagement_dynamics(times, pred_scores, pred_events, gt_scores=None):
 #                      MAIN PIPELINE
 # ═══════════════════════════════════════════════════════════════
 async def run_pipeline(video_path, user_query, max_frames=300):
+    t1 = time.time()
     empty_outputs = (None, None, None, None, None, None, None) # 7 empty slots (Plot + 6 clips)
     if not video_path:
         yield "⚠️ Please upload a video.", *empty_outputs, 0
@@ -258,16 +406,16 @@ async def run_pipeline(video_path, user_query, max_frames=300):
         yield f"❌ Error: Checkpoint not found.", *empty_outputs, 0
         return
 
-    # ── STEP 2 & 3: LIVE EXTRACTION & PREDICTION ──
-    log = f"🎬 **Step 2/4: Extracting raw frames and audio...**\n" + log
+    # ── STEP 2: INITIALIZE STREAM ──
+    log = f"🎬 **Step 2/4: Initializing Video Reader & Audio...**\n" + log
     yield log, *empty_outputs, 10
 
-    frames, audio_chunks, times, duration = sample_frames_and_audio(video_path, fps=1.0)
-    total_frames = len(frames)
+    # Stream setup instead of full extraction
+    vr, indices, times, duration, audio_full = setup_video_stream(video_path, fps=1.0)
+    total_frames = len(indices)
 
     # ── CHECK FOR GT HEATMAP JSON ──
     json_path = "./downloads/rival_vids/" + video_path.split("/")[-1].split(".mp4")[0] + "_heatmap.json"
-    # Load GT Data if it exists
     if os.path.exists(json_path):
         print(f"GT found at {json_path}")
         gt_scores_full = load_heatmap_json(json_path, times) 
@@ -275,8 +423,8 @@ async def run_pipeline(video_path, user_query, max_frames=300):
         print(f"No GT Found")
         gt_scores_full = None
         
-    log = log.replace("🎬 **Step 2/4: Extracting raw frames and audio...**\n", "")
-    log = f"🧠 **Step 3/4: Processing VLM & Predicting Engagement (Live)...**\n" + log
+    log = log.replace("🎬 **Step 2/4: Initializing Video Reader & Audio...**\n", "")
+    log = f"🧠 **Step 3/4: Sampling, Processing VLM & Predicting (Live)...**\n" + log
 
     CHUNK_SIZE = 8 
     accumulated_features = []
@@ -284,11 +432,14 @@ async def run_pipeline(video_path, user_query, max_frames=300):
     pred_sum = np.zeros(total_frames, dtype=np.float64)
     pred_count = np.zeros(total_frames, dtype=np.float64)
 
+    # ── STEP 3: LIVE EXTRACTION & INFERENCE ──
     for i in range(0, total_frames, CHUNK_SIZE):
         end_idx = min(i + CHUNK_SIZE, total_frames)
         
-        frame_chunk = frames[i:end_idx]
-        audio_chunk = audio_chunks[i:end_idx]
+        # ✨ LAZY LOAD JUST THIS CHUNK ✨
+        chunk_indices = indices[i:end_idx]
+        chunk_times = times[i:end_idx]
+        frame_chunk, audio_chunk = fetch_media_chunk(vr, chunk_indices, chunk_times, audio_full)
         
         chunk_features = await asyncio.to_thread(
             extract_temporal_features_for_video, 
@@ -332,6 +483,9 @@ async def run_pipeline(video_path, user_query, max_frames=300):
         
         yield log, current_fig, None, None, None, None, None, None, progress_pct
         plt.close(current_fig)
+
+    # Free the decord object after the loop to prevent memory leaks
+    del vr
 
     predicted_np = pred_sum / np.maximum(pred_count, 1.0)
     log = f"✅ VLM & Temporal Processing complete.\n\n" + log
@@ -377,18 +531,19 @@ async def run_pipeline(video_path, user_query, max_frames=300):
     log = f"🏁 **Done! Processing finished.**\n\n" + log
     
     # Final yield with all 9 outputs
+    t2 = time.time()
+    print("Total time:", t2 - t1)
     yield log, final_fig, pred_padded[0], pred_padded[1], pred_padded[2], gt_padded[0], gt_padded[1], gt_padded[2], 100
     plt.close(final_fig)
-
 
 # ═══════════════════════════════════════════════════════════════
 #                          GUI LAYOUT
 # ═══════════════════════════════════════════════════════════════
-with gr.Blocks(title="OMNI Infer") as demo:
+with gr.Blocks(title="VSLICE") as demo:
     gr.Markdown(
         """
-        # 🧠📈 OMNI Infer — Engagement Prediction
-        Pipeline: Sample Frames → VLM Features → Temporal Head Prediction → Auto-Slice Peaks
+        # 🦀🎬 VSLICE — Multimodal Video Highlight Extractor
+        Pipeline: Whisper ASR → VLM Visual Scan → Signal Fusion → LLM Analysis → Auto-Slice
         """
     )
 

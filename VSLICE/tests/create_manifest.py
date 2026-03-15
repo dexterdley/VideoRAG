@@ -1,7 +1,7 @@
 import glob
 import json
 import os
-domain = "kamala_vids"
+domain = "cat_vids"
 output_dir = f"./downloads/{domain}"
 
 downloaded_files = glob.glob(os.path.join(output_dir, "*.info.json"))

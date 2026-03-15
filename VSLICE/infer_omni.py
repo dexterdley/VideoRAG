@@ -1,27 +1,11 @@
 """
-Infer — run a trained engagement model on a single video and plot importance scores.
+Infer — run VLM directly on a single video and plot importance scores.
 
 Pipeline:
   1. Sample frames from the input video (decord, 1 FPS)
-  2. Extract query-conditioned features (MiniCPM-V VLM)
-  3. Run the trained temporal head to predict per-second engagement scores
+  2. Prompt the MiniCPM-V VLM for each frame
+  3. Extract the probability of the "Yes" token as the engagement score
   4. Plot the predicted importance curve (and optionally the GT heatmap)
-
-Usage:
-    python ./VSLICE/infer.py \
-        --video ./downloads/cat_vids/abc123.mp4 \
-        --checkpoint ./checkpoints/cat_vids_conv/best_model.pt \
-        --model_path .checkpoints/MiniCPM-V-2_6-int4 \
-        --query "funniest cat videos" \
-        --output ./results/abc123_importance.png
-
-    # With a ground-truth heatmap overlay:
-    python ./VSLICE/infer.py \
-        --video ./downloads/cat_vids/abc123.mp4 \
-        --checkpoint ./checkpoints/cat_vids_conv/best_model.pt \
-        --model_path .checkpoints/MiniCPM-V-2_6-int4 \
-        --query "funniest cat videos" \
-        --heatmap_json ./downloads/cat_vids/abc123_heatmap.json
 """
 import os
 import sys
@@ -40,8 +24,7 @@ warnings.filterwarnings("ignore", message=".*not a valid Python identifier.*")
 
 # Allow imports from the same directory
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from model import build_model
-from extract_features_omni import sample_frames_and_audio, extract_features_for_video, extract_temporal_features_for_video
+from extract_features_omni import sample_frames_and_audio
 
 
 # ─── VLM feature extraction ─────────────────────────────────────────
@@ -51,7 +34,6 @@ def load_vlm(model_path, device):
     from auto_gptq import AutoGPTQForCausalLM
     
     print(f"[GPU {device}] Loading VLM from {model_path}...")
-    # Use the test script's exact loading logic for the quantized model
     model = AutoGPTQForCausalLM.from_quantized(
         model_path,
         torch_dtype=torch.bfloat16,
@@ -72,21 +54,12 @@ def load_vlm(model_path, device):
 
 # ─── GT heatmap loader ──────────────────────────────────────────────
 def load_heatmap_json(heatmap_path, frame_times, sigma=0.0):
-    """
-    Load a YouTube heatmap JSON and interpolate to match frame timestamps.
-    Applies the SAME processing as the training pipeline:
-      - midpoint-based interpolation (matches prepare_dataset.py)
-      - min-max normalization to [0, 1]
-      - Gaussian smoothing (matches dataset.py heatmap_sigma)
-    """
     with open(heatmap_path, "r", encoding="utf-8") as f:
         heatmap_raw = json.load(f)
 
-    # Use midpoint of each segment (same as prepare_dataset.py)
     hm_times = np.array([(pt["start_time"] + pt["end_time"]) / 2 for pt in heatmap_raw])
     hm_values = np.array([pt["value"] for pt in heatmap_raw])
 
-    # Min-max normalize to [0, 1] (same as prepare_dataset.py line 57-61)
     v_min, v_max = hm_values.min(), hm_values.max()
     if v_max > v_min:
         hm_values = (hm_values - v_min) / (v_max - v_min)
@@ -94,11 +67,9 @@ def load_heatmap_json(heatmap_path, frame_times, sigma=0.0):
         hm_values = np.zeros_like(hm_values)
 
     from scipy.interpolate import interp1d
-    interp = interp1d(hm_times, hm_values, kind="linear",
-                       fill_value="extrapolate", bounds_error=False)
+    interp = interp1d(hm_times, hm_values, kind="linear", fill_value="extrapolate", bounds_error=False)
     gt = np.clip(interp(frame_times), 0, 1)
 
-    # Apply same Gaussian smoothing as training dataset
     if sigma > 0:
         from scipy.ndimage import gaussian_filter1d
         gt = gaussian_filter1d(gt, sigma=sigma)
@@ -106,56 +77,13 @@ def load_heatmap_json(heatmap_path, frame_times, sigma=0.0):
 
     return gt
 
-
-def compute_ece(predicted, ground_truth, n_bins=15):
-    """
-    Compute Expected Calibration Error (ECE) for regression/density scores.
-    Measures how close the average prediction in each bin is to the average GT.
-    """
-    bins = np.linspace(0, 1, n_bins + 1)
-    ece = 0.0
-    total_samples = len(predicted)
-    
-    for i in range(n_bins):
-        # Indices in this bin
-        bin_mask = (predicted >= bins[i]) & (predicted < bins[i+1])
-        if i == n_bins - 1: # Include 1.0 in last bin
-            bin_mask = bin_mask | (predicted == bins[i+1])
-            
-        bin_count = np.sum(bin_mask)
-        if bin_count > 0:
-            bin_confidence = np.mean(predicted[bin_mask])
-            bin_accuracy = np.mean(ground_truth[bin_mask])
-            ece += (bin_count / total_samples) * np.abs(bin_confidence - bin_accuracy)
-            
-    return ece
-
-
-# ─── Plotting ────────────────────────────────────────────────────────
-import scipy.signal
-
-def plot_importance(times, predicted, features=None, gt_heatmap=None, title="", output_path=None):
-    """Plot predicted importance scores and project the Top 3 scene clusters into 2D PCA space."""
+def plot_importance(times, predicted, gt_heatmap=None, title="", output_path=None):
+    """Plot predicted importance scores and the temporal scene segmentation (KTS)."""
     times = np.array(times) if isinstance(times, list) else times
     
-    n_plots = 2 if features is not None else 1
-    # Give the PCA plot a bit more vertical breathing room to be square-ish
-    height_ratios = [1, 1.5] if features is not None else [1]
-    
-    fig, axes = plt.subplots(n_plots, 1, figsize=(14, 4 * n_plots), 
-                             gridspec_kw={'height_ratios': height_ratios})
-    
-    if n_plots == 1:
-        axes = [axes]
+    fig, ax1 = plt.subplots(1, 1, figsize=(14, 4))
 
-    # Reference scores dictate the "ground truth" for finding peaks
-    reference_scores = gt_heatmap if gt_heatmap is not None else predicted
-
-    # ---------------------------------------------------------
-    # Row 1: Engagement Scores (Predicted vs GT)
-    # ---------------------------------------------------------
-    ax1 = axes[0]
-    ax1.plot(times / 60, predicted, color="#4A90D9", linewidth=1.8, label="Predicted")
+    ax1.plot(times / 60, predicted, color="#4A90D9", linewidth=1.8, label="Predicted (VLM 'Yes' Prob)")
     ax1.fill_between(times / 60, 0, predicted, alpha=0.15, color="#4A90D9")
 
     if gt_heatmap is not None:
@@ -172,78 +100,7 @@ def plot_importance(times, predicted, features=None, gt_heatmap=None, title="", 
     if title:
         plot_title += f"\n{title}"
     ax1.set_title(plot_title, fontsize=13, fontweight="bold")
-    
-    if n_plots == 1:
-        ax1.set_xlabel("Time (minutes)", fontsize=12)
-
-    if features is not None:
-        from sklearn.decomposition import PCA
-        
-        # Pre-process features (Normalize for cosine similarity)
-        norms = np.linalg.norm(features, axis=1, keepdims=True)
-        norms[norms == 0] = 1e-10
-        feat_norm = features / norms
-
-        # ---------------------------------------------------------
-        # Row 2: 2D PCA Scene Clusters
-        # ---------------------------------------------------------
-        ax2 = axes[1]
-        
-        # 1. Project features to 2D
-        pca = PCA(n_components=2)
-        pca_coords = pca.fit_transform(feat_norm)
-        
-        # Plot the "timeline trajectory" of the whole video in the background
-        ax2.plot(pca_coords[:, 0], pca_coords[:, 1], color="gray", alpha=0.3, linewidth=0.8, zorder=1)
-        ax2.scatter(pca_coords[:, 0], pca_coords[:, 1], color="lightgray", s=15, alpha=0.5, label="Other Frames", zorder=2)
-        
-        # 2. Find distinct peaks (spaced by at least 10 frames/seconds)
-        peaks, _ = scipy.signal.find_peaks(reference_scores, distance=10)
-        if len(peaks) == 0:
-            peaks = np.argsort(reference_scores)[-3:]
-            
-        # 3. Sort peaks by engagement score and grab the Top 3
-        top_peaks = sorted(peaks, key=lambda x: reference_scores[x], reverse=True)[:3]
-        
-        colors = ["#2ECC71", "#9B59B6", "#F1C40F"] 
-        
-        # 4. Cluster the contiguous frames around each peak
-        for i, p in enumerate(top_peaks):
-            key_frame_feat = feat_norm[p]
-            sims = np.dot(feat_norm, key_frame_feat)
-            
-            # Define scene boundary: expand left and right from peak until similarity drops < 0.85
-            # (0.85 is a strong baseline for same-scene VLM cosine similarity)
-            cluster_indices = [p]
-            
-            # Look backwards
-            for j in range(p - 1, -1, -1):
-                if sims[j] > 0.85: cluster_indices.append(j)
-                else: break
-                
-            # Look forwards
-            for j in range(p + 1, len(sims)):
-                if sims[j] > 0.85: cluster_indices.append(j)
-                else: break
-                
-            cluster_indices = sorted(list(set(cluster_indices)))
-            
-            # Plot the cluster "cloud" (The GMM probability mass)
-            ax2.scatter(pca_coords[cluster_indices, 0], pca_coords[cluster_indices, 1], 
-                        color=colors[i], s=60, alpha=0.7, edgecolors='none',
-                        label=f"Cluster {i+1} (Peak at {times[p]/60:.2f}m)", zorder=3)
-            
-            # Mark the exact Key Frame with a large Star
-            ax2.scatter(pca_coords[p, 0], pca_coords[p, 1], 
-                        color=colors[i], marker='*', s=350, edgecolor='black', linewidth=1.5, zorder=4)
-
-        ax2.set_xlabel(f"Principal Component 1 ({pca.explained_variance_ratio_[0]*100:.1f}% Variance)", fontsize=12)
-        ax2.set_ylabel(f"Principal Component 2 ({pca.explained_variance_ratio_[1]*100:.1f}% Variance)", fontsize=12)
-        ax2.set_title("Top 3 Engaging Scenes Projected in VLM Feature Space (PCA)", fontsize=13, fontweight="bold")
-        ax2.legend(loc="upper right", fontsize=10)
-        ax2.grid(True, alpha=0.3)
-
-    fig.tight_layout()
+    ax1.set_xlabel("Time (minutes)", fontsize=12)
 
     if output_path:
         os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
@@ -256,7 +113,6 @@ def plot_importance(times, predicted, features=None, gt_heatmap=None, title="", 
 
 # ─── Main ────────────────────────────────────────────────────────────
 def get_query_from_manifest(manifest_path, video_path):
-    """Look up the video's title from the manifest JSON, matching extract_features.py logic."""
     video_id = os.path.splitext(os.path.basename(video_path))[0]
     if manifest_path and os.path.exists(manifest_path):
         with open(manifest_path, "r", encoding="utf-8") as f:
@@ -266,122 +122,99 @@ def get_query_from_manifest(manifest_path, video_path):
                 return item.get("title", "Describe this video")
     return "Describe this video"
 
+def get_vlm_confidence(model, tokenizer, processor, device, frames, query, batch_size=8):
+    """
+    Extracts the direct probability of the 'Yes' token for each frame.
+    """
+    system_prompt = "You are an expert video analyst."
+    user_prompt = (
+        f"Analyze this gaming frame in the context of: '{query}'. "
+        "Is a highly exciting moment happening right now, such as an intense team fight, "
+        "an ultimate ability being used, or a kill? "
+        "If it is a high-action highlight, answer 'Yes'. "
+        "If the player is just walking, waiting, dead, or looking at a menu, answer 'No'. "
+        "Do not provide any explanation."
+    )
+    yes_token_id = tokenizer.encode("Yes", add_special_tokens=False)[0]
+    all_confidences = []
+    
+    print(f"🧠 Running VLM Inference in batches of {batch_size}...")
+    for i in tqdm(range(0, len(frames), batch_size), desc="VLM Inference"):
+        batch_frames = frames[i:i + batch_size]
+        
+        for frame in batch_frames:
+            msgs = [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": f"(<image>./</image>)\n{user_prompt}"},
+            ]
+            prompt_str = processor.tokenizer.apply_chat_template(
+                msgs, tokenize=False, add_generation_prompt=True
+            )
+            
+            inputs = processor(
+                [prompt_str], [[frame]],
+                max_slice_nums=1,
+                use_image_id=False,
+                return_tensors="pt",
+                max_length=2048,
+            ).to(device)
+            
+            if "image_sizes" in inputs:
+                inputs.pop("image_sizes")
+            
+            if "position_ids" not in inputs:
+                batch_size_in, seq_len = inputs["input_ids"].shape
+                inputs["position_ids"] = torch.arange(seq_len, dtype=torch.long, device=device).unsqueeze(0).expand(batch_size_in, -1)
+            
+            with torch.inference_mode():
+                outputs = model(inputs, attention_mask=inputs.get("attention_mask"))
+                logits = outputs.logits[:, -1, :]
+                probs = torch.nn.functional.softmax(logits, dim=-1)
+    
+            # Extract Yes probability for this frame
+            confidence = probs[:, yes_token_id].cpu().numpy()[0]
+            all_confidences.append(confidence)
+
+    return np.array(all_confidences)
 
 def infer(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # 1. Load trained temporal head
-    print(f"Loading checkpoint: {args.checkpoint}")
-    checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=False)
-    arch = checkpoint.get("arch", "conv")
-    feat_dim = checkpoint.get("feat_dim", 3584)
-    hidden = checkpoint.get("hidden", 128)
-
-    temporal_model = build_model(
-        arch=arch, 
-        feat_dim=feat_dim,
-        hidden=hidden,
-    ).to(device)
-
-    temporal_model.load_state_dict(checkpoint["model_state_dict"])
-    temporal_model.eval()
-    print(f"✅ Temporal head loaded: {arch} (epoch {checkpoint.get('epoch', '?')})")
-
-    # 2. Resolve query from manifest (same as extract_features.py)
     query = get_query_from_manifest(args.manifest, args.video)
     print(f"\n🏷️ Query (from manifest): \"{query}\"")
 
-    # 3. Skip if features exist
-    if os.path.exists(args.features_dir):
-        print(f"\n Loading VLM features...")
-        data = np.load(args.features_dir, allow_pickle=True)
-        features = data["features"]
-        times = data["times"]
-    else:
-        # 3. Sample frames & Extract VLM features
-        print(f"\n🎬 Sampling frames from: {args.video}")
-        frames, audio_chunks, times, duration  = sample_frames_and_audio(args.video, fps=args.fps)
-        print(f"   {len(frames)} frames sampled ({duration:.0f}s video at {args.fps} FPS)")
+    print(f"\n🎬 Sampling frames from: {args.video}")
+    frames, audio_chunks, times, duration  = sample_frames_and_audio(args.video, fps=args.fps)
+    print(f"   {len(frames)} frames sampled ({duration:.0f}s video at {args.fps} FPS)")
 
-        print(f"\n🧠 Extracting VLM features...")
-        vlm_model, tokenizer, processor = load_vlm(args.model_path, device="cuda:0")
-        features = extract_temporal_features_for_video(vlm_model, tokenizer, processor, device,
-                                     frames, audio_chunks, query)
-        del vlm_model, tokenizer, processor
-        torch.cuda.empty_cache() if torch.cuda.is_available() else None
+    vlm_model, tokenizer, processor = load_vlm(args.model_path, device="cuda:0")
+    
+    # Get raw probabilities
+    predicted_np = get_vlm_confidence(vlm_model, tokenizer, processor, device, frames, query)
+    
+    del vlm_model, tokenizer, processor
+    torch.cuda.empty_cache() if torch.cuda.is_available() else None
 
-    print(f"   Features shape: {features.shape}")
+    print(f"   Scores: min={predicted_np.min():.3f}, max={predicted_np.max():.3f}, mean={predicted_np.mean():.3f}")
 
-    # 5. Sliding window prediction (matches dataset.py chunking)
-    T_full = features.shape[0]
-    max_frames = args.max_frames
-    stride = max_frames // 2  # 50% overlap, same as dataset.py default
-
-    print(f"\n📈 Running temporal model (sliding window: {max_frames}f, stride {stride}f)...")
-
-    # Accumulate predictions with overlap averaging
-    pred_sum = np.zeros(T_full, dtype=np.float64)
-    pred_count = np.zeros(T_full, dtype=np.float64)
-
-    chunk_starts = []
-    if T_full <= max_frames:
-        chunk_starts = [0]
-    else:
-        start = 0
-        while start + max_frames <= T_full:
-            chunk_starts.append(start)
-            start += stride
-        # Ensure last chunk covers the very end
-        if chunk_starts[-1] + max_frames < T_full:
-            chunk_starts.append(T_full - max_frames)
-
-    for chunk_start in chunk_starts:
-        chunk_end = min(chunk_start + max_frames, T_full)
-        chunk_feat = features[chunk_start:chunk_end]
-        T_chunk = chunk_feat.shape[0]
-
-        # Pad if needed
-        mask_np = np.ones(max_frames, dtype=bool)
-        if T_chunk < max_frames:
-            pad_len = max_frames - T_chunk
-            chunk_feat = np.pad(chunk_feat, ((0, pad_len), (0, 0)), mode="constant")
-            mask_np[T_chunk:] = False
-
-        feat_t = torch.from_numpy(chunk_feat).float().unsqueeze(0).to(device)
-        mask_t = torch.from_numpy(mask_np).unsqueeze(0).to(device)
-
-        with torch.no_grad():
-            pred = temporal_model(feat_t, mask=mask_t)
-        pred_chunk = pred[0].cpu().numpy()[:T_chunk]
-
-        pred_sum[chunk_start:chunk_start + T_chunk] += pred_chunk
-        pred_count[chunk_start:chunk_start + T_chunk] += 1.0
-
-    # Average overlapping predictions
-    predicted_np = pred_sum / np.maximum(pred_count, 1.0)
-
-    print(f"   {len(chunk_starts)} chunks → {T_full} frames stitched")
-    print(f"   Scores: min={predicted_np.min():.3f}, max={predicted_np.max():.3f}, "
-          f"mean={predicted_np.mean():.3f}")
-
-    # 6. Load GT heatmap (optional) and compute Spearman correlation
     gt = None
     if args.heatmap_json and os.path.exists(args.heatmap_json):
         print(f"   Loading GT heatmap from: {args.heatmap_json}")
         gt = load_heatmap_json(args.heatmap_json, times)
 
         from scipy.stats import spearmanr
-        rho, pval = spearmanr(predicted_np, gt)
-        ece = compute_ece(predicted_np, gt)
-        print(f"   📊 Spearman ρ = {rho:.4f}  (p = {pval:.2e}) | ECE = {ece:.4f}")
+        # Avoid NaN if standard deviation is 0
+        if np.std(predicted_np) > 1e-6 and np.std(gt) > 1e-6:
+            rho, pval = spearmanr(predicted_np, gt)
+            print(f"   📊 Spearman ρ = {rho:.4f}  (p = {pval:.2e})")
+        else:
+            print("   📊 Spearman ρ = NaN (One of the arrays is completely flat)")
 
-    # 7. Plot
     video_name = os.path.splitext(os.path.basename(args.video))[0]
     output_path = args.output or f"./results/{video_name}_importance.png"
 
     plot_importance(
         times, predicted_np,
-        features=features,
         gt_heatmap=gt,
         title=f"{video_name} — \"{query}\"",
         output_path=output_path,
@@ -389,29 +222,22 @@ def infer(args):
 
     print(f"\n✅ Inference complete!")
 
-
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Run engagement inference on a single video and plot importance scores"
+        description="Run engagement inference using direct VLM probabilities and plot importance scores"
     )
     parser.add_argument("--video", type=str, default="./downloads/rival_vids/aAzcPEESXms.mp4", 
                         help="Path to input video file (.mp4)")
     parser.add_argument("--manifest", type=str, default="./downloads/rival_vids/manifest.json",
                         help="Path to manifest JSON (to look up video title as query)")
-    parser.add_argument("--checkpoint", type=str, default="./checkpoints/rival_vids_omni_bi_lstm/best_model.pt",
-                        help="Path to trained temporal model checkpoint (.pt)")
     parser.add_argument("--model_path", type=str, default=".checkpoints/MiniCPM-o-2_6-int4",
-                        help="Path to VLM model for feature extraction")
+                        help="Path to VLM model")
     parser.add_argument("--heatmap_json", type=str, default="./downloads/rival_vids/aAzcPEESXms_heatmap.json",
                         help="Optional: path to GT heatmap JSON for overlay comparison")
-    parser.add_argument("--max_frames", type=int, default=300,
-                        help="Max frames — must match training (default: 300)")
     parser.add_argument("--fps", type=float, default=1.0,
                         help="Frame sampling rate (default: 1 FPS)")
     parser.add_argument("--output", type=str, default="./results/aAzcPEESXms_importance_omni.png",
                         help="Output path for the plot")
-    parser.add_argument("--features_dir", type=str, default="./processed_dataset/rival_vids/features_omni_res_tempo/aAzcPEESXms.npz")
     args = parser.parse_args()
 
     infer(args)
-
