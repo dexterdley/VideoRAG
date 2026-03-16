@@ -2,21 +2,22 @@
 Train — training loop for the temporal engagement head.
 
 Trains a lightweight temporal model on pre-extracted VLM features
-(or 1D VLM yes/no logits) to predict per-frame engagement scores, 
-supervised by YouTube Most Replayed heatmaps.
+to predict per-frame engagement scores, supervised by YouTube 
+Most Replayed heatmaps.
 
 Supports single-GPU and multi-GPU (DDP) training via torchrun.
 
-Single-GPU usage (Logits Mode):
+Usage:
     python ./VSLICE/train.py --train_manifest="./processed_dataset/trump_vids/train.json" \
     --val_manifest="./processed_dataset/trump_vids/val.json" \
-    --features_dir="./processed_dataset/trump_vids/logit_features/" \
-    --output_dir="./checkpoints_logits" --use_logits --epochs 50 --lr 1e-3
+    --features_dir="./processed_dataset/trump_vids/features/" \
+    --output_dir="./checkpoints" --epochs 50 --lr 1e-3
 """
 import os
 import json
 import argparse
 import time
+import random
 import numpy as np
 import torch
 import torch.nn as nn
@@ -30,6 +31,20 @@ from scipy.stats import spearmanr
 from model import build_model
 from dataset import VSLICEDataset
 
+# ---------------------------------------------------------------------------
+# Seed helper
+# ---------------------------------------------------------------------------
+def set_seed(seed):
+    """Set all random seeds for reproducible training."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+        # Ensure deterministic behavior in cuDNN
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
 
 # ---------------------------------------------------------------------------
 # DDP helpers
@@ -51,82 +66,6 @@ def cleanup_ddp():
 
 def is_main_process(rank):
     return rank == 0
-
-
-# ---------------------------------------------------------------------------
-# Custom Logit Components (Dataset & Model)
-# ---------------------------------------------------------------------------
-
-class LogitDataset(Dataset):
-    """A lightweight dataset strictly for 1D Contrastive Logits."""
-    def __init__(self, manifest_path, features_dir, max_frames=300):
-        with open(manifest_path, 'r', encoding='utf-8') as f:
-            self.manifest = json.load(f)
-        self.features_dir = features_dir
-        self.max_frames = max_frames
-
-    def __len__(self):
-        return len(self.manifest)
-
-    def __getitem__(self, idx):
-        item = self.manifest[idx]
-        vid = item["video_id"]
-        npz_path = os.path.join(self.features_dir, f"{vid}.npz")
-        
-        try:
-            data = np.load(npz_path)
-            logits = data["logits"]  # [T]
-            heatmap = data["heatmap"]  # [T]
-        except Exception as e:
-            # Fallback for missing/corrupted files during data loading
-            logits = np.zeros(self.max_frames, dtype=np.float32)
-            heatmap = np.zeros(self.max_frames, dtype=np.float32)
-
-        T = len(logits)
-        valid_len = min(T, self.max_frames)
-        
-        # We shape logits as [max_frames, 1] so it acts like feat_dim=1 
-        # for compatibility with the existing training loop
-        out_logits = np.zeros((self.max_frames, 1), dtype=np.float32)
-        out_heatmap = np.zeros((self.max_frames,), dtype=np.float32)
-        out_mask = np.zeros((self.max_frames,), dtype=bool)
-        
-        out_logits[:valid_len, 0] = logits[:valid_len]
-        out_heatmap[:valid_len] = heatmap[:valid_len]
-        out_mask[:valid_len] = True
-        
-        return {
-            "features": torch.from_numpy(out_logits),
-            "heatmap": torch.from_numpy(out_heatmap),
-            "mask": torch.from_numpy(out_mask)
-        }
-
-class LogitTemporalCalibrator(nn.Module):
-    """1D CNN designed to learn temporal smoothing and engagement delays."""
-    def __init__(self, window_size=15):
-        super().__init__()
-        # Padding ensures output length perfectly matches input length
-        self.conv1 = nn.Conv1d(
-            in_channels=1, 
-            out_channels=1, 
-            kernel_size=window_size, 
-            padding=window_size // 2, 
-            padding_mode='replicate'
-        )
-        self.sigmoid = nn.Sigmoid()
-
-    def forward(self, x, mask=None):
-        # Incoming x is [B, T, 1]. Conv1d expects [B, C, T]
-        x = x.transpose(1, 2)
-        out = self.sigmoid(self.conv1(x))
-        # Revert back to [B, T] for loss calculation
-        out = out.squeeze(1)
-        
-        if mask is not None:
-            out = out * mask.float()
-            
-        return out
-
 
 # ---------------------------------------------------------------------------
 # Losses
@@ -170,53 +109,66 @@ def ranking_loss(predicted, target, mask, margin=0.2):
         return total_loss / n_pairs
     return total_loss
 
-class FocalMSELoss(nn.Module):
-    def __init__(self, gamma=2.0, alpha=0.8, threshold=0.1):
+class FocalBCELoss(nn.Module):
+    def __init__(self, gamma=2.0, alpha=0.8): 
+        """
+        Args:
+            gamma: Focusing parameter to down-weight easy examples.
+            alpha: Weighting factor for the positive class (highlights). 
+                   >0.5 makes the model more aggressive/confident.
+        """
         super().__init__()
         self.gamma = gamma
         self.alpha = alpha
-        self.threshold = threshold
 
     def forward(self, preds, targets):
-        mse = F.mse_loss(preds, targets, reduction='none')
-        error = torch.abs(preds - targets)
-        focal_weight = error ** self.gamma
-        alpha_weight = torch.where(targets > self.threshold, self.alpha, 1.0 - self.alpha)
-        loss = alpha_weight * focal_weight * mse
-        return loss.mean()
+        preds = torch.clamp(preds, min=1e-7, max=1.0 - 1e-7)
+        
+        # Positive term heavily weighted by alpha
+        pos_term = -self.alpha * targets * torch.pow(1.0 - preds, self.gamma) * torch.log(preds)
+        
+        # Negative term lightly weighted by (1 - alpha)
+        neg_term = -(1.0 - self.alpha) * (1.0 - targets) * torch.pow(preds, self.gamma) * torch.log(1.0 - preds)
+
+        loss = pos_term + neg_term
+        return loss
 
 # ---------------------------------------------------------------------------
 # Train / Validate
 # ---------------------------------------------------------------------------
-criterion = FocalMSELoss(gamma=2.0, alpha=0.8, threshold=0.15)
+criterion = FocalBCELoss(gamma=1.0, alpha=0.8)
 
 def train_one_epoch(model, loader, optimizer, device, epoch, sampler=None):
     model.train()
     if sampler is not None:
         sampler.set_epoch(epoch)
 
-    total_loss, total_mse, total_rank = 0, 0, 0
+    total_loss, total_rank = 0, 0
     n_batches = 0
     all_predicted, all_target = [], []
     
     for batch in loader:
-        features = batch["features"].to(device)    # [B, T, D] or [B, T, 1]
+        features = batch["features"].to(device)    # [B, T, D]
         heatmap = batch["heatmap"].to(device)       # [B, T]
         mask = batch["mask"].to(device)             # [B, T]
         
         optimizer.zero_grad()
         predicted = model(features, mask=mask)      # [B, T]
         
-        mse_loss = criterion(predicted[mask], heatmap[mask])
         rank_loss = ranking_loss(predicted, heatmap, mask, margin=0.2)
-        loss = 0.5 * mse_loss + 0.5 * rank_loss
+        
+        # Soft BCE Loss
+        raw_bce = criterion(predicted, heatmap)
+        bce_loss = raw_bce[mask].mean()
+
+        #loss = 0.5 * bce_loss + 0.5 * rank_loss
+        loss = bce_loss + rank_loss
         
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
         
         total_loss += loss.item()
-        total_mse += mse_loss.item()
         total_rank += rank_loss.item()
         n_batches += 1
         
@@ -235,7 +187,6 @@ def train_one_epoch(model, loader, optimizer, device, epoch, sampler=None):
                 
     return {
         "loss": total_loss / max(n_batches, 1),
-        "mse_loss": total_mse / max(n_batches, 1),
         "spearman": np.mean(spearman_scores) if spearman_scores else 0.0,
         "rank_loss": total_rank / max(n_batches, 1)
     }
@@ -284,44 +235,39 @@ def validate(model, loader, device):
 # ---------------------------------------------------------------------------
 
 def train(args):
+    # Lock the seed right at the start
+    set_seed(args.seed)
+
     rank, local_rank, world_size = setup_ddp()
     distributed = world_size > 1
     device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
 
     if is_main_process(rank):
         os.makedirs(args.output_dir, exist_ok=True)
-        print(f"🚀 World size: {world_size} | Device: {device} | Logit Mode: {args.use_logits}")
+        print(f"🚀 World size: {world_size} | Device: {device} | Seed: {args.seed}")
 
     # ------------------------------------------------------------------
-    # Datasets & Models Swap based on mode
+    # Dataset & Model Setup
     # ------------------------------------------------------------------
-    if args.use_logits:
-        train_dataset = LogitDataset(args.train_manifest, args.features_dir, max_frames=args.max_frames)
-        val_dataset = LogitDataset(args.val_manifest, args.features_dir, max_frames=args.max_frames)
-        
-        model = LogitTemporalCalibrator(window_size=15).to(device)
-        feat_dim = 1
-        arch_name = "1D_Logit_CNN"
-    else:
-        train_dataset = VSLICEDataset(
-            args.train_manifest, args.features_dir,
-            max_frames=args.max_frames, augment=args.augment, heatmap_sigma=args.heatmap_sigma
-        )
-        val_dataset = VSLICEDataset(
-            args.val_manifest, args.features_dir,
-            max_frames=args.max_frames, augment=False, heatmap_sigma=0.0
-        )
-        
-        sample = train_dataset[0]
-        feat_dim = sample["features"].shape[-1]
-        
-        model = build_model(
-            arch=args.arch, 
-            feat_dim=feat_dim,
-            hidden=args.hidden_dim,
-            dropout=args.dropout
-        ).to(device)
-        arch_name = args.arch
+    train_dataset = VSLICEDataset(
+        args.train_manifest, args.features_dir,
+        max_frames=args.max_frames, augment=args.augment, heatmap_sigma=args.heatmap_sigma
+    )
+    val_dataset = VSLICEDataset(
+        args.val_manifest, args.features_dir,
+        max_frames=args.max_frames, augment=False, heatmap_sigma=0.0
+    )
+    
+    sample = train_dataset[0]
+    feat_dim = sample["features"].shape[-1]
+    
+    model = build_model(
+        arch=args.arch, 
+        feat_dim=feat_dim,
+        hidden=args.hidden_dim,
+        dropout=args.dropout
+    ).to(device)
+    arch_name = args.arch
 
     if is_main_process(rank):
         print(f"Feature dimension: {feat_dim}")
@@ -368,7 +314,7 @@ def train(args):
         print(f"{'='*60}\n")
 
     pbar = tqdm(range(1, args.epochs + 1), desc="Training", unit="epoch", disable=not is_main_process(rank))
-
+    
     for epoch in pbar:
         t0 = time.time()
         train_metrics = train_one_epoch(model, train_loader, optimizer, device, epoch, sampler=train_sampler)
@@ -394,8 +340,7 @@ def train(args):
                     "spearman": best_spearman,
                     "arch": arch_name,
                     "feat_dim": feat_dim,
-                    "hidden": args.hidden_dim,
-                    "is_logit_model": args.use_logits
+                    "hidden": args.hidden_dim
                 }, os.path.join(args.output_dir, "best_model.pt"))
                 improved = " ⭐"
 
@@ -433,7 +378,7 @@ if __name__ == "__main__":
     parser.add_argument("--heatmap_sigma", type=float, default=2.0)
     parser.add_argument("--rank_weight", type=float, default=2.0)
     parser.add_argument("--num_workers", type=int, default=2)
-    parser.add_argument("--use_logits", action="store_true", help="Bypass VSLICEDataset to train purely on 1D contrastive logits.")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
     args = parser.parse_args()
     
     train(args)

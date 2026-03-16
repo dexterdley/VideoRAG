@@ -52,7 +52,6 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from model import build_model
 from extract_features_omni import sample_frames_and_audio, extract_features_for_video, extract_temporal_features_for_video
 
-
 # ─── VLM feature extraction ─────────────────────────────────────────
 def load_vlm(model_path, device):
     """Load MiniCPM-o model for feature extraction on a specific device."""
@@ -119,43 +118,56 @@ def _bin_initializer(bin_dict, num_bins=10):
     for i in range(num_bins):
         bin_dict[i] = {COUNT: 0, CONF: 0, ACC: 0, BIN_ACC: 0, BIN_CONF: 0}
 
-def _populate_bins(confs, GT, num_bins=10):
+def soft_populate_bins(confs, preds, GT, num_bins=10):
+    # If GT is 1D (engagement scores), treat it as the 'label confidence'
+    if GT.ndim == 1:
+        labels_confs = GT
+        labels = (GT >= 0.5).astype(int) # Binary proxy for "engaged"
+    else:
+        labels_confs, labels = GT.max(1)
+
     bin_dict = {}
     _bin_initializer(bin_dict, num_bins)
     num_test_samples = len(confs)
 
     for i in range(0, num_test_samples):
-        confidence = float(confs[i])
-        label = float(GT[i]) # GT heatmap score is the "Accuracy" 
+        confidence = confs[i]
+        prediction = preds[i]
+        label = labels[i]
+        label_conf = labels_confs[i]
         
-        # User's exact binning math, safeguarded against -1 index when conf=0
-        binn = int(math.ceil(((num_bins * confidence) - 1)))
-        binn = max(0, min(binn, num_bins - 1))
+        # Clip confidence to [0, 1] and safely calculate bin index
+        clamped_conf = max(0.0, min(1.0, float(confidence)))
+        binn = int(math.floor(clamped_conf * num_bins))
+        if binn == num_bins: 
+            binn = num_bins - 1 # Handle the exactly 1.0 edge case
         
         bin_dict[binn][COUNT] += 1
         bin_dict[binn][CONF] += confidence
-        bin_dict[binn][ACC] += label 
+        bin_dict[binn][ACC] += (label_conf if (label == prediction) else 1 - label_conf)
 
     for binn in range(0, num_bins):
         if (bin_dict[binn][COUNT] == 0):
-            bin_dict[binn][BIN_ACC] = 0.0
-            bin_dict[binn][BIN_CONF] = 0.0
+            bin_dict[binn][BIN_ACC] = 0
+            bin_dict[binn][BIN_CONF] = 0
         else:
-            bin_dict[binn][BIN_ACC] = float(bin_dict[binn][ACC]) / bin_dict[binn][COUNT]
-            bin_dict[binn][BIN_CONF] = bin_dict[binn][CONF] / float(bin_dict[binn][COUNT])
-            
+            bin_dict[binn][BIN_ACC] = float(
+                bin_dict[binn][ACC]) / bin_dict[binn][COUNT]
+            bin_dict[binn][BIN_CONF] = bin_dict[binn][CONF] / \
+                float(bin_dict[binn][COUNT])
     return bin_dict
 
-def expected_calibration_error(confs, GT, num_bins=15):
-    bin_dict = _populate_bins(confs, GT, num_bins)
+def soft_expected_calibration_error(confs, preds, GT, num_bins=15):
+    bin_dict = soft_populate_bins(confs, preds, GT, num_bins)
     num_samples = len(confs)
-    ece = 0
+    sece = 0
     for i in range(num_bins):
         bin_accuracy = bin_dict[i][BIN_ACC]
         bin_confidence = bin_dict[i][BIN_CONF]
         bin_count = bin_dict[i][COUNT]
-        ece += (float(bin_count) / num_samples) * abs(bin_accuracy - bin_confidence)
-    return ece
+        sece += (float(bin_count) / num_samples) * \
+            abs(bin_accuracy - bin_confidence)
+    return sece
 
 def reliability_plot(confs, GT, title="", output_path=None, num_bins=10):
     """
@@ -165,10 +177,13 @@ def reliability_plot(confs, GT, title="", output_path=None, num_bins=10):
     if GT is None:
         return
 
-    bin_dict = _populate_bins(confs, GT, num_bins)
+    # Generate proxy predictions for calibration metrics
+    preds = np.round(confs)
+    
+    bin_dict = soft_populate_bins(confs, preds, GT, num_bins)
     bns = [(i / float(num_bins)) for i in range(num_bins)]
     
-    ece = expected_calibration_error(confs, GT, num_bins)
+    ece = soft_expected_calibration_error(confs, preds, GT, num_bins)
 
     fig, ax = plt.subplots(figsize=(6, 6))
     
@@ -383,6 +398,7 @@ def infer(args):
 
         with torch.no_grad():
             pred = temporal_model(feat_t, mask=mask_t)
+
         pred_chunk = pred[0].cpu().numpy()[:T_chunk]
 
         pred_sum[chunk_start:chunk_start + T_chunk] += pred_chunk
@@ -403,7 +419,9 @@ def infer(args):
 
         from scipy.stats import spearmanr
         rho, pval = spearmanr(predicted_np, gt)
-        ece = expected_calibration_error(predicted_np, gt, num_bins=10)
+        
+        preds = np.round(predicted_np)
+        ece = soft_expected_calibration_error(predicted_np, preds, gt, num_bins=10)
         print(f"   📊 Spearman ρ = {rho:.4f}  (p = {pval:.2e}) | ECE = {ece:.4f}")
 
     # 7. Plot
@@ -449,4 +467,3 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     infer(args)
-

@@ -17,48 +17,31 @@ for domain in "${DOMAINS[@]}"; do
 done
 
 # ============================================================
-# 3. Extract features for ALL splits — GPUs in parallel
-# ============================================================
-for domain in "${DOMAINS[@]}"; do
-    for split in train val test; do
-        manifest="./processed_dataset/${domain}/${split}.json"
-        if [ -f "$manifest" ]; then
-            echo "🔄 Extracting omni features: ${domain}/${split} (${NGPUS} GPUs)"
-            CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 torchrun --nproc_per_node=8 --master_port=29501 ./VSLICE/extract_features_omni.py \
-                --manifest="$manifest" \
-                --output_dir="./processed_dataset/${domain}/logits_omni/" \
-                --model_path "$MODEL_PATH" \
-                --use_logits
-        fi
-    done
-done
-
-# ============================================================
 # 4. Train — DDP across GPUs
 # ============================================================
 
 for domain in "${DOMAINS[@]}"; do
     echo "🏋️ Training Bi-LSTM on ${domain} (${NGPUS} GPUs)"
-    CUDA_VISIBLE_DEVICES=6,7 torchrun --nproc_per_node=${NGPUS} --master_port=29502 ./VSLICE/train.py \
+    CUDA_VISIBLE_DEVICES=0,1 torchrun --nproc_per_node=${NGPUS} --master_port=29502 ./VSLICE/train.py \
         --train_manifest="./processed_dataset/${domain}/train.json" \
         --val_manifest="./processed_dataset/${domain}/val.json" \
-        --features_dir="./processed_dataset/${domain}/logits_omni/" \
-        --output_dir="./checkpoints/${domain}_omni_logits" \
+        --features_dir="./processed_dataset/${domain}/features_omni_res/" \
+        --output_dir="./checkpoints/${domain}_omni_features_bce" \
         --arch bi_lstm \
         --max_frames 300 \
-        --hidden_dim 64 \
-        --dropout 0.2 \
+        --hidden_dim 128 \
+        --dropout 0.1 \
         --batch_size 128 \
-        --epochs 100 \
+        --epochs 150 \
         --lr 1e-3 \
         --weight_decay 1e-4\
         --augment \
-        --rank_weight 5 \
-        --use_logits
+        --rank_weight 5
 done
 
 echo "✅ Full Omni multi-architecture pipeline complete!"
 
 # python ./VSLICE/infer_omni.py --model_path=".checkpoints/MiniCPM-o-2_6-int4/" --checkpoint="./checkpoints/rival_vids_omni_bi_lstm/best_model.pt"
+# python ./VSLICE/infer_omni_temporal.py --model_path=".checkpoints/MiniCPM-o-2_6-int4/" --checkpoint="./checkpoints/rival_vids_omni_features_bce/best_model.pt"
 # python ./VSLICE/evaluate.py --test_manifest="./processed_dataset/rival_vids/test.json" --checkpoint="./checkpoints/rival_vids_omni_bi_lstm/best_model.pt" --features_dir="./processed_dataset/rival_vids/features_omni_res_tempo/"
 # python ./VSLICE/evaluate_calibration.py --test_manifest="./processed_dataset/rival_vids/test.json" --checkpoint="./checkpoints/rival_vids_omni_bi_lstm/best_model.pt" --features_dir="./processed_dataset/rival_vids/features_omni_res/" --val_manifest="./processed_dataset/rival_vids/test.json"
