@@ -17,6 +17,7 @@ from decord import VideoReader, cpu
 from transformers import AutoModel, AutoTokenizer, AutoModelForSpeechSeq2Seq, AutoModelForImageTextToText, AutoProcessor, pipeline
 from torch.utils.data import Dataset, DataLoader
 from qwen_vl_utils import process_vision_info
+from scipy.ndimage import gaussian_filter1d
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 torch.backends.cuda.matmul.allow_tf32 = True
@@ -155,25 +156,40 @@ except Exception as e:
     final_tokenizer = None
 
 # --- HELPER: Cut Video Clip ---
-async def async_cut_clip(input_path, start_sec, end_sec, output_path):
-    """Uses FFMPEG to slice video without re-encoding (FAST)"""
-    duration = end_sec - start_sec
-    command = [
-        "ffmpeg", "-y",             # Overwrite if exists
-        "-ss", str(start_sec),      # Seek to start
-        "-i", input_path,           # Input file
-        "-t", str(duration),        # Duration to take
-        "-c", "copy",               # Copy stream (no re-encode)
-        "-avoid_negative_ts", "1",  # Fix timestamps
-        output_path
+async def basic_slice_highlight(video_path, start_sec, end_sec, index):
+    """
+    Directly slices video using raw start and end seconds.
+    """
+    # Force to float to handle any tensor types or ints
+    start_sec = float(start_sec)
+    end_sec = float(end_sec)
+    
+    # Ensure logical duration
+    duration = max(end_sec - start_sec, 2.0)
+    start_sec = max(0.0, start_sec)
+
+    clip_path = os.path.join(OUTPUT_FOLDER, f"highlight_{index}_{int(start_sec)}.mp4")
+    
+    cmd = [
+        "ffmpeg", "-y",
+        "-ss", str(start_sec),
+        "-i", video_path,
+        "-t", str(duration),
+        "-c:v", "libx264",
+        "-preset", "ultrafast",
+        "-c:a", "aac",
+        "-avoid_negative_ts", "1",
+        clip_path
     ]
-    process = await asyncio.create_subprocess_exec(
-        *command,
-        stdout=asyncio.subprocess.DEVNULL,
+    
+    proc = await asyncio.create_subprocess_exec(
+        *cmd, 
+        stdout=asyncio.subprocess.DEVNULL, 
         stderr=asyncio.subprocess.DEVNULL
     )
-    await process.wait()
-    return output_path
+    await proc.wait()
+    return clip_path if os.path.exists(clip_path) else None
+
 
 async def async_stitch_videos(video_paths, output_path):
     """Stitches multiple video files into one using ffmpeg concat."""
@@ -216,21 +232,6 @@ async def async_stitch_videos(video_paths, output_path):
         print(f"❌ Stitching Failed:\n{stderr.decode()}")
         return None
         
-    return output_path
-
-def cut_clip(input_path, start_sec, end_sec, output_path):
-    """Uses FFMPEG to slice video without re-encoding (FAST)"""
-    duration = end_sec - start_sec
-    command = [
-        "ffmpeg", "-y",             # Overwrite if exists
-        "-ss", str(start_sec),      # Seek to start
-        "-i", input_path,           # Input file
-        "-t", str(duration),        # Duration to take
-        "-c", "copy",               # Copy stream (no re-encode)
-        "-avoid_negative_ts", "1",  # Fix timestamps
-        output_path
-    ]
-    subprocess.run(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     return output_path
 
 # --- HELPER: Generate Commentary ---
@@ -454,9 +455,7 @@ async def analyze_video(video_path, input_prompt):
 
     yield log_output, None, None, None, None, 0
 
-    await asyncio.sleep(0.01)
-
-    dataset = await asyncio.to_thread(VideoSegmentDataset, video_path, segment_length=20)
+    dataset = await asyncio.to_thread(VideoSegmentDataset, video_path, segment_length=64)
 
     dataloader = DataLoader(
         dataset, 
@@ -530,16 +529,11 @@ async def analyze_video(video_path, input_prompt):
                 
                 # 2. Update Log
                 log_output = f"🔗 Extending Clip: Now {prev_start_sec}s - {prev_end_sec}s\n" + log_output
-                
-                # 3. Generate NEW filename for the LONGER duration
-                # Note: We use the OLD start time (prev_start_sec) and NEW end time
-                clip_name = f"highlight_{prev_start_sec}_{prev_end_sec}.mp4"
-                clip_path = os.path.join(OUTPUT_FOLDER, clip_name)
-                
-                # 4. Re-cut the video (Overwrite the visual experience)
-                await async_cut_clip(video_path, prev_start_sec, timestamp.min().item() + 5, clip_path)
 
-                # 5. Update UI List (Replace the top item, DO NOT shift others)
+                # 3. Cut
+                clip_path = await basic_slice_highlight(video_path, prev_start_sec, timestamp.min().item() + 5, i)
+
+                # 4. Update UI List (Replace the top item, DO NOT shift others)
                 if recent_clips:
                     recent_clips[0] = clip_path
                 else:
@@ -560,14 +554,8 @@ async def analyze_video(video_path, input_prompt):
                 new_entry = f"{timestamp} 🎯 NEW MATCH FOUND \n Confidence: {100 * timestamp_conf:.1f}%\n----------------\n"
                 log_output = new_entry + log_output
 
-                # 3. Generate filename
-                clip_name = f"highlight_{start_sec}_{end_sec}.mp4"
-                #clip_name = f"highlight_{timestamp.min().item()}_{end_sec}.mp4"
-                clip_path = os.path.join(OUTPUT_FOLDER, clip_name)
-                
-                # 4. Cut
-                #await async_cut_clip(video_path, start_sec, end_sec, clip_path)
-                await async_cut_clip(video_path, timestamp.min().item() - 10, timestamp.min().item() + 5, clip_path)
+                # 3. Cut
+                clip_path = await basic_slice_highlight(video_path, timestamp.min().item() - 10, timestamp.min().item() + 5, i)
 
                 # 5. Push to Stack (Insert at top)
                 recent_clips.insert(0, clip_path)
@@ -654,7 +642,7 @@ with gr.Blocks() as demo:
                 with gr.Column(scale=3, min_width=400):
                     v1 = gr.Video(
                         label="2. 🔥 Newest Hit (最新高光时刻)",
-                        autoplay=False,
+                        autoplay=True,
                         interactive=False,
                         height=420  # Increased to match the stack on the right
                     )

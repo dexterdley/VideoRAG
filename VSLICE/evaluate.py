@@ -109,8 +109,9 @@ def evaluate(args):
     checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=False)
     arch = checkpoint.get("arch", "conv")
     feat_dim = checkpoint.get("feat_dim", 4096)
+    hidden = checkpoint.get("hidden", 256)
     
-    model = build_model(arch=arch, feat_dim=feat_dim).to(device)
+    model = build_model(arch=arch, feat_dim=feat_dim, hidden=hidden).to(device)
     model.load_state_dict(checkpoint["model_state_dict"])
     model.eval()
     print(f"✅ Loaded {arch} model from {args.checkpoint} (epoch {checkpoint.get('epoch', '?')})")

@@ -40,6 +40,7 @@ for domain in "${DOMAINS[@]}"; do
 done
 
 echo "✅ Full Omni multi-architecture pipeline complete!"
+python ./VSLICE/evaluate.py --test_manifest="./processed_dataset/rival_vids/test.json" --checkpoint="./checkpoints/rival_vids_omni_features_bce/best_model.pt" --features_dir="./processed_dataset/rival_vids/features_omni_res/"
 
 # python ./VSLICE/infer_omni.py --model_path=".checkpoints/MiniCPM-o-2_6-int4/" --checkpoint="./checkpoints/rival_vids_omni_bi_lstm/best_model.pt"
 # python ./VSLICE/infer_omni_temporal.py --model_path=".checkpoints/MiniCPM-o-2_6-int4/" --checkpoint="./checkpoints/rival_vids_omni_features_bce/best_model.pt"
