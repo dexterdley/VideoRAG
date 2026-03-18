@@ -47,6 +47,13 @@ print(f"Found file in: {MODEL_PATH}")
 OUTPUT_FOLDER = "vslice_results"
 os.makedirs(OUTPUT_FOLDER, exist_ok=True)
 
+DUMMY_VIDEO_PATHS = [
+    ["./downloads/rival_vids/XvO5F2Be2ak.mp4"],
+    ["./downloads/rival_vids/aAzcPEESXms.mp4"],
+    ["./downloads/rival_vids/qS2NesstoE8.mp4"],
+    ["/home/dexter/LLaVA-VLS/playground/demo/QID80I1IRyI.mp4"]
+]
+
 class QwenVLWrapper:
     def __init__(self, model, tokenizer):
         self.model = model
@@ -104,7 +111,8 @@ try:
     tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH, trust_remote_code=True)
     processor = AutoProcessor.from_pretrained(MODEL_PATH, trust_remote_code=True)
     yes_token_id = tokenizer.encode("Yes", add_special_tokens=False)[0]
-    print("✅ VLM Model & Tokens Loaded Successfully.")
+    no_token_id = tokenizer.encode("No", add_special_tokens=False)[0]
+    print(f"✅ VLM Model & Tokens Loaded Successfully (Yes: {yes_token_id}, No: {no_token_id}).")
 
     qwen_model = AutoModelForImageTextToText.from_pretrained(
                 "Qwen/Qwen3.5-9B", 
@@ -159,9 +167,20 @@ def batched_yes_no_inference(images, prompt_text):
     with torch.inference_mode():
         outputs = vlm_model(inputs, attention_mask=inputs.get("attention_mask"))
         logits = outputs.logits[:, -1, :]
-        probs = torch.nn.functional.softmax(logits, dim=-1)
+        
+        # --- CALIBRATION: Binary Softmax (Yes vs No Competition) ---
+        # Instead of softmax over 32k tokens, we isolate the two relevant outcomes.
+        yes_logits = logits[:, yes_token_id]
+        no_logits = logits[:, no_token_id]
+        
+        # Apply a mild Temperature Scaling (T=1.2) to soften the distribution
+        T = 1.2
+        binary_logits = torch.stack([yes_logits, no_logits], dim=-1) / T
+        binary_probs = torch.nn.functional.softmax(binary_logits, dim=-1)
+        
+        # The calibrated confidence is the probability of 'Yes' relative only to 'No'
+        confidences = binary_probs[:, 0].cpu()
 
-    confidences = probs[:, yes_token_id].cpu()
     return confidences
 
 async def analyze_with_qwen(transcript, prompt=None, analysis_mode="conservative"):
@@ -180,10 +199,10 @@ async def analyze_with_qwen(transcript, prompt=None, analysis_mode="conservative
             "and reframe them to align strongly with Democratic/liberal values (e.g., social equity, environmentalism, collective action). "
             "Even if the transcript is chaotic or disjointed, identify the 3 most prominent segments and provide strategic reasons why they resonate with a progressive base."
         ),
-        "neutral": (
-            "You are a NEUTRAL, BIPARTISAN speech analyst. "
-            "Your task is to extract timestamped segments based strictly on structural criteria (emotional intensity, rhetoric, audience reaction). "
-            "Even if the transcript is chaotic, identify the 3 most objectively significant moments and explain why they are important without any political bias."
+        "engagement": (
+            "You are a EXPERT video game analyst. "
+            "Your task is to analyse video gaming segments based strictly on structural criteria (battle intensity, audience engagement). "
+            "Even if the transcript is chaotic, identify the 3 most objectively significant moments and explain why they are exciting."
         )
     }
     json_format = (
@@ -344,37 +363,45 @@ async def basic_slice_highlight(video_path, h, index):
     return clip_path if os.path.exists(clip_path) else None
 
 # ─────────────────────── SCORE CALIBRATION ───────────────────────
-def calibrate_bitemporal(scores, decay=0.9, sigma=2.0):
+def calibrate_bitemporal(scores, decay=0.9, sigma=2.0, hp_sigma=20.0):
     """
-    Performs bitemporal decay and applies a Gaussian filter 
-    to create smooth, bell-shaped confidence curves.
+    Performs a high-pass filter, bitemporal decay, and Gaussian smoothing.
+    Restores true peak heights and avoids over-smoothing.
     """
+    scores = np.array(scores)
     n = len(scores)
     if n == 0:
         return scores
-        
+    
+    original_scores = scores.copy()
+
+    # --- 1. High-Pass Filter Logic ---
+    low_pass_baseline = gaussian_filter1d(scores, sigma=hp_sigma)
+    hp_scores = np.maximum(0, scores - low_pass_baseline)
+
     forward = np.zeros(n)
     backward = np.zeros(n)
 
-    # --- Forward Pass (Past -> Future) ---
+    # --- 2. Forward Pass ---
     curr_score = 0
     for i in range(n):
-        curr_score = max(scores[i], curr_score * decay)
+        curr_score = max(hp_scores[i], curr_score * decay)
         forward[i] = curr_score
 
-    # --- Backward Pass (Future -> Past) ---
+    # --- 3. Backward Pass ---
     curr_score = 0
     for i in range(n - 1, -1, -1):
-        curr_score = max(scores[i], curr_score * decay)
+        curr_score = max(hp_scores[i], curr_score * decay)
         backward[i] = curr_score
 
-    # --- Aggregate & Smooth ---
-    # Use max() instead of mean() to keep the peak at 1.0 even after smoothing
+    # --- 4. Aggregate & Smooth ---
     calibrated = np.maximum(forward, backward)
     calibrated = gaussian_filter1d(calibrated, sigma=sigma)
 
-    if calibrated.max() > 0:
-        calibrated = calibrated / calibrated.max() * np.max(scores)
+    # --- 5. True Peak Restoration ---
+    # Scale back up using the absolute maximum of the ORIGINAL scores!
+    if calibrated.max() > 0 and original_scores.max() > 0:
+        calibrated = (calibrated / calibrated.max()) * original_scores.max()
 
     return np.clip(calibrated, 0, 1)
 
@@ -405,7 +432,7 @@ async def run_pipeline(video_path, user_query, analysis_mode):
     plot_df = None
     
     if not video_path:
-        yield "⚠️ Please upload a video.", "", "", "[]", None, None, None, plot_df, 0
+        yield "⚠️ Please upload a video.", "", "", None, None, None, plot_df, 0
         return
 
     run_id = int(time.time())
@@ -413,7 +440,7 @@ async def run_pipeline(video_path, user_query, analysis_mode):
 
     # ── STEP 1: WHISPER TRANSCRIPTION ──
     log = "🎙️ **Step 1/4: Running Whisper Transcription...**\n"
-    yield log, "", "", "[]", None, None, None, plot_df, 5
+    yield log, "", "", None, None, None, plot_df, 5
 
     base_name = os.path.splitext(os.path.basename(video_path))[0]
     json_path = os.path.join(OUTPUT_FOLDER, f"{base_name}_whisper.json")
@@ -434,15 +461,15 @@ async def run_pipeline(video_path, user_query, analysis_mode):
     n_segs = len(whisper_segs)
 
     log = f"✅ **Whisper:** {n_segs} segments transcribed/loaded.\n\n" + log
-    yield log, transcript, "", "[]", None, None, None, plot_df, 20
+    yield log, transcript, "", None, None, None, plot_df, 20
 
     # ── STEP 2: MINICPM VISUAL SCAN ──
     visual_hits = []
     
     log = f"👁️ **Step 2/4: VLM Visual Scan** — Query: '{user_query}'\n" + log
-    yield log, transcript, "", "[]", None, None, None, plot_df, 25
+    yield log, transcript, "", None, None, None, plot_df, 25
 
-    dataset = await asyncio.to_thread(VideoSegmentDataset, video_path, segment_length=32, width=896, height=672)
+    dataset = await asyncio.to_thread(VideoSegmentDataset, video_path, segment_length=32, width=1280, height=720)
     loader = DataLoader(dataset, batch_size=1, shuffle=False, num_workers=2, collate_fn=lambda x: x[0])
     
     history_time, history_conf = [], []
@@ -462,15 +489,26 @@ async def run_pipeline(video_path, user_query, analysis_mode):
 
         raw_scores = np.array(history_conf)
         calibrated_scores = calibrate_bitemporal(raw_scores, decay=0.9)
+        
+        df_raw = pd.DataFrame({
+            "Time (s)": history_time, 
+            "Confidence": raw_scores.tolist(), 
+            "Type": "Before"
+        })
+        df_calib = pd.DataFrame({
+            "Time (s)": history_time, 
+            "Confidence": calibrated_scores.tolist(), 
+            "Type": "After (Calibrated)"
+        })
 
-        # Overwrite plot_df with the actual incoming data
-        plot_df = pd.DataFrame({"Time (s)": history_time, "Confidence": calibrated_scores.tolist()})
+        plot_df = pd.concat([df_raw, df_calib], ignore_index=True)
         pct = 25 + int((i / total_steps) * 40)  # 25-65%
-        max_conf, best_idx = confidences.max(0)
-
+        # max_conf, best_idx = confidences.max(0)
+        max_conf, best_idx = torch.tensor(calibrated_scores[-num_frames:]).max(0)
         best_time = start + (best_idx * time_step)
-
-        if max_conf > 0.65:
+        #import pdb; pdb.set_trace()
+        
+        if max_conf > 0.5:
             ts = f"{int(best_time // 60)}:{int(best_time % 60):02d}"
             visual_hits.append({"time": best_time, "conf": max_conf.item(), "timestamp": ts})
             log = f"[{ts}] 🎯 VISUAL MATCH ({max_conf*100:.1f}%)\n" + log
@@ -487,7 +525,6 @@ async def run_pipeline(video_path, user_query, analysis_mode):
             success_path = await basic_slice_highlight(video_path, h_simple, i)
 
             if success_path:
-                await asyncio.sleep(0.001) 
                 recent_clips.insert(0, success_path)
                 recent_clips = recent_clips[:3]
                 log = f"[{ts}] 🎯 VISUAL MATCH ({max_conf*100:.1f}%)\n" + log
@@ -503,11 +540,10 @@ async def run_pipeline(video_path, user_query, analysis_mode):
             response = await analyze_with_qwen(enriched_transcript, analysis_mode=analysis_mode)
             analysis_display = f"### Hit at {ts}\n{response}\n\n" + analysis_display
 
-        yield log, transcript, analysis_display, "[]", recent_clips[0], recent_clips[1], recent_clips[2], plot_df, pct
-        await asyncio.sleep(0.01)
+        yield log, transcript, analysis_display, recent_clips[0], recent_clips[1], recent_clips[2], plot_df, pct
 
     gr.Info("Slicing process complete, you can view your highlights")
-    yield log, transcript, analysis_display, "[]", recent_clips[0], recent_clips[1], recent_clips[2], plot_df, 100
+    yield log, transcript, analysis_display, recent_clips[0], recent_clips[1], recent_clips[2], plot_df, 100
 
 # ═══════════════════════════════════════════════════════════════
 #                         GUI LAYOUT
@@ -523,7 +559,7 @@ with gr.Blocks(title="VSLICE") as demo:
         # ── LEFT: INPUTS ──
         with gr.Column(scale=4):
             with gr.Group():
-                input_video = gr.Video(label="Upload Video", height=300)
+                input_video = gr.Video(label="Upload Video")
                 input_query = gr.Textbox(
                     label="Visual Search Query (optional)",
                     value="Find scenes of Trump drinking water",
@@ -531,12 +567,18 @@ with gr.Blocks(title="VSLICE") as demo:
                     info="VLM scans video frames for this. Leave blank to skip visual scan."
                 )
                 analysis_mode = gr.Radio(
-                    choices=["conservative", "liberal", "neutral"],
-                    value="conservative",
+                    choices=["Engagement","Conservative", "Liberal"],
+                    value="Engagement",
                     label="Analysis Mode",
-                    info="Political lens for LLM highlight selection"
+                    info="Mode for LLM highlight selection"
                 )
                 btn_run = gr.Button("🚀 Run Full Pipeline", variant="primary", size="lg")
+
+                gr.Examples(
+                    examples=DUMMY_VIDEO_PATHS, # Make sure DUMMY_VIDEO_PATHS is defined in your full script
+                    inputs=input_video,
+                    label="Or select a local test video:"
+                )
 
         # ── RIGHT: OUTPUTS ──
         with gr.Column(scale=6):
@@ -556,30 +598,31 @@ with gr.Blocks(title="VSLICE") as demo:
                 y_lim=[0, 1.05],
                 tooltip=["Time (s)", "Confidence"],
                 height=250,
+                color="Type"
             )
-    with gr.Row():
-        with gr.Column(scale=1):
-            transcript_box = gr.Textbox(label="📝 Transcript (Whisper)", lines=8, interactive=True,
-                                        info="Editable — fix errors before re-running analysis")
-        with gr.Column(scale=1):
-            analysis_box = gr.Textbox(label="🤖 LLM Analysis", lines=8, interactive=False)
-
-    highlights_state = gr.Textbox(label="Highlights JSON (editable)", lines=4, interactive=True,
-                                   info="Edit timestamps before slicing")
-
-    log_box = gr.Textbox(label="System Logs", lines=8, max_lines=15)
+    
+    analysis_box = gr.Textbox(label="🤖 LLM Analysis", lines=8, interactive=False)
     progress = gr.Slider(0, 100, label="Progress", interactive=False)
-
+    with gr.Row():
+        # Placed Transcript in an Accordion
+        with gr.Accordion("📝 Transcript (Whisper)", open=False):
+            transcript_box = gr.Textbox(
+                show_label=False, 
+                lines=8, 
+                interactive=True,
+                info="Editable — fix errors before re-running analysis"
+            )
+            log_box = gr.Textbox(show_label=False, lines=8, max_lines=15)
+        
     # ── WIRE ──
     btn_run.click(
         fn=run_pipeline,
         inputs=[input_video, input_query, analysis_mode],
-        outputs=[log_box, transcript_box, analysis_box, highlights_state,
+        outputs=[log_box, transcript_box, analysis_box,
                  clip_1, clip_2, clip_3, confidence_plot, progress]
     )
 
 theme = gr.themes.Glass(primary_hue="sky", radius_size="lg", font=[gr.themes.GoogleFont("Inconsolata"), "Arial", "sans-serif"]).set(
-        # "Glass" effect for background
         body_background_fill_dark="#0f172a",
         block_background_fill_dark="#1e293b"
         )
@@ -589,5 +632,7 @@ if __name__ == "__main__":
         server_name="0.0.0.0",
         server_port=7860,
         theme=theme,
-        allowed_paths=[OUTPUT_FOLDER]
+        allowed_paths=[OUTPUT_FOLDER, # Make sure OUTPUT_FOLDER is defined in your full script
+                    "/home/dexter/VideoRAG/downloads/rival_vids/", 
+                    "/home/dexter/LLaVA-VLS/playground/demo/"]
     )
