@@ -1,12 +1,15 @@
 import os
 import torch
+import argparse
 import numpy as np
 import matplotlib.pyplot as plt
 from PIL import Image
 from decord import VideoReader, cpu
 from torch.utils.data import Dataset, DataLoader
-
+from tqdm import tqdm
 from transformers import AutoModel, AutoTokenizer, AutoProcessor
+from scipy.ndimage import gaussian_filter1d
+from sklearn.metrics import accuracy_score, f1_score
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 torch.backends.cuda.matmul.allow_tf32 = True
@@ -52,7 +55,7 @@ CLASSES = {'bloom': 0, 'cats': 1, 'people': 2}
 CLASSES2KEYS =  {0:'bloom', 1:'cats', 2:'people'}
 EVENT_DURATION_SEC = 5
 FPS = 1  
-N_BINS = 10
+N_BINS = 15
 SEGMENT_LENGTH = 5 # Number of seconds (and frames) per batch
 
 def convert_to_onehot(labels, classes=3):
@@ -70,7 +73,7 @@ def generate_temporal_ground_truth(sequence_name, fps=FPS, duration=EVENT_DURATI
             labels.extend([CLASSES[event]] * frames_per_event)
     return torch.tensor(labels, dtype=torch.long)
 
-def get_model_predictions(video_path, num_frames, model, processor, yes_id, no_id, labels):        
+def get_model_predictions(video_path, num_frames, model, processor, yes_id, no_id, labels, mode):        
     # Extract frames
     vr = VideoReader(video_path, ctx=cpu(0), width=596, height=336)
     fps = vr.get_avg_fps()
@@ -86,19 +89,19 @@ def get_model_predictions(video_path, num_frames, model, processor, yes_id, no_i
         prompts_lists = []
         input_images_lists = []
 
-        # 1. Build a mega-batch containing the TRUE class prompt for EVERY frame
+        # 1. Build a mega-batch asking about EVERY class for EVERY frame
         for i, img in enumerate(frames):
-            cls_name = CLASSES2KEYS[labels[i].item()]
-            formatted_prompt = f"Does this image contain or represent: '{cls_name}'?"
-            msgs = [
-                {'role': 'system', 'content': system_prompt},
-                {'role': 'user', 'content': f"(<image>./</image>)\n{formatted_prompt}"}
-            ]
-            prompt_str = processor.tokenizer.apply_chat_template(
-                msgs, tokenize=False, add_generation_prompt=True
-            )
-            prompts_lists.append(prompt_str)
-            input_images_lists.append([img])
+            for class_id, cls_name in CLASSES2KEYS.items():
+                formatted_prompt = f"Does this image contain or represent: '{cls_name}'?"
+                msgs = [
+                    {'role': 'system', 'content': system_prompt},
+                    {'role': 'user', 'content': f"(<image>./</image>)\n{formatted_prompt}"}
+                ]
+                prompt_str = processor.tokenizer.apply_chat_template(
+                    msgs, tokenize=False, add_generation_prompt=True
+                )
+                prompts_lists.append(prompt_str)
+                input_images_lists.append([img])
                 
         # 2. Process the mega-batch
         inputs = processor(
@@ -122,22 +125,25 @@ def get_model_predictions(video_path, num_frames, model, processor, yes_id, no_i
         probs = torch.nn.functional.softmax(logits, dim=-1)
         yes_probs = probs[:, yes_id]
 
-        if False:
-            yes_logits = logits[:, yes_id]
-            no_logits = logits[:, no_id]
-            T = 1.2
+        if mode == "bitemporal":
+            # --- CALIBRATION: Binary Softmax (Yes vs No Competition) ---
+            # Instead of softmax over 32k tokens, we isolate the two relevant outcomes.
+            yes_logits = logits[:, yes_token_id]
+            no_logits = logits[:, no_token_id]
+            
+            # Apply a mild Temperature Scaling (T=1.2) to soften the distribution
+            T = 0.8
             binary_logits = torch.stack([yes_logits, no_logits], dim=-1) / T
             binary_probs = torch.nn.functional.softmax(binary_logits, dim=-1)
             
-            # Extract strictly the P(Yes) and move to CPU safely
-            yes_probs = binary_probs[:, 0].to(torch.float32).cpu()
+            # The calibrated confidence is the probability of 'Yes' relative only to 'No'
+            yes_probs = binary_probs[:, 0]
 
-    return yes_probs
+    return yes_probs.cpu()
 
-def compute_ece_and_bins(yes_probabilities, n_bins=N_BINS):
+def compute_ece_and_bins(yes_probabilities, targets, n_bins=N_BINS):
     """
-    Computes binary ECE. Since the prompt always asks about the TRUE class, 
-    the ground truth target is always 1 (Yes).
+    Computes binary ECE comparing P(Yes) against actual 1/0 targets.
     """
     # Prediction is 1 (Yes) if P(Yes) >= 0.5, else 0 (No)
     predictions = (yes_probabilities >= 0.5).float()
@@ -145,8 +151,7 @@ def compute_ece_and_bins(yes_probabilities, n_bins=N_BINS):
     # Confidence is max(P(Yes), P(No))
     confidences = torch.where(yes_probabilities >= 0.5, yes_probabilities, 1.0 - yes_probabilities)
     
-    # The correct answer is always 1
-    targets = torch.ones_like(predictions)
+    # Compare predictions against the REAL targets (1 or 0)
     accuracies = predictions.eq(targets)
     
     bin_boundaries = torch.linspace(0, 1, n_bins + 1)
@@ -171,7 +176,7 @@ def compute_ece_and_bins(yes_probabilities, n_bins=N_BINS):
             
     return ece.item(), bin_confidences, bin_accuracies
 
-def plot_reliability_diagram(bin_confidences, bin_accuracies, ece_score, save_path="reliability_diagram.png"):
+def plot_reliability_diagram(bin_confidences, bin_accuracies, ece_score, save_path="./results/t3_reliability_diagram.png"):
     plt.figure(figsize=(8, 8))
     plt.plot([0, 1], [0, 1], linestyle='--', color='gray', label='Perfect Calibration')
     
@@ -189,7 +194,40 @@ def plot_reliability_diagram(bin_confidences, bin_accuracies, ece_score, save_pa
     plt.savefig(save_path)
     print(f"\n✅ Reliability diagram saved to {save_path}")
 
-def main():
+def calibrate_bitemporal(scores, decay=0.9, sigma=1.0):
+    """
+    Performs bitemporal decay and Gaussian smoothing
+    """
+    scores = np.array(scores)
+    n = len(scores)
+    if n == 0:
+        return scores
+
+    forward = np.zeros(n)
+    backward = np.zeros(n)
+
+    # --- 1. Forward Pass (Bridge dropouts forward) ---
+    curr_score = 0
+    for i in range(n):
+        curr_score = max(scores[i], curr_score * decay)
+        forward[i] = curr_score
+
+    # --- 2. Backward Pass (Bridge dropouts backward) ---
+    curr_score = 0
+    for i in range(n - 1, -1, -1):
+        curr_score = max(scores[i], curr_score * decay)
+        backward[i] = curr_score
+
+    # --- 3. Aggregate & Smooth ---
+    # Take the strongest signal from either direction to fill in gaps
+    calibrated = np.maximum(forward, backward)
+    
+    # Apply a mild Gaussian blur to remove sharp jagged edges
+    calibrated = gaussian_filter1d(calibrated, sigma=sigma)
+
+    return np.clip(calibrated, 0, 1)
+
+def main(args):
     if not os.path.exists(DATA_DIR):
         print(f"Warning: Directory not found at {DATA_DIR}. Running with simulated names.")
         sequences = ['bloom_cats_people']
@@ -205,8 +243,9 @@ def main():
 
     all_probabilities = []
     all_labels = []
+    all_ece = []
 
-    for seq in sequences:
+    for seq in tqdm(sequences):
         print(f"\nProcessing Sequence: {seq}")
         # 1. Get Ground Truth
         labels = generate_temporal_ground_truth(seq)
@@ -220,7 +259,7 @@ def main():
             for item in video_files:
                 target_path = os.path.join(video_path, item)
                 
-                print(f"Decoding path: {target_path}")
+                #print(f"Decoding path: {target_path}")
 
                 probs = get_model_predictions(
                     video_path=target_path, 
@@ -229,28 +268,58 @@ def main():
                     processor=processor,
                     yes_id=yes_token_id, 
                     no_id=no_token_id,
-                    labels=labels
+                    labels=labels,
+                    mode=args.mode
                 )
-                vid_ece, _, _ = compute_ece_and_bins(probs.cpu())
-                print(f"  --> Per-Video ECE for {item}: {vid_ece*100:.4f}%")
-                # import pdb; pdb.set_trace()
 
-        all_labels.append(labels)
-        all_probabilities.append(probs)
+                # Calculate how many frames were actually processed
+                actual_frames = len(probs) // len(CLASSES)
+                valid_labels = labels[:actual_frames]
+
+                # --- APPLY TEMPORAL CALIBRATION ---
+                probs_cpu = probs.cpu()
+                if args.mode == "bitemporal":
+
+                    probs_numpy = probs.view(actual_frames, len(CLASSES)).cpu().float().numpy()
+                    calibrated_probs = np.zeros_like(probs_numpy)
+                    
+                    for c in range(len(CLASSES)):
+                        calibrated_probs[:, c] = calibrate_bitemporal(probs_numpy[:, c])
+
+                # --- NEW: FRAME-LEVEL ACCURACY & F1 (PER VIDEO) ---
+                probs_reshaped_for_metrics = probs_cpu.view(actual_frames, len(CLASSES))
+                frame_preds = torch.argmax(probs_reshaped_for_metrics, dim=1).numpy()
+                frame_labels = valid_labels.numpy()
+                
+                vid_acc = accuracy_score(frame_labels, frame_preds)
+                vid_f1 = f1_score(frame_labels, frame_preds, average='macro')
+
+                vid_targets = convert_to_onehot(valid_labels, classes=len(CLASSES)).flatten()                
+                vid_ece, _, _ = compute_ece_and_bins(probs_cpu, vid_targets)
+                #print(f"  --> Per-Video ECE for {item}: {vid_ece*100:.4f}%")
+                all_labels.append(valid_labels)
+                all_probabilities.append(probs_cpu)
+                all_ece.append(vid_ece)
 
     # Aggregate
     all_labels = torch.cat(all_labels)
     all_probabilities = torch.cat(all_probabilities, dim=0)
+    all_targets = convert_to_onehot(all_labels, classes=len(CLASSES)).flatten()
 
     # 3. Measure Calibration
-    ece, bin_confs, bin_accs = compute_ece_and_bins(all_probabilities, all_labels)
+    ece, bin_confs, bin_accs = compute_ece_and_bins(all_probabilities, all_targets)
     
     print("-" * 40)
     print(f"Total Frames Evaluated: {len(all_labels)}")
     print(f"Overall Expected Calibration Error (ECE): {ece:.4f}")
+    print(f"Average ECE:, {sum(all_ece)/len(all_ece)*100:.4f}%")
 
     # 4. Plot
-    plot_reliability_diagram(bin_confs, bin_accs, ece)
+    save_name = f"./results/t3_reliability_{args.mode}.png"
+    plot_reliability_diagram(bin_confs, bin_accs, ece, save_path=save_name)
 
 if __name__ == '__main__':
-    main()
+    parser = argparse.ArgumentParser(description="Run inference using direct VLM probabilities and measure calibration on T3.")
+    parser.add_argument("--mode", type=str, default="regular", help="Calibration algo")
+    args = parser.parse_args()
+    main(args)
