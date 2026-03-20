@@ -54,6 +54,12 @@ DUMMY_VIDEO_PATHS = [
     ["/home/dexter/LLaVA-VLS/playground/demo/QID80I1IRyI.mp4"]
 ]
 
+'''
+GUI Experiments Times
+Start 267.31
+No QWEN becomes 117.77
+'''
+
 class QwenVLWrapper:
     def __init__(self, model, tokenizer):
         self.model = model
@@ -105,8 +111,8 @@ try:
         trust_remote_code=True,
         dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
         device_map=device,
-        #_attn_implementation="flash_attention_2"
-        attn_implementation="eager"
+        _attn_implementation="flash_attention_2"
+        #attn_implementation="eager"
     ).eval()
     tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH, trust_remote_code=True)
     processor = AutoProcessor.from_pretrained(MODEL_PATH, trust_remote_code=True)
@@ -118,6 +124,7 @@ try:
                 "Qwen/Qwen3.5-9B", 
                 device_map="auto", 
                 dtype=torch.bfloat16,
+                _attn_implementation="flash_attention_2",
                 trust_remote_code=True).eval()
     qwen_tokenizer = AutoProcessor.from_pretrained("Qwen/Qwen3.5-9B", pad_token='<|endoftext|>')
     qwen_model = QwenVLWrapper(qwen_model, qwen_tokenizer)
@@ -429,6 +436,7 @@ async def run_pipeline(video_path, user_query, analysis_mode):
       Step 4: Auto-slice highlights
     """
     gr.Info("Starting Process ⏳")
+    t1 = time.time()
     plot_df = None
     
     if not video_path:
@@ -469,8 +477,8 @@ async def run_pipeline(video_path, user_query, analysis_mode):
     log = f"👁️ **Step 2/4: VLM Visual Scan** — Query: '{user_query}'\n" + log
     yield log, transcript, "", None, None, None, plot_df, 25
 
-    dataset = await asyncio.to_thread(VideoSegmentDataset, video_path, segment_length=32, width=1280, height=720)
-    loader = DataLoader(dataset, batch_size=1, shuffle=False, num_workers=2, collate_fn=lambda x: x[0])
+    dataset = await asyncio.to_thread(VideoSegmentDataset, video_path, segment_length=48, width=1280, height=720)
+    loader = DataLoader(dataset, batch_size=1, shuffle=False, num_workers=4, collate_fn=lambda x: x[0])
     
     history_time, history_conf = [], []
     recent_clips = [None, None, None]
@@ -537,12 +545,15 @@ async def run_pipeline(video_path, user_query, analysis_mode):
 
              # ── STEP 3: Pass enriched transcript LLM for ANALYSIS ──
             log = f"🤖 **Step 3/4: LLM Analysis ({analysis_mode} mode)...**\n" + log
-            response = await analyze_with_qwen(enriched_transcript, analysis_mode=analysis_mode)
+            #response = await analyze_with_qwen(enriched_transcript, analysis_mode=analysis_mode)
+            response = "Pass"
             analysis_display = f"### Hit at {ts}\n{response}\n\n" + analysis_display
 
         yield log, transcript, analysis_display, recent_clips[0], recent_clips[1], recent_clips[2], plot_df, pct
 
     gr.Info("Slicing process complete, you can view your highlights")
+    t2 = time.time()
+    print("Total time:", t2 - t1)
     yield log, transcript, analysis_display, recent_clips[0], recent_clips[1], recent_clips[2], plot_df, 100
 
 # ═══════════════════════════════════════════════════════════════

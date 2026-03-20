@@ -1,5 +1,6 @@
 import os
 import torch
+import random
 import argparse
 import numpy as np
 import matplotlib.pyplot as plt
@@ -26,6 +27,19 @@ elif os.path.exists(path_linux):
 else:
     MODEL_PATH = "openbmb/MiniCPM-V-2_6"
 print(f"Using model path: {MODEL_PATH}")
+
+# ─────────────────────── REPRODUCIBILITY ───────────────────────
+def set_seed(seed=42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    # The following ensures deterministic CuDNN behavior (might slightly slow down execution)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+set_seed(42) # <-- Initialize seed here
 
 # ─────────────────────── VLM MODEL LOADER ───────────────────────
 print(f"Loading VLM Backbone: {MODEL_PATH}...")
@@ -173,7 +187,7 @@ def compute_ece_and_bins(yes_probabilities, targets, n_bins=N_BINS):
         else:
             bin_accuracies.append(0.0)
             bin_confidences.append(0.0)
-            
+
     return ece.item(), bin_confidences, bin_accuracies
 
 def plot_reliability_diagram(bin_confidences, bin_accuracies, ece_score, save_path="./results/t3_reliability_diagram.png"):
@@ -194,9 +208,10 @@ def plot_reliability_diagram(bin_confidences, bin_accuracies, ece_score, save_pa
     plt.savefig(save_path)
     print(f"\n✅ Reliability diagram saved to {save_path}")
 
-def calibrate_bitemporal(scores, decay=0.9, sigma=1.0):
+def calibrate_bitemporal(scores, decay=0.9, sigma=1.0, cutoff_threshold=0.4):
     """
-    Performs bitemporal decay and Gaussian smoothing
+    Performs bitemporal decay and Gaussian smoothing, but breaks the smoothing
+    if a sharp visual cutoff (scene change) is detected.
     """
     scores = np.array(scores)
     n = len(scores)
@@ -207,23 +222,34 @@ def calibrate_bitemporal(scores, decay=0.9, sigma=1.0):
     backward = np.zeros(n)
 
     # --- 1. Forward Pass (Bridge dropouts forward) ---
-    curr_score = 0
-    for i in range(n):
-        curr_score = max(scores[i], curr_score * decay)
+    curr_score = scores[0]
+    forward[0] = curr_score
+    for i in range(1, n):
+        # If the model's confidence sharply drops/spikes, it's a visual cut. Reset!
+        if abs(scores[i] - scores[i-1]) > cutoff_threshold:
+            curr_score = scores[i]
+        else:
+            curr_score = max(scores[i], curr_score * decay)
         forward[i] = curr_score
 
     # --- 2. Backward Pass (Bridge dropouts backward) ---
-    curr_score = 0
-    for i in range(n - 1, -1, -1):
-        curr_score = max(scores[i], curr_score * decay)
+    curr_score = scores[-1]
+    backward[-1] = curr_score
+    for i in range(n - 2, -1, -1):
+        # If the model's confidence sharply drops/spikes, it's a visual cut. Reset!
+        if abs(scores[i] - scores[i+1]) > cutoff_threshold:
+            curr_score = scores[i]
+        else:
+            curr_score = max(scores[i], curr_score * decay)
         backward[i] = curr_score
 
     # --- 3. Aggregate & Smooth ---
-    # Take the strongest signal from either direction to fill in gaps
+    # Take the strongest signal from either direction
     calibrated = np.maximum(forward, backward)
     
-    # Apply a mild Gaussian blur to remove sharp jagged edges
-    calibrated = gaussian_filter1d(calibrated, sigma=sigma)
+    # Apply a very mild Gaussian blur (keep sigma low to prevent re-smearing boundaries)
+    if sigma > 0:
+        calibrated = gaussian_filter1d(calibrated, sigma=sigma)
 
     return np.clip(calibrated, 0, 1)
 
@@ -286,6 +312,8 @@ def main(args):
                     for c in range(len(CLASSES)):
                         calibrated_probs[:, c] = calibrate_bitemporal(probs_numpy[:, c])
 
+                    probs_cpu = torch.tensor(calibrated_probs, dtype=torch.float32).flatten()
+
                 # --- NEW: FRAME-LEVEL ACCURACY & F1 (PER VIDEO) ---
                 probs_reshaped_for_metrics = probs_cpu.view(actual_frames, len(CLASSES))
                 frame_preds = torch.argmax(probs_reshaped_for_metrics, dim=1).numpy()
@@ -297,9 +325,11 @@ def main(args):
                 vid_targets = convert_to_onehot(valid_labels, classes=len(CLASSES)).flatten()                
                 vid_ece, _, _ = compute_ece_and_bins(probs_cpu, vid_targets)
                 #print(f"  --> Per-Video ECE for {item}: {vid_ece*100:.4f}%")
+                #import pdb; pdb.set_trace()
                 all_labels.append(valid_labels)
                 all_probabilities.append(probs_cpu)
                 all_ece.append(vid_ece)
+        break
 
     # Aggregate
     all_labels = torch.cat(all_labels)
