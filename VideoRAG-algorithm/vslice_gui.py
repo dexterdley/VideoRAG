@@ -55,6 +55,7 @@ DUMMY_VIDEO_PATHS = [
     ["/home/dexter/LLaVA-VLS/playground/demo/QID80I1IRyI.mp4"]
 ]
 
+# Analyze these frames for text banners like 'First Blood', 'Double Kill', 'Triple Kill', 'Quadra Kill', or 'Invincible'. If any of these are present, answer 'Yes'. Otherwise, answer 'No'. Do not provide any explanation."
 '''
 GUI Experiments Times
 Start 267.31
@@ -175,63 +176,21 @@ def batched_yes_no_inference(images, prompt_text):
     with torch.inference_mode():
         outputs = vlm_model(inputs, attention_mask=inputs.get("attention_mask"))
         
-        flat_pixels = [
-            patch 
-            for img_patches in inputs['pixel_values'] 
-            for patch in img_patches
-        ]
-        
-        # 2. Stack them into a single batched tensor and move to device
-        # This will create a tensor of shape [Total_Patches, 3, H, W]
-        pixel_tensor = torch.stack(flat_pixels).to(vlm_model.device)
-        patch_features = vlm_model.vpm(pixel_tensor.to(vlm_model.dtype)).last_hidden_state.mean(dim=1)
-
-        # Regroup patches back into Frame Features
-        patch_counts = [len(img_patches) for img_patches in inputs['pixel_values']]
-        frame_embeddings = []
-        start_idx = 0
-        for count in patch_counts:
-            frame_emb = patch_features[start_idx : start_idx + count].mean(dim=0)
-            frame_embeddings.append(frame_emb)
-            start_idx += count
-        frame_embeddings = torch.stack(frame_embeddings)
-
         logits = outputs.logits[:, -1, :]
         yes_logits = logits[:, yes_token_id]
         no_logits = logits[:, no_token_id]
         
         # Apply a mild Temperature Scaling (T=1.2) to soften the distribution
-        T = 2.0
+        T = 1.0
         binary_logits = torch.stack([yes_logits, no_logits], dim=-1) / T
         binary_probs = F.softmax(binary_logits, dim=-1)
+        # confidences = binary_probs[:, 0].cpu()
         
+        contrast_score = binary_probs[:, 0] - binary_probs[:, 1]
         # The calibrated confidence is the probability of 'Yes' relative only to 'No'
-        confidences = binary_probs[:, 0].cpu()
+        confidences = F.relu(contrast_score)
 
-        T_dynamic = torch.full((len(frame_embeddings), 1), T, device=vlm_model.device)
-        hits = torch.where(confidences > 0.5)[0]
-        sim_matrix = torch.zeros(len(frame_embeddings), device=vlm_model.device)
-
-        if len(hits) > 0:
-            anchor_frame = frame_embeddings[hits].mean(0) # average of all hits
-
-            sim_matrix = F.cosine_similarity(
-                anchor_frame, 
-                frame_embeddings, 
-                dim=-1
-            )
-            sim_matrix[sim_matrix <= 0.9] = 0.0
-            T_dynamic = T - (0.5 * sim_matrix.unsqueeze(1))
-            # import pdb; pdb.set_trace()
-        # Re-calculate using the raw logits and the new dynamic temperature
-        # Note: We use original yes/no logits to avoid applying T=1.2 twice
-        raw_binary_logits = torch.stack([yes_logits, no_logits], dim=-1)
-        dynamic_probs = torch.nn.functional.softmax(raw_binary_logits / T_dynamic, dim=-1)
-        
-        # Final calibrated output
-        confidences = dynamic_probs[:, 0].cpu()
-
-    return confidences
+    return confidences.pow(2)
 
 async def analyze_with_qwen(transcript, prompt=None, analysis_mode="conservative"):
     """Send the transcript to QWEN3 for analysis."""
