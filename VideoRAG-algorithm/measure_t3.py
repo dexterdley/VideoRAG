@@ -35,9 +35,7 @@ def set_seed(seed=42):
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
-    # The following ensures deterministic CuDNN behavior (might slightly slow down execution)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
+    
 
 set_seed(42) # <-- Initialize seed here
 
