@@ -21,6 +21,7 @@ from transformers import AutoModel, AutoTokenizer, AutoModelForSpeechSeq2Seq, Au
 from torch.utils.data import Dataset, DataLoader
 from qwen_vl_utils import process_vision_info
 from scipy.ndimage import gaussian_filter1d
+import matplotlib.pyplot as plt
 
 from transcribe import (
     transcribe_video,
@@ -61,6 +62,96 @@ GUI Experiments Times
 Start 267.31
 No QWEN becomes 117.77
 '''
+
+def create_reliability_diagram(confs, GT, title="", num_bins=10):
+    """
+    Generates a literature-standard reliability diagram as a Matplotlib Figure.
+    Calculates exact bin accuracy, expected calibration error (ECE), and visualizes the gap.
+    """
+    confs = np.array(confs)
+    GT = np.array(GT)
+    
+    # Return empty figure if no data yet
+    if len(confs) == 0:
+        fig, ax = plt.subplots(figsize=(3, 3))
+        ax.set_title("Waiting for data...")
+        return fig
+
+    # Standard binning logic
+    bins = np.linspace(0, 1, num_bins + 1)
+    bin_indices = np.digitize(confs, bins) - 1
+    
+    bin_accs = np.zeros(num_bins)
+    bin_counts = np.zeros(num_bins)
+    
+    total_samples = len(confs)
+    ece = 0.0
+
+    for i in range(num_bins):
+        # Handle edge case for 1.0 falling into an out-of-bounds bin index
+        in_bin = (bin_indices == i)
+        if i == num_bins - 1:
+            in_bin = in_bin | (confs == 1.0)
+            
+        count = np.sum(in_bin)
+        bin_counts[i] = count
+        
+        if count > 0:
+            acc = np.mean(GT[in_bin])
+            conf = np.mean(confs[in_bin])
+            bin_accs[i] = acc
+            # ECE is weighted average of absolute difference between accuracy and confidence
+            ece += (count / total_samples) * abs(acc - conf)
+
+    # ── Plotting ──
+    fig, ax = plt.subplots(figsize=(3, 3))
+    
+    # Diagonal line for perfect calibration
+    ax.plot([0, 1], [0, 1], linestyle='--', color='gray', linewidth=2, zorder=1)
+
+    width = 1.0 / num_bins
+    bns = bins[:-1]
+    
+    for i in range(num_bins):
+        if bin_counts[i] > 0:
+            x_edge = bns[i]
+            acc = bin_accs[i]
+            expected_diagonal = x_edge + width/2
+            
+            bottom_gap = min(acc, expected_diagonal)
+            gap_height = abs(acc - expected_diagonal)
+            
+            # Plot Outputs (Accuracy) bar
+            ax.bar(x_edge, acc, align='edge', width=width, color='blue', edgecolor='black', 
+                   linewidth=1, zorder=2, label='Outputs' if i==0 else "")
+            
+            # Plot Gap bar (Red Hatch)
+            ax.bar(x_edge, gap_height, bottom=bottom_gap, align='edge', width=width, 
+                   color='#FF9999', edgecolor='red', hatch='//', linewidth=1, zorder=3, 
+                   label='Gap' if i==0 else "")
+
+    # Scaled down fonts
+    ax.set_xlabel("Confidence", fontsize=12, labelpad=6)
+    ax.set_ylabel("Accuracy", fontsize=12, labelpad=6)
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
+    
+    ax.set_xticks(np.arange(0, 1.2, 0.2))
+    ax.set_yticks(np.arange(0, 1.2, 0.2))
+    ax.tick_params(axis='both', which='major', labelsize=10)
+    ax.grid(True, linestyle=':', alpha=0.8, linewidth=1, zorder=0)
+    
+    # Scaled down legend and text box
+    legend = ax.legend(loc="upper left", fontsize=10, framealpha=1.0, edgecolor='gray')
+    legend.get_frame().set_linewidth(1)
+    
+    textstr = f'Error={ece*100:.1f}' 
+    props = dict(boxstyle='square,pad=0.3', facecolor='#B3B3FF', edgecolor='black', linewidth=1)
+    ax.text(0.95, 0.05, textstr, transform=ax.transAxes, fontsize=12, fontweight='bold',
+            verticalalignment='bottom', horizontalalignment='right', bbox=props, zorder=4)
+
+    fig.tight_layout()
+    return fig
 
 class QwenVLWrapper:
     def __init__(self, model, tokenizer):
@@ -180,17 +271,13 @@ def batched_yes_no_inference(images, prompt_text):
         yes_logits = logits[:, yes_token_id]
         no_logits = logits[:, no_token_id]
         
-        # Apply a mild Temperature Scaling (T=1.2) to soften the distribution
-        T = 1.0
-        binary_logits = torch.stack([yes_logits, no_logits], dim=-1) / T
+        binary_logits = torch.stack([yes_logits, no_logits], dim=-1)
         binary_probs = F.softmax(binary_logits, dim=-1)
-        # confidences = binary_probs[:, 0].cpu()
-        
-        contrast_score = binary_probs[:, 0] - binary_probs[:, 1]
-        # The calibrated confidence is the probability of 'Yes' relative only to 'No'
-        confidences = F.relu(contrast_score)
 
-    return confidences.pow(2)
+        contrast_score = binary_probs[:, 0] - binary_probs[:, 1]
+        confidences = F.relu(contrast_score) # The calibrated confidence is the probability of 'Yes' relative only to 'No'
+
+    return binary_probs[:, 0], confidences.pow(2)
 
 async def analyze_with_qwen(transcript, prompt=None, analysis_mode="conservative"):
     """Send the transcript to QWEN3 for analysis."""
@@ -291,16 +378,7 @@ class VideoSegmentDataset(Dataset):
         self.segment_length = segment_length
         self.width, self.height = width, height
 
-        try:
-            vr = VideoReader(self.video_path, ctx=cpu(0))
-        except Exception:
-            print("⚠️ Codec Error. Sanitizing video...")
-            sanitized_path = os.path.join(OUTPUT_FOLDER, f"safe_{int(time.time())}.mp4")
-            subprocess.run(["ffmpeg", "-y", "-i", self.video_path, "-c:v", "libx264", "-preset", "fast", "-crf", "23", "-c:a", "aac", sanitized_path],
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            self.video_path = sanitized_path
-            vr = VideoReader(self.video_path, ctx=cpu(0))
-
+        vr = VideoReader(self.video_path, ctx=cpu(0))
         self.fps = vr.get_avg_fps()
         self.step = max(1, int(self.fps * 1))
         self.duration = len(vr) / self.fps
@@ -440,9 +518,14 @@ async def run_pipeline(video_path, user_query, analysis_mode):
     gr.Info("Starting Process ⏳")
     t1 = time.time()
     plot_df = None
-    
+    fig_before = None
+    fig_after = None
+    if "QID80I1IRyI.mp4" in video_path:
+        gt_timestamps = [307, 549, 700, 872, 968, 1111, 1238, 1287]
+        gt_window = 2
+
     if not video_path:
-        yield "⚠️ Please upload a video.", "", "", None, None, None, plot_df, 0
+        yield "⚠️ Please upload a video.", "", "", None, None, None, plot_df, fig_before, fig_after, 0
         return
 
     run_id = int(time.time())
@@ -450,7 +533,7 @@ async def run_pipeline(video_path, user_query, analysis_mode):
 
     # ── STEP 1: WHISPER TRANSCRIPTION ──
     log = "🎙️ **Step 1/4: Running Whisper Transcription...**\n"
-    yield log, "", "", None, None, None, plot_df, 5
+    yield log, "", "", None, None, None, plot_df, fig_before, fig_after, 5
 
     base_name = os.path.splitext(os.path.basename(video_path))[0]
     json_path = os.path.join(OUTPUT_FOLDER, f"{base_name}_whisper.json")
@@ -471,24 +554,24 @@ async def run_pipeline(video_path, user_query, analysis_mode):
     n_segs = len(whisper_segs)
 
     log = f"✅ **Whisper:** {n_segs} segments transcribed/loaded.\n\n" + log
-    yield log, transcript, "", None, None, None, plot_df, 20
+    yield log, transcript, "", None, None, None, plot_df, fig_before, fig_after, 20
 
     # ── STEP 2: MINICPM VISUAL SCAN ──
     visual_hits = []
     
     log = f"👁️ **Step 2/4: VLM Visual Scan** — Query: '{user_query}'\n" + log
-    yield log, transcript, "", None, None, None, plot_df, 25
+    yield log, transcript, "", None, None, None, plot_df, fig_before, fig_after, 25
 
-    dataset = await asyncio.to_thread(VideoSegmentDataset, video_path, segment_length=48, width=1280, height=720)
-    loader = DataLoader(dataset, batch_size=1, shuffle=False, num_workers=4, collate_fn=lambda x: x[0])
+    dataset = await asyncio.to_thread(VideoSegmentDataset, video_path, segment_length=48)
+    loader = DataLoader(dataset, batch_size=1, shuffle=False, num_workers=4, prefetch_factor=2, collate_fn=lambda x: x[0])
     
-    history_time, history_conf = [], []
+    history_time, history_conf, history_cali_conf = [], [], []
     recent_clips = [None, None, None]
     total_steps = len(dataset)
     analysis_display = ""
 
     for i, (frames, start, end) in enumerate(loader):
-        confidences = await asyncio.to_thread(batched_yes_no_inference, frames, user_query)
+        confidences, cali_confidences = await asyncio.to_thread(batched_yes_no_inference, frames, user_query)
         num_frames = confidences.shape[0]
 
         time_step = (end - start) / num_frames if num_frames > 0 else 1
@@ -496,10 +579,23 @@ async def run_pipeline(video_path, user_query, analysis_mode):
             
         history_time.extend(batch_times)
         history_conf.extend(confidences.tolist())
+        history_cali_conf.extend(cali_confidences.tolist())
 
         raw_scores = np.array(history_conf)
-        calibrated_scores = calibrate_bitemporal(raw_scores, decay=0.9)
+        cali_scores = np.array(history_cali_conf)
+        calibrated_scores = calibrate_bitemporal(cali_scores, decay=0.9)
         
+        if "QID80I1IRyI.mp4" in video_path:
+            # 1. Create Ground Truth Array (1.0 for hits, 0.0 for misses)
+            y_true = np.array([
+                1.0 if any(abs(t - gt) <= gt_window for gt in gt_timestamps) else 0.0 
+                for t in history_time
+            ])
+
+            # 2. Generate Matplotlib Figures
+            fig_before = create_reliability_diagram(raw_scores, y_true, title="Before")
+            fig_after = create_reliability_diagram(calibrated_scores, y_true, title="After (Calibrated)")
+
         df_raw = pd.DataFrame({
             "Time (s)": history_time, 
             "Confidence": raw_scores.tolist(), 
@@ -516,7 +612,6 @@ async def run_pipeline(video_path, user_query, analysis_mode):
         # max_conf, best_idx = confidences.max(0)
         max_conf, best_idx = torch.tensor(calibrated_scores[-num_frames:]).max(0)
         best_time = start + (best_idx * time_step)
-        #import pdb; pdb.set_trace()
         
         if max_conf > 0.5:
             ts = f"{int(best_time // 60)}:{int(best_time % 60):02d}"
@@ -537,7 +632,6 @@ async def run_pipeline(video_path, user_query, analysis_mode):
             if success_path:
                 recent_clips.insert(0, success_path)
                 recent_clips = recent_clips[:3]
-                log = f"[{ts}] 🎯 VISUAL MATCH ({max_conf*100:.1f}%)\n" + log
 
             enriched_transcript = (
                 f"CONTEXT: Visual match detected for '{user_query}' with {max_conf*100:.1f}% confidence.\n"
@@ -551,12 +645,12 @@ async def run_pipeline(video_path, user_query, analysis_mode):
             response = "Pass"
             analysis_display = f"### Hit at {ts}\n{response}\n\n" + analysis_display
 
-        yield log, transcript, analysis_display, recent_clips[0], recent_clips[1], recent_clips[2], plot_df, pct
+        yield log, transcript, analysis_display, recent_clips[0], recent_clips[1], recent_clips[2], plot_df, fig_before, fig_after, pct
 
     gr.Info("Slicing process complete, you can view your highlights")
     t2 = time.time()
     print("Total time:", t2 - t1)
-    yield log, transcript, analysis_display, recent_clips[0], recent_clips[1], recent_clips[2], plot_df, 100
+    yield log, transcript, analysis_display, recent_clips[0], recent_clips[1], recent_clips[2], plot_df, fig_before, fig_after, 100
 
 # ═══════════════════════════════════════════════════════════════
 #                         GUI LAYOUT
@@ -575,8 +669,8 @@ with gr.Blocks(title="VSLICE") as demo:
                 input_video = gr.Video(label="Upload Video")
                 input_query = gr.Textbox(
                     label="Visual Search Query (optional)",
-                    value="Find scenes of Trump drinking water",
-                    placeholder="Find scenes of Trump drinking water",
+                    value="Analyze these frames for text banners like 'First Blood', 'Double Kill', 'Triple Kill', 'Quadra Kill', or 'Invincible'.", #"Find scenes of Trump drinking water",
+                    placeholder="Analyze these frames for text banners like 'First Blood', 'Double Kill', 'Triple Kill', 'Quadra Kill', or 'Invincible'.",
                     info="VLM scans video frames for this. Leave blank to skip visual scan."
                 )
                 analysis_mode = gr.Radio(
@@ -613,6 +707,12 @@ with gr.Blocks(title="VSLICE") as demo:
                 height=250,
                 color="Type"
             )
+
+            gr.Markdown("### 🎯 Reliability Diagrams (Calibration)")
+            with gr.Row():
+                # Replaced LinePlot with Plot to accept Matplotlib figures
+                rel_plot_before = gr.Plot(label="Before Calibration")
+                rel_plot_after = gr.Plot(label="After Calibration")
     
     analysis_box = gr.Textbox(label="🤖 LLM Analysis", lines=8, interactive=False)
     progress = gr.Slider(0, 100, label="Progress", interactive=False)
@@ -632,7 +732,7 @@ with gr.Blocks(title="VSLICE") as demo:
         fn=run_pipeline,
         inputs=[input_video, input_query, analysis_mode],
         outputs=[log_box, transcript_box, analysis_box,
-                 clip_1, clip_2, clip_3, confidence_plot, progress]
+                 clip_1, clip_2, clip_3, confidence_plot, rel_plot_before, rel_plot_after, progress]
     )
 
 theme = gr.themes.Glass(primary_hue="sky", radius_size="lg", font=[gr.themes.GoogleFont("Inconsolata"), "Arial", "sans-serif"]).set(
