@@ -24,7 +24,7 @@ from scipy.ndimage import gaussian_filter1d
 import matplotlib.pyplot as plt
 from matplotlib.figure import Figure
 
-from transcribe import (
+from utils.transcribe import (
     transcribe_video,
     format_transcript_for_llm,
     analyze_with_llm,

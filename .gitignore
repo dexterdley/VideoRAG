@@ -12,3 +12,6 @@ VideoRAG-algorithm/VSLICE_agent.ipynb
 *.json
 *.mp4
 VSLICE_agent.ipynb
+vslice_features/
+SumMe/
+TVSum/
