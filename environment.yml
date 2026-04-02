@@ -1,4 +1,4 @@
-name: VRAG
+name: VSLICE
 channels:
   - defaults
 dependencies:
@@ -156,4 +156,4 @@ dependencies:
       - xxhash==3.6.0
       - yacs==0.1.8
       - yarl==1.22.0
-prefix: /home/dexter/anaconda3/envs/VRAG
+prefix: /home/dexter/anaconda3/envs/VSLICE

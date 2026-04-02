@@ -22,6 +22,7 @@ from torch.utils.data import Dataset, DataLoader
 from qwen_vl_utils import process_vision_info
 from scipy.ndimage import gaussian_filter1d
 import matplotlib.pyplot as plt
+from matplotlib.figure import Figure
 
 from transcribe import (
     transcribe_video,
@@ -73,7 +74,8 @@ def create_reliability_diagram(confs, GT, title="", num_bins=10):
     
     # Return empty figure if no data yet
     if len(confs) == 0:
-        fig, ax = plt.subplots(figsize=(3, 3))
+        fig = Figure(figsize=(3, 3))
+        ax = fig.subplots()
         ax.set_title("Waiting for data...")
         return fig
 
@@ -104,7 +106,8 @@ def create_reliability_diagram(confs, GT, title="", num_bins=10):
             ece += (count / total_samples) * abs(acc - conf)
 
     # ── Plotting ──
-    fig, ax = plt.subplots(figsize=(3, 3))
+    fig = Figure(figsize=(3, 3))
+    ax = fig.subplots()
     
     # Diagonal line for perfect calibration
     ax.plot([0, 1], [0, 1], linestyle='--', color='gray', linewidth=2, zorder=1)
@@ -234,7 +237,7 @@ def batched_yes_no_inference(images, prompt_text):
     prompts_lists = []
     input_images_lists = []
 
-    system_prompt = "You are an expert video analyst. Answer strictly Yes or No."
+    system_prompt = "You are an expert video analyst. Strictly answer only Yes or No."
     formatted_prompt = f"Does this image contain or represent: '{prompt_text}'?"
 
     for img in images:
@@ -563,7 +566,8 @@ async def run_pipeline(video_path, user_query, analysis_mode):
     yield log, transcript, "", None, None, None, plot_df, fig_before, fig_after, 25
 
     dataset = await asyncio.to_thread(VideoSegmentDataset, video_path, segment_length=48)
-    loader = DataLoader(dataset, batch_size=1, shuffle=False, num_workers=4, prefetch_factor=2, collate_fn=lambda x: x[0])
+    # loader = DataLoader(dataset, batch_size=1, shuffle=False, num_workers=4, prefetch_factor=2, collate_fn=lambda x: x[0])
+    loader = DataLoader(dataset, batch_size=None, shuffle=False, num_workers=4, prefetch_factor=1)
     
     history_time, history_conf, history_cali_conf = [], [], []
     recent_clips = [None, None, None]
@@ -606,8 +610,13 @@ async def run_pipeline(video_path, user_query, analysis_mode):
             "Confidence": calibrated_scores.tolist(), 
             "Type": "After (Calibrated)"
         })
+        df_thresh = pd.DataFrame({
+            "Time (s)": history_time, 
+            "Confidence": [0.5] * len(history_time), 
+            "Type": "Threshold"
+        })
 
-        plot_df = pd.concat([df_raw, df_calib], ignore_index=True)
+        plot_df = pd.concat([df_raw, df_calib, df_thresh], ignore_index=True)
         pct = 25 + int((i / total_steps) * 40)  # 25-65%
         # max_conf, best_idx = confidences.max(0)
         max_conf, best_idx = torch.tensor(calibrated_scores[-num_frames:]).max(0)
@@ -692,9 +701,32 @@ with gr.Blocks(title="VSLICE") as demo:
             # ── CLIPS (Moved to the top) ──
             gr.Markdown("### 🎬 Highlight Clips")
             with gr.Row():
-                clip_1 = gr.Video(label="Highlight 1", autoplay=True, height=250)
-                clip_2 = gr.Video(label="Highlight 2", height=250)
-                clip_3 = gr.Video(label="Highlight 3", height=250)
+                #clip_1 = gr.Video(label="Highlight 1", autoplay=True, height=250)
+                #clip_2 = gr.Video(label="Highlight 2", height=250)
+                #clip_3 = gr.Video(label="Highlight 3", height=250)
+
+                with gr.Column(scale=3, min_width=400):
+                    clip_1 = gr.Video(
+                        label="2. 🔥 Newest Hit",
+                        autoplay=True,
+                        interactive=False,
+                        height=400  # Increased to match the stack on the right
+                    )
+
+                # scale=1 makes this a sidebar
+                with gr.Column(scale=1, min_width=150):                    
+                    clip_2 = gr.Video(
+                        label="3. Previous",
+                        autoplay=False,
+                        interactive=False,
+                        height=200
+                    )
+                    clip_3 = gr.Video(
+                        label="4. Oldest",
+                        autoplay=False,
+                        interactive=False,
+                        height=200
+                    )
 
             # ── PLOT (Moved to the bottom) ──
             gr.Markdown("### 📊 Real-Time Visual Scan")
@@ -705,7 +737,12 @@ with gr.Blocks(title="VSLICE") as demo:
                 y_lim=[0, 1.05],
                 tooltip=["Time (s)", "Confidence"],
                 height=250,
-                color="Type"
+                color="Type",
+                color_map={
+                    "Before": "blue", 
+                    "After (Calibrated)": "orange", 
+                    "Threshold": "red"
+                }
             )
 
             gr.Markdown("### 🎯 Reliability Diagrams (Calibration)")
@@ -714,8 +751,6 @@ with gr.Blocks(title="VSLICE") as demo:
                 rel_plot_before = gr.Plot(label="Before Calibration")
                 rel_plot_after = gr.Plot(label="After Calibration")
     
-    analysis_box = gr.Textbox(label="🤖 LLM Analysis", lines=8, interactive=False)
-    progress = gr.Slider(0, 100, label="Progress", interactive=False)
     with gr.Row():
         # Placed Transcript in an Accordion
         with gr.Accordion("📝 Transcript (Whisper)", open=False):
@@ -726,7 +761,10 @@ with gr.Blocks(title="VSLICE") as demo:
                 info="Editable — fix errors before re-running analysis"
             )
             log_box = gr.Textbox(show_label=False, lines=8, max_lines=15)
-        
+
+    progress = gr.Slider(0, 100, label="Progress", interactive=False)
+    analysis_box = gr.Textbox(label="🤖 LLM Analysis", lines=8, interactive=False)
+
     # ── WIRE ──
     btn_run.click(
         fn=run_pipeline,
@@ -739,6 +777,7 @@ theme = gr.themes.Glass(primary_hue="sky", radius_size="lg", font=[gr.themes.Goo
         body_background_fill_dark="#0f172a",
         block_background_fill_dark="#1e293b"
         )
+
 
 if __name__ == "__main__":
     demo.queue(default_concurrency_limit=1, max_size=10).launch(
