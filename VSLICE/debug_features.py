@@ -156,7 +156,7 @@ def minicpm_inference(images, title, model, processor, yes_id, no_id):
         yes_logits, no_logits = logits[:, yes_id], logits[:, no_id]
         binary_probs = F.softmax(torch.stack([yes_logits, no_logits], dim=-1), dim=-1)
         contrast = F.relu(binary_probs[:, 0] - binary_probs[:, 1])
-    return binary_probs[:, 0], contrast.pow(2)
+    return binary_probs[:, 0], binary_probs[:, 1], contrast.pow(2)
 
 def qwen_inference(images, title, wrapper, yes_id, no_id):
     if process_vision_info is None:
@@ -165,7 +165,8 @@ def qwen_inference(images, title, wrapper, yes_id, no_id):
     system_prompt = "You are an expert video analyst. Strictly answer only Yes or No."
     formatted_prompt = f"Does this image contain or represent: '{title}'?"
     
-    probs_all = []
+    probs_yes = []
+    probs_no = []
     confs_all = []
     
     for img in images:
@@ -184,10 +185,11 @@ def qwen_inference(images, title, wrapper, yes_id, no_id):
             yes_logits, no_logits = logits[:, yes_id], logits[:, no_id]
             binary_probs = F.softmax(torch.stack([yes_logits, no_logits], dim=-1), dim=-1)
             
-            probs_all.append(binary_probs[:, 0])
+            probs_yes.append(binary_probs[:, 0])
+            probs_no.append(binary_probs[:, 1])
             confs_all.append(F.relu(binary_probs[:, 0] - binary_probs[:, 1]).pow(2))
-            
-    return torch.cat(probs_all), torch.cat(confs_all)
+    
+    return torch.cat(probs_yes), torch.cat(probs_no), torch.cat(confs_all)
 
 # ──────────────────────── DATASET BUILDERS ────────────────────────
 
@@ -339,7 +341,6 @@ def build_tvsum_manifest(root_dir):
     return resolved
 
 # ──────────────────────── MAIN EXTRACTION ────────────────────────
-
 def extract_all(args):
     os.makedirs(args.output_dir, exist_ok=True)
     manifest = []
@@ -351,23 +352,124 @@ def extract_all(args):
     vlm_vars = load_vlm(args.model_path, args.model_type, device)
     model, processor, yes_id, no_id = vlm_vars[0], vlm_vars[2], vlm_vars[3], vlm_vars[4]
 
+    results = [] # FIXED: Initialize results list
+
     for idx, item in enumerate(tqdm(manifest, desc=f"{device}")):
+        t0 = time.time() # FIXED: Define t0 for the elapsed time calculation
         video_path, title = item["video_path"], item["title"]
+        
+        picks = item["picks"] 
+        gtscore = item["gtscore"]
+        n_frames = item["n_frames"]
+
+        out_name = f"{item['dataset']}_{item['video_name']}.npz"
+        out_path = os.path.join(args.output_dir, out_name)
+        
         print(video_path)
         print(f"\n  [{idx+1}/{len(manifest)}] {item['dataset']}/{item['video_name']} | \"{title}\"")
         
         dataset = VideoSegmentDataset(video_path, segment_length=32, width=896, height=672)
         loader = DataLoader(dataset, batch_size=None, shuffle=False, num_workers=4, prefetch_factor=1)
         
+        all_p_yes = []
+        all_p_no = []
+        all_contrast = []
+
         pbar = tqdm(loader, desc="Segments")
         for i, (frames, start, end) in enumerate(pbar):
             pbar.set_description(f"    Segment {i} ({start:.1f}s - {end:.1f}s)")
-            if args.model_type == "minicpm":
-                out, _ = minicpm_inference(frames, title, model, processor, yes_id, no_id)
-            else:
-                out, _ = qwen_inference(frames, title, model, yes_id, no_id)
             
-            print(f"\n    {out.float().cpu().numpy()} | Any > 0.5: {(out>0.5).any()}")
+            # FIXED: Ensure your inference functions return p_no, or calculate it.
+            if args.model_type == "minicpm":
+                p_yes, p_no, contrast_conf  = minicpm_inference(frames, title, model, processor, yes_id, no_id)
+            else:
+                p_yes, p_no, contrast_conf  = qwen_inference(frames, title, model, yes_id, no_id)
+            
+            all_p_yes.append(p_yes.detach().cpu().float().numpy())
+            all_p_no.append(p_no.detach().cpu().float().numpy())
+            all_contrast.append(contrast_conf.detach().cpu().float().numpy())
+
+        raw_p_yes = np.concatenate(all_p_yes)
+        raw_p_no = np.concatenate(all_p_no)
+        raw_contrast = np.concatenate(all_contrast)
+
+        # Align with gtscore: explicitly interpolate to match exactly `len(picks)` elements
+        orig_x = np.linspace(0, 1, len(raw_p_yes))
+        target_x = np.linspace(0, 1, len(picks))
+
+        # FIXED: Corrected indentation for the rest of the block
+        full_p_yes = interp1d(orig_x, raw_p_yes, kind='linear', fill_value="extrapolate")(target_x).astype(np.float32)
+        full_p_yes = np.clip(full_p_yes, 0, 1)
+
+        full_p_no = interp1d(orig_x, raw_p_no, kind='linear', fill_value="extrapolate")(target_x).astype(np.float32)
+        full_p_no = np.clip(full_p_no, 0, 1)
+
+        full_contrast = interp1d(orig_x, raw_contrast, kind='linear', fill_value="extrapolate")(target_x).astype(np.float32)
+        full_contrast = np.clip(full_contrast, 0, 1)
+
+        # Save
+        np.savez_compressed(
+            out_path,
+            p_yes=full_p_yes,
+            p_no=full_p_no,
+            contrast_conf=full_contrast,
+            gtscore=gtscore,
+            picks=picks,
+            n_frames=np.array(n_frames),
+            title=np.array([title]),
+            video_name=np.array([item["video_name"]]),
+            dataset=np.array([item["dataset"]]),
+        )
+
+        elapsed = time.time() - t0
+        print(f"    [OK] Saved {out_name} ({len(picks)} frames, {elapsed:.1f}s)")
+        
+        # Quick per-video correlation with GT
+        if gtscore.max() > gtscore.min():
+            rho, _ = spearmanr(full_p_yes, gtscore)
+            tau, _ = kendalltau(full_p_yes, gtscore)
+            print(f"    [CORR] P(Yes) vs GT: Spearman rho={rho:.4f}, Kendall tau={tau:.4f}")
+
+            rho_c, _ = spearmanr(full_contrast, gtscore)
+            tau_c, _ = kendalltau(full_contrast, gtscore)
+            print(f"    [CORR] Contrast vs GT: Spearman rho={rho_c:.4f}, Kendall tau={tau_c:.4f}")
+            
+            results.append({
+                "dataset": item["dataset"],
+                "video": item["video_name"],
+                "title": title,
+                "n_frames": len(picks),
+                "spearman_pyes": rho,
+                "kendall_pyes": tau,
+                "spearman_contrast": rho_c,
+                "kendall_contrast": tau_c,
+            })
+
+        #plt.plot(full_p_yes)
+        #plt.plot(gtscore)
+        #plt.legend(["Pred", "GT"])
+        #plt.show()
+
+    # ── Summary table ──
+    if results:
+        print("\n" + "=" * 90)
+        print("RESULTS SUMMARY")
+        print("=" * 90)
+        df = pd.DataFrame(results)
+        print(df.to_string(index=False))
+        print("-" * 90)
+
+        for ds in df["dataset"].unique():
+            sub = df[df["dataset"] == ds]
+            print(f"\n  [{ds.upper()}] Mean Spearman(P_yes)={sub['spearman_pyes'].mean():.4f}  "
+                  f"Mean Kendall(P_yes)={sub['kendall_pyes'].mean():.4f}  "
+                  f"Mean Spearman(contrast)={sub['spearman_contrast'].mean():.4f}  "
+                  f"Mean Kendall(contrast)={sub['kendall_contrast'].mean():.4f}")
+
+        # Save results CSV
+        csv_path = os.path.join(args.output_dir, f"{args.model_type}_extraction_results.csv")
+        df.to_csv(csv_path, index=False)
+        print(f"\n[RESULTS] Saved to {csv_path}")
 
 # ──────────────────────── CLI ────────────────────────
 
