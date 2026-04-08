@@ -7,6 +7,8 @@ This script:
 3. Groups frame-level scores into segment-level scores.
 4. Solves the 0/1 Knapsack problem for a 15% duration budget.
 5. Calculates the F-score against ground truth (user_summary/gtsummary).
+
+USAGE: python evaluate_summarization.py --feature_dir="./vslice_features/minicpm" --model_type="minicpm" --root_dir="/home/dexter/LLaVA-VLS/dataset/SumMe_TVSum"
 """
 
 import os
@@ -15,6 +17,7 @@ import numpy as np
 import argparse
 import pandas as pd
 from tqdm import tqdm
+from extract_features import build_summe_manifest, build_tvsum_manifest
 
 def knapsack_dp(values, weights, capacity):
     """
@@ -54,28 +57,32 @@ def knapsack_dp(values, weights, capacity):
             
     return picks
 
-def evaluate_video(feature_path, h5_path):
+def evaluate_video(feature_path, h5_path, h5_key=None):
     """
-    Calculates F-score for a single video.
+    Calculates F-score and correlations for a single video.
     """
     data = np.load(feature_path)
-    # Using 'contrast_conf' as the importance score
-    scores = data['contrast_conf']
+
+    # Using raw 'p_yes' as the importance score
+    scores = data['p_yes']
     video_name = str(data['video_name'][0])
     dataset_name = str(data['dataset'][0])
 
+    if np.isnan(data['p_yes']).any():
+        raise ValueError(f"NaN found in p_yes for video {video_name}")
+
     with h5py.File(h5_path, 'r') as f:
-        # Find the correct key in H5
-        # For SumMe, key is usually the video name
-        # For TVSum, key is 'video_1'...'video_50'
-        h5_key = None
-        for k in f.keys():
-            vname = f[k]['video_name'][...].item().decode('utf-8') if 'video_name' in f[k] else k
-            if vname == video_name or k == video_name:
-                h5_key = k
-                break
-        
+        # Find the correct key in H5 if not provided
         if h5_key is None:
+            # For SumMe, key is usually the video name
+            # For TVSum, key is 'video_1'...'video_50'
+            for k in f.keys():
+                vname = f[k]['video_name'][...].item().decode('utf-8') if 'video_name' in f[k] else k
+                if vname == video_name or k == video_name:
+                    h5_key = k
+                    break
+        
+        if h5_key is None or h5_key not in f:
             return None
 
         grp = f[h5_key]
@@ -90,6 +97,9 @@ def evaluate_video(feature_path, h5_path):
             user_summaries = grp['user_summary'][...] # [20, N]
         else:
             user_summaries = [grp['gtsummary'][...]] # [1, N]
+        
+        # Ground truth importance scores
+        gt_scores = grp['gtscore'][...]
             
     # 1. Map frame-level scores [len(picks)] to all frames [n_frames]
     # (Linear interpolation or nearest neighbor)
@@ -125,11 +135,18 @@ def evaluate_video(feature_path, h5_path):
         else:
             f1 = 0
         f_scores.append(f1)
+    
+    # 6. Evaluate Correlations
+    from scipy.stats import spearmanr, kendalltau
+    rho, _ = spearmanr(scores, gt_scores)
+    tau, _ = kendalltau(scores, gt_scores)
         
     return {
         "video": video_name,
         "dataset": dataset_name,
         "f_score": np.max(f_scores) if dataset_name == 'summe' else f_scores[0],
+        "spearman": rho,
+        "kendall": tau,
         "n_frames": n_frames,
         "n_segments": len(cps)
     }
@@ -138,14 +155,22 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--feature_dir", type=str, default="./vslice_features",
                         help="Dir where .npz files are saved")
+    parser.add_argument("--model_type", type=str, default="qwen",
+                        help="qwen or minicpm")
     parser.add_argument("--root_dir", type=str, default=".",
                         help="Root dir for SumMe/TVSum H5 files")
-    parser.add_argument("--split_file", type=str, default=None,
+    parser.add_argument("--split_file", type=str, default="./dataset/summe_splits.json",
                         help="Optional JSON split file (SumMe/TVSum standard splits)")
     args = parser.parse_args()
 
-    summe_h5 = os.path.join(args.root_dir, "SumMe", "eccv16_dataset_summe_google_pool5.h5")
-    tvsum_h5 = os.path.join(args.root_dir, "TVSum", "eccv16_dataset_tvsum_google_pool5.h5")
+    if "summe" in args.split_file:
+        manifest = build_summe_manifest(args.root_dir)
+        summe_h5 = os.path.join(args.root_dir, "SumMe", "eccv16_dataset_summe_google_pool5.h5")
+        print("SumMe Manifest Loaded")
+    else:
+        manifest = build_tvsum_manifest(args.root_dir)
+        tvsum_h5 = os.path.join(args.root_dir, "TVSum", "eccv16_dataset_tvsum_google_pool5.h5")
+        print("TVSUM Manifest Loaded")
 
     # 1. Load splits if provided
     splits = None
@@ -157,57 +182,67 @@ def main():
             print(f"Loaded {len(splits)} splits from {args.split_file}")
         except Exception as e:
             print(f"Failed to load splits: {e}")
+    
+    all_split_results = []
 
-    # Fallback to scanning everything if no splits
-    if splits is None:
-        files = [f for f in os.listdir(args.feature_dir) if f.endswith(".npz")]
-        # Create a single "virtual split" containing all videos
-        splits = [{"test_keys": [f.replace(".npz", "").split("_", 1)[-1] for f in files]}]
-        print(f"No split file provided. Evaluating all {len(files)} videos found in {args.feature_dir}")
-
-    all_fold_results = []
-
-    for fold_idx, split in enumerate(splits):
-        test_keys = split.get("test_keys", [])
-        if not test_keys:
-            continue
-            
-        fold_scores = []
+    for split_idx, split in enumerate(splits):
         
-        print(f"\n--- Fold {fold_idx} ({len(test_keys)} videos) ---")
-        for video_id in tqdm(test_keys, leave=False):
+        test_set = split['test_keys'] # e.g., ['video_16', 'video_21', 'video_25', 'video_4', 'video_9']    
+        split_f_scores = []
+        split_rho_scores = []
+        split_tau_scores = []
+        
+        print(f"\n--- Split number {split_idx} ({len(test_set)} videos) ---")
+        for video_id in tqdm(test_set):
             # Find the feature file. The file is usually named {dataset}_{video_id}.npz
             # But the video_id in splits might match the H5 key or the video_name.
             feature_file = None
-            for fname in os.listdir(args.feature_dir):
-                if fname.endswith(".npz") and video_id in fname:
-                    feature_file = fname
-                    break
-            
+            for item in manifest:
+                if item['h5_key'] == video_id:
+                    #print("Matched", video_id, item['video_name'])
+
+                    for fname in os.listdir(args.feature_dir + "/" + args.model_type):
+                        if fname.endswith(".npz") and item['video_name'] in fname:
+                            feature_file = fname
+                            #print("Found video", args.model_type, "for ", feature_file)
+                            break
+
             if not feature_file:
-                # print(f"  [SKIP] No feature found for {video_id}")
+                print(f"  [SKIP] No feature found for {video_id}")
                 continue
-                
-            fpath = os.path.join(args.feature_dir, feature_file)
-            dataset_name = "summe" if "summe" in feature_file.lower() else "tvsum"
+
+            fpath = os.path.join(args.feature_dir + "/" + args.model_type, feature_file)
+            dataset_name = "summe" if "summe" in args.split_file else "tvsum"
             h5_path = summe_h5 if dataset_name == "summe" else tvsum_h5
             
-            res = evaluate_video(fpath, h5_path)
+            res = evaluate_video(fpath, h5_path, h5_key=video_id)
             if res:
-                fold_scores.append(res["f_score"])
+                split_f_scores.append(res["f_score"])
+                split_rho_scores.append(res["spearman"])
+                split_tau_scores.append(res["kendall"])
         
-        if fold_scores:
-            mean_f = np.mean(fold_scores)
-            all_fold_results.append(mean_f)
-            print(f"Fold {fold_idx} Mean F-score: {mean_f:.4f}")
+        if split_f_scores:
+            mean_f = np.mean(split_f_scores)
+            mean_rho = np.nanmean(split_rho_scores)
+            mean_tau = np.nanmean(split_tau_scores)
+            all_split_results.append({
+                "f1": mean_f,
+                "spearman": mean_rho,
+                "kendall": mean_tau
+            })
+            print(f"Split {split_idx} | Mean F-score: {mean_f:.4f} | Rho: {mean_rho:.4f} | Tau: {mean_tau:.4f}")
 
-    if all_fold_results:
-        final_avg = np.mean(all_fold_results)
-        print("\n" + "="*50)
-        print(f"FINAL BENCHMARK SUMMARY ({'SPLIT-BASED' if args.split_file else 'ALL VIDEOS'})")
-        print("="*50)
-        print(f"Average F-score across {len(all_fold_results)} folds: {final_avg:.4f}")
-        print("="*50)
+    if all_split_results:
+        final_f1 = np.mean([r['f1'] for r in all_split_results])
+        final_rho = np.nanmean([r['spearman'] for r in all_split_results])
+        final_tau = np.nanmean([r['kendall'] for r in all_split_results])
+        print("\n" + "="*70)
+        print(f"FINAL BENCHMARK SUMMARY (SPLIT-BASED: {args.split_file})")
+        print("="*70)
+        print(f"Average F-score across {len(all_split_results)} splits: {final_f1:.4f}")
+        print(f"Average Spearman Rho across splits: {final_rho:.4f}")
+        print(f"Average Kendall Tau across splits: {final_tau:.4f}")
+        print("="*70)
     else:
         print("No videos were evaluated. Check your feature_dir and split_file.")
 
