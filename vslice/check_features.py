@@ -224,23 +224,24 @@ def main():
                 # Light filled shade for Ground Truth
                 plt.fill_between(range(len(gt_score)), 0, gt_score, label="Ground Truth", color='green', alpha=0.2)
                 # Optional: Keep a thin, faint line on the top edge of the shaded area
-                plt.plot(gt_score, color='green', alpha=0.4, linewidth=1) 
+                plt.plot(gt_score, color='green', alpha=0.5, linewidth=1) 
+                plt.plot(p_yes, label='Raw Probabilities', color='red', alpha=0.8)
+                plt.plot(p_contrast, label='Calibrated Probabilities (Ours)', color='blue', alpha=0.8)
 
-                plt.plot(p_yes, label='Raw Probabilities', color='blue', alpha=0.7)
-                plt.plot(p_contrast, label='Calibrated Probabilities (Ours)', color='red', alpha=0.7)
-
-                plt.title(f"Video: {v_id} - {video_name}")
-                plt.xlabel("Frames (secs)")
+                #plt.title(f"Video: {v_id} - {video_name}")
+                print(f"Video: {v_id} - {video_name}")
+                plt.xlabel("Time step ($t$)")
                 plt.ylabel("Importance Score (Normalized)")
                 plt.legend(loc="upper left")
                 plt.grid(True, linestyle='--', alpha=0.5) # Adjusted grid to be slightly softer
                 plt.tight_layout()
+                save_path = f"./results/{v_id}_temporal_plot.png"
+                plt.savefig(save_path, format='png', dpi=300, bbox_inches='tight')
                 plt.show()
-
                 # 2. Reliability Diagram Plotting (Figure 2)
                 # Binarize GT for calibration metric purposes (standard approach for continuous summary scores)
-                binary_targets = (gt_score >= 0.5).astype(float)
-                plot_comparative_reliability(p_yes, p_contrast, binary_targets, video_name)
+                # binary_targets = (gt_score >= 0.5).astype(float)
+                # plot_comparative_reliability(p_yes, p_contrast, binary_targets, video_name)
 
                 # If we were looking for a specific ID or the best one, exit after plotting
                 if args.video_id or target_video_name:

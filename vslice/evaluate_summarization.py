@@ -8,7 +8,9 @@ This script:
 4. Solves the 0/1 Knapsack problem for a 15% duration budget.
 5. Calculates the F-score against ground truth (user_summary/gtsummary).
 
-USAGE: python evaluate_summarization.py --feature_dir="./vslice_features/minicpm" --model_type="minicpm" --root_dir="/home/dexter/LLaVA-VLS/dataset/SumMe_TVSum"
+USAGE: python evaluate_summarization.py --feature_dir="./vslice_features" --model_type="minicpm" --root_dir="/home/dexter/LLaVA-VLS/dataset/"
+python ./vslice/evaluate_summarization.py --feature_dir="./vslice_features" --model_type="qwen"
+python ./vslice/evaluate_summarization.py --feature_dir="./vslice_features" --model_type="minicpm"
 """
 
 import os
@@ -230,7 +232,7 @@ def main():
                 "spearman": mean_rho,
                 "kendall": mean_tau
             })
-            print(f"Split {split_idx} | Mean F-score: {mean_f:.4f} | Rho: {mean_rho:.4f} | Tau: {mean_tau:.4f}")
+            print(f"Split {split_idx} | Mean F-score: {mean_f:.4f} | Tau: {mean_tau:.4f} | Rho: {mean_rho:.4f}")
 
     if all_split_results:
         final_f1 = np.mean([r['f1'] for r in all_split_results])
@@ -240,8 +242,8 @@ def main():
         print(f"FINAL BENCHMARK SUMMARY (SPLIT-BASED: {args.split_file})")
         print("="*70)
         print(f"Average F-score across {len(all_split_results)} splits: {final_f1:.4f}")
-        print(f"Average Spearman Rho across splits: {final_rho:.4f}")
         print(f"Average Kendall Tau across splits: {final_tau:.4f}")
+        print(f"Average Spearman Rho across splits: {final_rho:.4f}")
         print("="*70)
     else:
         print("No videos were evaluated. Check your feature_dir and split_file.")
