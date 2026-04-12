@@ -14,13 +14,12 @@ from scipy.interpolate import interp1d
 from extract_features import build_summe_manifest, build_tvsum_manifest
 
 import matplotlib.pyplot as plt
-# Some keys used for the following dictionaries
+
 COUNT = 'count'
 CONF = 'conf'
 ACC = 'acc'
 BIN_ACC = 'bin_acc'
 BIN_CONF = 'bin_conf'
-
 
 def _bin_initializer(bin_dict, num_bins=10):
     for i in range(num_bins):
@@ -30,53 +29,57 @@ def _bin_initializer(bin_dict, num_bins=10):
         bin_dict[i][BIN_ACC] = 0
         bin_dict[i][BIN_CONF] = 0
 
-def soft_populate_bins(confs, preds, GT, num_bins=10):
-    labels_confs, labels = GT.max(1)
+def soft_populate_bins(confs, gt_scores, num_bins=10):
+    """
+    For regression-style GT scores (0-1), treat them as probabilistic labels.
+    confs: model's confidence (probability of positive class)
+    gt_scores: ground truth scores (0-1, treated as probability of being positive)
+    """
     bin_dict = {}
     for i in range(num_bins):
         bin_dict[i] = {}
     _bin_initializer(bin_dict, num_bins)
     num_test_samples = len(confs)
 
-    for i in range(0, num_test_samples):
+    for i in range(num_test_samples):
         confidence = confs[i]
-        prediction = preds[i]
-        label = labels[i]
-        label_conf = labels_confs[i]
+        gt_score = gt_scores[i]  # GT probability of being positive
+        
         binn = int(math.ceil(((num_bins * confidence) - 1)))
         binn = max(0, min(binn, num_bins - 1))
+        
         bin_dict[binn][COUNT] += 1
         bin_dict[binn][CONF] += confidence
-        bin_dict[binn][ACC] += (label_conf if (label == prediction) else 1 - label_conf)
+        # Accuracy = how well confidence matches GT probability
+        # Lower difference = more accurate
+        bin_dict[binn][ACC] +=  gt_score
 
     for binn in range(0, num_bins):
-        if (bin_dict[binn][COUNT] == 0):
+        if bin_dict[binn][COUNT] == 0:
             bin_dict[binn][BIN_ACC] = 0
             bin_dict[binn][BIN_CONF] = 0
         else:
-            bin_dict[binn][BIN_ACC] = float(
-                bin_dict[binn][ACC]) / bin_dict[binn][COUNT]
-            bin_dict[binn][BIN_CONF] = bin_dict[binn][CONF] / \
-                float(bin_dict[binn][COUNT])
+            bin_dict[binn][BIN_ACC] = bin_dict[binn][ACC] / bin_dict[binn][COUNT]
+            bin_dict[binn][BIN_CONF] = bin_dict[binn][CONF] / bin_dict[binn][COUNT]
+    
     return bin_dict
 
-def soft_expected_calibration_error(confs, preds, GT, num_bins=15):
-    bin_dict = soft_populate_bins(confs, preds, GT, num_bins)
+def soft_expected_calibration_error(confs, gt_scores, num_bins=15):
+    bin_dict = soft_populate_bins(confs, gt_scores, num_bins)
     num_samples = len(confs)
     sece = 0
     for i in range(num_bins):
-        bin_accuracy = bin_dict[i][BIN_ACC]
-        bin_confidence = bin_dict[i][BIN_CONF]
+        avg_gt = bin_dict[i][BIN_ACC]      # What actually happened
+        avg_conf = bin_dict[i][BIN_CONF]   # What model predicted
         bin_count = bin_dict[i][COUNT]
-        sece += (float(bin_count) / num_samples) * \
-            abs(bin_accuracy - bin_confidence)
+        sece += (float(bin_count) / num_samples) * abs(avg_gt - avg_conf)
     return sece
 
-def reliability_plot(ax, confs, preds, labels, title, ece, num_bins=15):
-    '''
-    Method to draw a reliability plot from a model's predictions and confidences.
-    '''
-    bin_dict = soft_populate_bins(confs, preds, labels, num_bins)
+def reliability_plot(ax, confs, gt_scores, title, sece, num_bins=15):
+    """
+    Draw a reliability plot for regression-style GT scores.
+    """
+    bin_dict = soft_populate_bins(confs, gt_scores, num_bins)
     bns = [(i / float(num_bins)) for i in range(num_bins)]
     y = []
     for i in range(num_bins):
@@ -86,7 +89,7 @@ def reliability_plot(ax, confs, preds, labels, title, ece, num_bins=15):
     
     ax.bar(bns, bns, align='edge', width=width, color='pink', label='Gap', alpha=0.7, edgecolor='red')
     ax.bar(bns, y, align='edge', width=width, color='blue', edgecolor='black', alpha=0.5, label='Predicted')
-            
+    
     ax.plot([0, 1], [0, 1], linestyle='--', color='gray', linewidth=2, zorder=1, label='Ideal')
     
     ax.set_ylabel('Accuracy', fontsize=12)
@@ -95,19 +98,18 @@ def reliability_plot(ax, confs, preds, labels, title, ece, num_bins=15):
     ax.set_xlim(0, 1)
     ax.set_ylim(0, 1)
     
-    textstr = f'ECE = {ece*100:.2f}%'
+    textstr = f'SECE = {sece*100:.2f}%'
     props = dict(boxstyle='square,pad=0.4', facecolor='#f0f0f0', edgecolor='black', linewidth=1)
     ax.text(0.95, 0.05, textstr, transform=ax.transAxes, fontsize=11, fontweight='bold',
             verticalalignment='bottom', horizontalalignment='right', bbox=props, zorder=4)
     ax.legend()
     return y
 
-def bin_strength_plot(ax, confs, preds, labels, title, num_bins=15):
-    '''
-    Method to draw a plot for the percentage of samples in each confidence bin.
-    '''
-    # Use soft_populate_bins to ensure the math matches the reliability plots exactly
-    bin_dict = soft_populate_bins(confs, preds, labels, num_bins)
+def bin_strength_plot(ax, confs, gt_scores, title, num_bins=15):
+    """
+    Draw a plot for the percentage of samples in each confidence bin.
+    """
+    bin_dict = soft_populate_bins(confs, gt_scores, num_bins)
     
     bns = [(i / float(num_bins)) for i in range(num_bins)]
     num_samples = len(confs)
@@ -125,7 +127,6 @@ def bin_strength_plot(ax, confs, preds, labels, title, num_bins=15):
     ax.set_title(title, fontsize=12)
     ax.set_xlim(0, 1)
     
-    # Scale Y-axis dynamically to leave a little headroom, max 1.0
     max_y = max(y) if y else 1.0
     ax.set_ylim(0, min(1.0, max_y * 1.2)) 
     
@@ -139,32 +140,21 @@ def diagnostic_plots(global_p_yes, global_p_contrast, global_gt):
     axes[0,0].hist(global_p_yes.numpy(), bins=50, alpha=0.5, label='P(Yes)', density=True)
     axes[0,0].hist(global_p_contrast.numpy(), bins=50, alpha=0.5, label='Contrast', density=True)
     axes[0,0].hist(global_gt.numpy(), bins=50, alpha=0.5, label='GT', density=True)
-    axes[0,0].set_title('Distribution Comparison', fontsize=12, fontweight='bold')
-    axes[0,0].set_xlabel('Value', fontsize=10)
-    axes[0,0].set_ylabel('Density', fontsize=10)
+    axes[0,0].set_title('Distribution Comparison')
     axes[0,0].legend()
-    axes[0,0].grid(True, alpha=0.3)
     
     # 2. Scatter plots
     axes[0,1].scatter(global_p_yes.numpy(), global_gt.numpy(), alpha=0.1, s=1)
-    axes[0,1].plot([0,1], [0,1], 'r--', label='Perfect', linewidth=2)
-    axes[0,1].set_xlabel('P(Yes) Prediction', fontsize=10)
-    axes[0,1].set_ylabel('Ground Truth', fontsize=10)
-    axes[0,1].set_title('P(Yes) vs GT', fontsize=12, fontweight='bold')
-    axes[0,1].legend()
-    axes[0,1].grid(True, alpha=0.3)
-    axes[0,1].set_xlim(0, 1)
-    axes[0,1].set_ylim(0, 1)
+    axes[0,1].plot([0,1], [0,1], 'r--', label='Perfect')
+    axes[0,1].set_xlabel('P(Yes)')
+    axes[0,1].set_ylabel('GT')
+    axes[0,1].set_title('P(Yes) vs GT')
     
     axes[0,2].scatter(global_p_contrast.numpy(), global_gt.numpy(), alpha=0.1, s=1)
-    axes[0,2].plot([0,1], [0,1], 'r--', label='Perfect', linewidth=2)
-    axes[0,2].set_xlabel('Contrast Prediction', fontsize=10)
-    axes[0,2].set_ylabel('Ground Truth', fontsize=10)
-    axes[0,2].set_title('Contrast vs GT', fontsize=12, fontweight='bold')
-    axes[0,2].legend()
-    axes[0,2].grid(True, alpha=0.3)
-    axes[0,2].set_xlim(0, 1)
-    axes[0,2].set_ylim(0, 1)
+    axes[0,2].plot([0,1], [0,1], 'r--', label='Perfect')
+    axes[0,2].set_xlabel('Contrast')
+    axes[0,2].set_ylabel('GT')
+    axes[0,2].set_title('Contrast vs GT')
     
     # 3. Error analysis
     error_yes = torch.abs(global_p_yes - global_gt)
@@ -172,11 +162,8 @@ def diagnostic_plots(global_p_yes, global_p_contrast, global_gt):
     
     axes[1,0].hist(error_yes.numpy(), bins=50, alpha=0.5, label='P(Yes)', density=True)
     axes[1,0].hist(error_contrast.numpy(), bins=50, alpha=0.5, label='Contrast', density=True)
-    axes[1,0].set_title('Absolute Error Distribution', fontsize=12, fontweight='bold')
-    axes[1,0].set_xlabel('Absolute Error', fontsize=10)
-    axes[1,0].set_ylabel('Density', fontsize=10)
+    axes[1,0].set_title('Absolute Error Distribution')
     axes[1,0].legend()
-    axes[1,0].grid(True, alpha=0.3)
     
     # 4. Bias analysis (prediction - GT)
     bias_yes = global_p_yes - global_gt
@@ -184,117 +171,48 @@ def diagnostic_plots(global_p_yes, global_p_contrast, global_gt):
     
     axes[1,1].hist(bias_yes.numpy(), bins=50, alpha=0.5, label='P(Yes)', density=True)
     axes[1,1].hist(bias_contrast.numpy(), bins=50, alpha=0.5, label='Contrast', density=True)
-    axes[1,1].axvline(x=0, color='r', linestyle='--', linewidth=2, label='Zero Bias')
-    axes[1,1].set_title('Bias Distribution (Pred - GT)', fontsize=12, fontweight='bold')
-    axes[1,1].set_xlabel('Bias (Prediction - Ground Truth)', fontsize=10)
-    axes[1,1].set_ylabel('Density', fontsize=10)
+    axes[1,1].axvline(x=0, color='r', linestyle='--')
+    axes[1,1].set_title('Bias Distribution (Pred - GT)')
     axes[1,1].legend()
-    axes[1,1].grid(True, alpha=0.3)
-    
-    # Add text annotations for bias statistics
-    bias_yes_mean = bias_yes.mean().item()
-    bias_contrast_mean = bias_contrast.mean().item()
-    axes[1,1].axvline(x=bias_yes_mean, color='b', linestyle=':', linewidth=2, alpha=0.7)
-    axes[1,1].axvline(x=bias_contrast_mean, color='g', linestyle=':', linewidth=2, alpha=0.7)
     
     # 5. Confidence vs error relationship
     bins = np.linspace(0, 1, 20)
     mean_error_yes = []
     mean_error_contrast = []
-    std_error_yes = []
-    std_error_contrast = []
-    
     for i in range(len(bins)-1):
         mask_yes = (global_p_yes >= bins[i]) & (global_p_yes < bins[i+1])
         mask_contrast = (global_p_contrast >= bins[i]) & (global_p_contrast < bins[i+1])
-        
         if mask_yes.any():
-            mean_error_yes.append(error_yes[mask_yes].mean().item())
-            std_error_yes.append(error_yes[mask_yes].std().item())
+            mean_error_yes.append(error_yes[mask_yes].mean())
         else:
             mean_error_yes.append(0)
-            std_error_yes.append(0)
-            
         if mask_contrast.any():
-            mean_error_contrast.append(error_contrast[mask_contrast].mean().item())
-            std_error_contrast.append(error_contrast[mask_contrast].std().item())
+            mean_error_contrast.append(error_contrast[mask_contrast].mean())
         else:
             mean_error_contrast.append(0)
-            std_error_contrast.append(0)
     
     bin_centers = (bins[:-1] + bins[1:]) / 2
-    
-    # Plot with error bands (mean ± std)
-    axes[1,2].plot(bin_centers, mean_error_yes, 'b-', label='P(Yes)', linewidth=2)
-    axes[1,2].fill_between(bin_centers, 
-                           np.array(mean_error_yes) - np.array(std_error_yes),
-                           np.array(mean_error_yes) + np.array(std_error_yes),
-                           alpha=0.2, color='b')
-    
-    axes[1,2].plot(bin_centers, mean_error_contrast, 'g-', label='Contrast', linewidth=2)
-    axes[1,2].fill_between(bin_centers,
-                           np.array(mean_error_contrast) - np.array(std_error_contrast),
-                           np.array(mean_error_contrast) + np.array(std_error_contrast),
-                           alpha=0.2, color='g')
-    
-    axes[1,2].set_xlabel('Confidence / Prediction Value', fontsize=10)
-    axes[1,2].set_ylabel('Mean Absolute Error (±1 std)', fontsize=10)
-    axes[1,2].set_title('Error vs Confidence', fontsize=12, fontweight='bold')
+    axes[1,2].plot(bin_centers, mean_error_yes, 'b-', label='P(Yes)')
+    axes[1,2].plot(bin_centers, mean_error_contrast, 'g-', label='Contrast')
+    axes[1,2].set_xlabel('Confidence')
+    axes[1,2].set_ylabel('Mean Absolute Error')
+    axes[1,2].set_title('Error vs Confidence')
     axes[1,2].legend()
-    axes[1,2].grid(True, alpha=0.3)
-    axes[1,2].set_xlim(0, 1)
-    axes[1,2].set_ylim(0, 1)
     
-    plt.suptitle('Model Diagnostics: P(Yes) vs Contrast Predictions', 
-                 fontsize=14, fontweight='bold', y=1.02)
     plt.tight_layout()
-    plt.savefig('diagnostic_plots.png', dpi=150, bbox_inches='tight')
+    plt.savefig('diagnostic_plots.png', dpi=150)
+    plt.show()
     
     # Print statistics
-    print(f"\n{'='*60}")
-    print(f"DETAILED STATISTICS")
-    print(f"{'='*60}")
-    print(f"\nP(Yes) Model:")
-    print(f"  Mean: {global_p_yes.mean():.4f}")
-    print(f"  Std:  {global_p_yes.std():.4f}")
-    print(f"  Min:  {global_p_yes.min():.4f}")
-    print(f"  Max:  {global_p_yes.max():.4f}")
-    print(f"\nContrast Model:")
-    print(f"  Mean: {global_p_contrast.mean():.4f}")
-    print(f"  Std:  {global_p_contrast.std():.4f}")
-    print(f"  Min:  {global_p_contrast.min():.4f}")
-    print(f"  Max:  {global_p_contrast.max():.4f}")
-    print(f"\nGround Truth:")
-    print(f"  Mean: {global_gt.mean():.4f}")
-    print(f"  Std:  {global_gt.std():.4f}")
-    print(f"  Min:  {global_gt.min():.4f}")
-    print(f"  Max:  {global_gt.max():.4f}")
-    
-    print(f"\n{'='*60}")
-    print(f"ERROR METRICS")
-    print(f"{'='*60}")
+    print(f"\n--- Detailed Statistics ---")
+    print(f"P(Yes) - Mean: {global_p_yes.mean():.4f}, Std: {global_p_yes.std():.4f}")
+    print(f"Contrast - Mean: {global_p_contrast.mean():.4f}, Std: {global_p_contrast.std():.4f}")
+    print(f"GT - Mean: {global_gt.mean():.4f}, Std: {global_gt.std():.4f}")
     print(f"\nP(Yes) - Mean Absolute Error: {error_yes.mean():.4f}")
     print(f"Contrast - Mean Absolute Error: {error_contrast.mean():.4f}")
-    print(f"\nP(Yes) - Mean Bias: {bias_yes.mean():+.4f} {'(Overestimation)' if bias_yes.mean() > 0 else '(Underestimation)'}")
-    print(f"Contrast - Mean Bias: {bias_contrast.mean():+.4f} {'(Overestimation)' if bias_contrast.mean() > 0 else '(Underestimation)'}")
-    print(f"\nP(Yes) - Bias Std: {bias_yes.std():.4f}")
-    print(f"Contrast - Bias Std: {bias_contrast.std():.4f}")
-    
-    # Additional metrics
-    mse_yes = (error_yes ** 2).mean()
-    mse_contrast = (error_contrast ** 2).mean()
-    print(f"\nP(Yes) - Mean Squared Error: {mse_yes:.4f}")
-    print(f"Contrast - Mean Squared Error: {mse_contrast:.4f}")
-    
-    # Correlation
-    corr_yes = np.corrcoef(global_p_yes.numpy(), global_gt.numpy())[0,1]
-    corr_contrast = np.corrcoef(global_p_contrast.numpy(), global_gt.numpy())[0,1]
-    print(f"\nP(Yes) - Correlation with GT: {corr_yes:.4f}")
-    print(f"Contrast - Correlation with GT: {corr_contrast:.4f}")
-    
-    return fig
+    print(f"P(Yes) - Mean Bias: {bias_yes.mean():.4f} (over/under)")
+    print(f"Contrast - Mean Bias: {bias_contrast.mean():.4f} (over/under)")
 
-# ──────────────────────── MAIN ────────────────────────
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--feature_dir", type=str, default="./vslice_features")
@@ -355,7 +273,7 @@ def main():
                 p_contrast_raw = feature["contrast_conf"].astype(np.float64)
                 gt_score = h5_data[v_id]['gtscore'][()].astype(np.float64)
 
-                # ── Align lengths ──
+                # Align lengths
                 if len(p_yes_raw) != len(gt_score):
                     orig_x = np.linspace(0, 1, len(p_yes_raw))
                     target_x = np.linspace(0, 1, len(gt_score))
@@ -366,59 +284,59 @@ def main():
                 global_p_contrast.extend(p_contrast_raw)
                 global_gt.extend(gt_score)
 
-        #break  # Use first split only
+        # break  # Use first split only for testing
     
+    # Convert to tensors
     global_p_yes = torch.tensor(global_p_yes, dtype=torch.float32)
     global_p_contrast = torch.tensor(global_p_contrast, dtype=torch.float32)
     global_gt = torch.tensor(global_gt, dtype=torch.float32)
-
-    global_p_yes_2d = torch.stack([1.0 - global_p_yes, global_p_yes], dim=1)
-    global_p_contrast_2d = torch.stack([1.0 - global_p_contrast, global_p_contrast], dim=1)
-    global_gt_2d = torch.stack([1.0 - global_gt, global_gt], dim=1)
 
     print(f"\nTotal frames aggregated: {len(global_gt)}")
     print(f"GT range: [{global_gt.min():.4f}, {global_gt.max():.4f}], mean={global_gt.mean():.4f}")
     print(f"p_yes range: [{global_p_yes.min():.4f}, {global_p_yes.max():.4f}]")
     print(f"p_contrast range: [{global_p_contrast.min():.4f}, {global_p_contrast.max():.4f}]")
+    
+    # Debug: Check correlation
+    correlation = torch.corrcoef(torch.stack([global_p_yes, global_gt]))[0, 1]
+    print(f"Correlation between p_yes and GT: {correlation:.4f}")
+    
+    correlation_contrast = torch.corrcoef(torch.stack([global_p_contrast, global_gt]))[0, 1]
+    print(f"Correlation between contrast and GT: {correlation_contrast:.4f}")
 
-    # Only track probability of Class 1
-    p_yes_confs = global_p_yes
-    p_yes_preds = torch.ones_like(global_p_yes)
+    # Calculate Soft Expected Calibration Error (SECE)
+    sece_yes = soft_expected_calibration_error(global_p_yes, global_gt, num_bins=15)
+    sece_contrast = soft_expected_calibration_error(global_p_contrast, global_gt, num_bins=15)
 
-    p_contrast_confs = global_p_contrast
-    p_contrast_preds = torch.ones_like(global_p_contrast)
+    print(f"\nSECE (p_yes): {sece_yes:.4f} ({sece_yes*100:.2f}%)")
+    print(f"SECE (contrast): {sece_contrast:.4f} ({sece_contrast*100:.2f}%)")
 
-    # 5. Calculate Soft Expected Calibration Error (SECE)
-    sece_yes = soft_expected_calibration_error(p_yes_confs, p_yes_preds, global_gt_2d, num_bins=15)
-    sece_contrast = soft_expected_calibration_error(p_contrast_confs, p_contrast_preds, global_gt_2d, num_bins=15)
-
-    print(f"SECE (p_yes): {sece_yes:.4f}")
-    print(f"SECE (p_contrast): {sece_contrast:.4f}")
-
-    # Create a 2x2 grid (Row 1: P_Yes, Row 2: Contrast)
+    # Create a 2x2 grid
     fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(12, 10))
 
-    # --- ROW 1: P(Yes) ---
-    reliability_plot(ax1, p_yes_confs, p_yes_preds, global_gt_2d, 
-                     title=f"Reliability P(Yes) - {dataset_str.upper()}", ece=sece_yes, num_bins=15)
-    bin_strength_plot(ax2, p_yes_confs, p_yes_preds, global_gt_2d, 
+    # Row 1: P(Yes)
+    reliability_plot(ax1, global_p_yes, global_gt, 
+                     title=f"Reliability P(Yes) - {dataset_str.upper()}", 
+                     sece=sece_yes, num_bins=15)
+    bin_strength_plot(ax2, global_p_yes, global_gt, 
                       title=f"Sample Distribution P(Yes)", num_bins=15)
 
-    # --- ROW 2: Contrast ---
-    reliability_plot(ax3, p_contrast_confs, p_contrast_preds, global_gt_2d, 
-                     title=f"Reliability Contrast - {dataset_str.upper()}", ece=sece_contrast, num_bins=15)
-    bin_strength_plot(ax4, p_contrast_confs, p_contrast_preds, global_gt_2d, 
+    # Row 2: Contrast
+    reliability_plot(ax3, global_p_contrast, global_gt, 
+                     title=f"Reliability Contrast - {dataset_str.upper()}", 
+                     sece=sece_contrast, num_bins=15)
+    bin_strength_plot(ax4, global_p_contrast, global_gt, 
                       title=f"Sample Distribution Contrast", num_bins=15)
     
     diagnostic_plots(global_p_yes, global_p_contrast, global_gt)
 
-    # Save the figure side-by-side
+    # Save the figure
     save_path = os.path.join(args.output_dir, f"{dataset_str}_reliability.png")
     os.makedirs(args.output_dir, exist_ok=True)
     plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    print(f"\nFigure saved to: {save_path}")
     plt.tight_layout()
     plt.show()
-    #import pdb; pdb.set_trace()
     
+
 if __name__ == "__main__":
     main()
