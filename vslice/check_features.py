@@ -16,113 +16,277 @@ from scipy.interpolate import interp1d
 from scipy.stats import spearmanr, kendalltau
 from torch.utils.data import Dataset, DataLoader
 from extract_features import build_summe_manifest, build_tvsum_manifest
-
+from scipy.signal import find_peaks, peak_widths
 import matplotlib.pyplot as plt
 
-def plot_reliability_diagram_on_ax(ax, confs, GT, title="Reliability Diagram", num_bins=10):
-    """
-    Core function to draw the histogram and gap on a specific Matplotlib axis (ax).
-    The red 'Ideal' histogram spans all bins to act as the reference diagonal.
-    """
-    confs = np.array(confs)
-    GT = np.array(GT)
-    
-    if len(confs) == 0:
-        ax.set_title("No data provided.")
-        return
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.signal import find_peaks, peak_widths
+from scipy.ndimage import gaussian_filter1d
 
-    # Standard binning logic
-    bins = np.linspace(0, 1, num_bins + 1)
-    bin_indices = np.digitize(confs, bins) - 1
+def plot_hierarchical_selection(features, gt_score, p_yes, v_id, video_name, num_selections=10):
+    """
+    Combines AUC Peak Clustering (Macro) with Motion Complexity (Micro).
+    Updates the temporal plot to explicitly shade the identified AUC boundaries,
+    and places a marker on the highest-motion frame within each boundary.
+    """
+    time_steps = np.arange(len(gt_score))
     
-    bin_accs = np.zeros(num_bins)
-    bin_counts = np.zeros(num_bins)
+    # ==========================================
+    # 1. MACRO: AUC Peak Detection & Boundaries
+    # ==========================================
+    min_temporal_dist = max(1, len(gt_score) // (num_selections * 3))
+    peaks, _ = find_peaks(gt_score, distance=min_temporal_dist)
     
-    total_samples = len(confs)
-    ece = 0.0
-
-    for i in range(num_bins):
-        # Handle edge case for 1.0 falling into an out-of-bounds bin index
-        in_bin = (bin_indices == i)
-        if i == num_bins - 1:
-            in_bin = in_bin | (confs == 1.0)
-            
-        count = np.sum(in_bin)
-        bin_counts[i] = count
+    if len(peaks) == 0:
+        peaks = np.array([np.argmax(gt_score)])
         
-        if count > 0:
-            acc = np.mean(GT[in_bin])
-            conf = np.mean(confs[in_bin])
-            bin_accs[i] = acc
-            # ECE is weighted average of absolute difference between accuracy and confidence
-            ece += (count / total_samples) * abs(acc - conf)
-
-    # Diagonal line for perfect calibration
-    ax.plot([0, 1], [0, 1], linestyle='--', color='gray', linewidth=2, zorder=1, label='Perfect Calibration')
-
-    width = 1.0 / num_bins
-    bns = bins[:-1]
+    # Get boundaries (going 80% down to the baseline to define the "event block")
+    _, _, left_ips, right_ips = peak_widths(gt_score, peaks, rel_height=0.8)
     
-    for i in range(num_bins):
-        x_edge = bns[i]
-        expected_diagonal = x_edge + width/2
+    # Calculate AUC for each event
+    peak_areas = []
+    bounds = []
+    for i in range(len(peaks)):
+        left = max(0, int(np.floor(left_ips[i])))
+        right = min(len(gt_score) - 1, int(np.ceil(right_ips[i])))
+        auc = np.sum(gt_score[left:right+1])
+        peak_areas.append(auc)
+        bounds.append((left, right))
         
-        # 1. Plot the RED IDEAL GAP bar for EVERY bin, regardless of predictions
-        # This creates the continuous staircase that represents the ideal
-        ax.bar(x_edge, expected_diagonal, align='edge', width=width, 
-               color='#FF9999', edgecolor='red', hatch='//', alpha=0.7,
-               linewidth=1, zorder=2, label='Gap' if i==0 else "")
+    # Sort by AUC and keep the top K events
+    sorted_indices = np.argsort(peak_areas)[::-1][:num_selections]
+    top_bounds = [bounds[i] for i in sorted_indices]
+    
+    # ==========================================
+    # 2. MICRO: Motion Complexity Integration
+    # ==========================================
+    # Calculate L2 distance between consecutive frames
+    diffs = np.linalg.norm(features[1:] - features[:-1], axis=1)
+    raw_motion = np.concatenate(([0], diffs))
+    
+    # Apply a 1D Gaussian filter to penalize 1-frame camera shake spikes
+    # and reward sustained, genuine motion
+    smooth_motion = gaussian_filter1d(raw_motion, sigma=2.0)
+    
+    # Normalize motion to match the scale of GT scores for visualization
+    smooth_motion = smooth_motion / (np.max(smooth_motion) + 1e-8)
+    
+    # Find the most dynamic frame strictly *within* each AUC boundary
+    final_keyframes = []
+    for (left, right) in top_bounds:
+        # Extract the local motion segment
+        local_motion = smooth_motion[left:right+1]
         
-        # 2. Plot the BLUE ACCURACY bar ON TOP (only if data exists in bin)
-        # The visible red part left over becomes the visual "Gap"
-        if bin_counts[i] > 0:
-            acc = bin_accs[i]
-            ax.bar(x_edge, acc, align='edge', width=width, 
-                   color='#1f77b4', edgecolor='black', 
-                   linewidth=1.2, zorder=3, label='Accuracy' if i==0 else "")
+        # Find the index of maximum motion within this segment
+        local_best_idx = np.argmax(local_motion)
+        
+        # Map back to global frame index
+        global_best_idx = left + local_best_idx
+        final_keyframes.append(global_best_idx)
 
-    # Formatting fonts and layout
-    ax.set_xlabel("Confidence", fontsize=12, labelpad=6)
-    ax.set_ylabel("Accuracy", fontsize=12, labelpad=6)
-    ax.set_title(title, fontsize=12, pad=10)
-    ax.set_xlim(0, 1)
-    ax.set_ylim(0, 1)
-    
-    ax.set_xticks(np.arange(0, 1.2, 0.2))
-    ax.set_yticks(np.arange(0, 1.2, 0.2))
-    ax.tick_params(axis='both', which='major', labelsize=10)
-    
-    # Legend and Text Box
-    legend = ax.legend(loc="upper left", fontsize=10, framealpha=1.0, edgecolor='gray')
-    if legend:
-        legend.get_frame().set_linewidth(1)
-    
-    textstr = f'ECE = {ece*100:.2f}%' 
-    props = dict(boxstyle='square,pad=0.4', facecolor='#f0f0f0', edgecolor='black', linewidth=1)
-    ax.text(0.95, 0.05, textstr, transform=ax.transAxes, fontsize=11, fontweight='bold',
-            verticalalignment='bottom', horizontalalignment='right', bbox=props, zorder=4)
+    # ==========================================
+    # 3. Visualization
+    # ==========================================
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8), sharex=True)
 
-def plot_comparative_reliability(p_yes, p_contrast, GT, video_name):
-    """
-    Creates a 2x1 figure showing the uncalibrated vs calibrated reliability diagrams.
-    """
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(5, 9), dpi=150)
+    # --- TOP PLOT: Temporal GT with AUC Shading ---
+    ax1.plot(time_steps, gt_score, color='green', alpha=0.3, linewidth=1, label="Ground Truth (Raw)")
+    ax1.plot(time_steps, p_yes, color='red', alpha=0.6, label="VLM Predicted $P(yes)$")
     
-    # Top Subplot: Raw Probabilities
-    plot_reliability_diagram_on_ax(ax1, p_yes, GT, title="Raw Probabilities (Uncalibrated)", num_bins=10)
+    # Shade ONLY the identified AUC segments
+    for i, (left, right) in enumerate(top_bounds):
+        label = "Identified AUC Event" if i == 0 else ""
+        ax1.fill_between(time_steps[left:right+1], 0, gt_score[left:right+1], 
+                         color='green', alpha=0.5, label=label)
+        
+        # Add a light vertical span to connect the subplots
+        ax1.axvspan(left, right, color='gray', alpha=0.1)
+        ax2.axvspan(left, right, color='gray', alpha=0.1)
+
+    ax1.set_title(f"Hierarchical Selection - {video_name}\nMacro: Top {num_selections} Events by Area Under Curve")
+    ax1.set_ylabel("Importance Score")
+    ax1.legend(loc="upper left")
+    ax1.grid(True, linestyle='--', alpha=0.4)
+
+    # --- BOTTOM PLOT: Motion Complexity & Final Selection ---
+    ax2.plot(time_steps, raw_motion / (np.max(raw_motion)+1e-8), color='lightgray', alpha=0.5, label="Raw Motion (Noisy)")
+    ax2.plot(time_steps, smooth_motion, color='blue', alpha=0.8, linewidth=1.5, label="Smoothed Motion Complexity")
     
-    # Bottom Subplot: Calibrated Probabilities
-    plot_reliability_diagram_on_ax(ax2, p_contrast, GT, title="Calibrated Probabilities (Ours)", num_bins=10)
+    # Highlight the final selected frames
+    ax2.scatter(final_keyframes, smooth_motion[final_keyframes], 
+                color='red', marker='*', s=150, zorder=5, label="Final Keyframe (Max Motion in Event)")
     
-    fig.suptitle(f"Calibration Improvement: {video_name}", fontsize=14, y=0.98)
+    # Draw vertical drop-lines from the star to the x-axis
+    for kf in final_keyframes:
+        ax2.vlines(x=kf, ymin=0, ymax=smooth_motion[kf], color='red', linestyle=':', alpha=0.7)
+        ax2.annotate(f"Frame {kf}", (kf, smooth_motion[kf]), 
+                     textcoords="offset points", xytext=(0, 10), ha='center', fontsize=9, weight='bold')
+
+    ax2.set_title("Micro: Keyframe Selection via Smoothed Motion Complexity")
+    ax2.set_xlabel("Time step ($t$)")
+    ax2.set_ylabel("Normalized Motion")
+    ax2.legend(loc="upper left")
+    ax2.grid(True, linestyle='--', alpha=0.4)
+
     plt.tight_layout()
+    plt.savefig(f"./results/{v_id}_hierarchical_selection.png", format='png', dpi=300, bbox_inches='tight')
+    plt.show()
+
+def plot_diversity_maximization(features, gt_score, v_id, video_name, num_selections=3):
+    """
+    Projects 1024D H5 features to 2D using SVD. Selects the top K most important 
+    frames based on the Area Under the Curve (AUC) of the GT events, then clusters 
+    all other frames to their nearest centroid in the high-dimensional space.
+    """
+    # 1. Dimensionality reduction (SVD) for 2D visualization
+    f_centered = features - np.mean(features, axis=0)
+    U, S, Vt = np.linalg.svd(f_centered, full_matrices=False)
+    features_2d = U[:, :2] * S[:2]
+
+    # 2. Select Top K most important frames using AUC of GT peaks
+    min_temporal_dist = max(1, features.shape[0] // (num_selections * 3))
+    
+    # Find local maxima (peaks) in the GT signal
+    peaks, _ = find_peaks(gt_score, distance=min_temporal_dist)
+    
+    if len(peaks) == 0:
+        # Fallback if the signal is entirely flat
+        peaks = np.array([np.argmax(gt_score)])
+        
+    # Calculate the width and bases of each peak (going 90% down to the local baseline)
+    _, _, left_ips, right_ips = peak_widths(gt_score, peaks, rel_height=0.9)
+    
+    # Calculate the Area Under the Curve (AUC) for each distinct event
+    peak_areas = []
+    for i in range(len(peaks)):
+        left = max(0, int(np.floor(left_ips[i])))
+        right = min(len(gt_score) - 1, int(np.ceil(right_ips[i])))
+        
+        # Integrate the GT scores across the event's duration
+        auc = np.sum(gt_score[left:right+1])
+        peak_areas.append(auc)
+        
+    peak_areas = np.array(peak_areas)
+    
+    # Sort the peaks descending by their total area
+    sorted_peak_indices = np.argsort(peak_areas)[::-1]
+    
+    top_indices = []
+    for idx in sorted_peak_indices:
+        top_indices.append(peaks[idx])
+        if len(top_indices) >= num_selections:
+            break
+            
+    # Fallback: If we didn't find enough distinct peak events, fill with highest remaining GT scores
+    if len(top_indices) < num_selections:
+        sorted_gt_indices = np.argsort(gt_score)[::-1]
+        for idx in sorted_gt_indices:
+            if len(top_indices) >= num_selections:
+                break
+            if all(abs(idx - selected) > min_temporal_dist for selected in top_indices):
+                top_indices.append(idx)
+
+    # 3. Cluster frames to the nearest Top K GT centroid (in original 1024D space)
+    centroids = features[top_indices]
+    
+    # Calculate Euclidean distances from all frames to all centroids
+    diffs = features[:, np.newaxis, :] - centroids[np.newaxis, :, :]
+    distances = np.linalg.norm(diffs, axis=-1)
+    
+    # Assign each frame to the centroid with the minimum distance
+    cluster_labels = np.argmin(distances, axis=1)
+
+    # 4. Plotting
+    plt.figure(figsize=(10, 6))
+    
+    cmap = plt.get_cmap('tab10')
+    
+    # Scatter all points, colored by their assigned cluster
+    scatter = plt.scatter(features_2d[:, 0], features_2d[:, 1], 
+                          c=cluster_labels, cmap=cmap, alpha=0.4, s=30,
+                          label='Frames (Colored by Nearest GT Peak)')
+    
+    # Highlight the GT centroids
+    selected_points_2d = features_2d[top_indices]
+    
+    for i in range(len(top_indices)):
+        plt.scatter(selected_points_2d[i, 0], selected_points_2d[i, 1], 
+                    color=cmap(i / max(1, len(top_indices) - 1) if len(top_indices) > 1 else 0), 
+                    marker='*', s=400, edgecolors='black', linewidths=1.5, zorder=5)
+        
+        # Annotate rank order based on AUC
+        plt.annotate(f"#{i + 1}", (selected_points_2d[i, 0], selected_points_2d[i, 1]), 
+                     textcoords="offset points", xytext=(0, 12), ha='center', 
+                     weight='bold', fontsize=11, zorder=6)
+
+    plt.title(f"GT-Anchored Clustering (Ranked by Event Area) - {video_name}")
+    plt.xlabel("Principal Component 1")
+    plt.ylabel("Principal Component 2")
+    
+    handles, _ = scatter.legend_elements()
+    star_marker = plt.Line2D([0], [0], marker='*', color='w', markerfacecolor='gray', 
+                             markeredgecolor='black', markersize=15, label='Top K GT Centroids (by AUC)')
+    if handles:
+        plt.legend(handles=[handles[0], star_marker], labels=['Frame Clusters', 'GT Centroids (by AUC)'])
+
+    plt.grid(True, linestyle='--', alpha=0.5)
+    plt.tight_layout()
+    plt.savefig(f"./results/{v_id}_gt_clustering_auc_plot.png", format='png', dpi=300, bbox_inches='tight')
+    plt.show()
+
+
+def plot_motion_complexity(features, gt_score, v_id, video_name, top_k=10):
+    """
+    Computes a simple complexity/motion score using L2 distance between consecutive 
+    H5 frame features, showing how it correlates (or fails to correlate) with ground truth.
+    """
+    # 1. Compute frame-to-frame difference in embedding space
+    diffs = np.linalg.norm(features[1:] - features[:-1], axis=1)
+    motion_scores = np.concatenate(([0], diffs)) # Pad the first frame
+    
+    # Normalize for visualization alongside GT scores
+    motion_scores = motion_scores / (np.max(motion_scores) + 1e-8)
+    
+    # Rank frames strictly by motion score
+    ranked_indices = np.argsort(motion_scores)[::-1]
+    top_indices = ranked_indices[:top_k]
+
+
+    from scipy.stats import spearmanr, kendalltau
+    rho, _ = spearmanr(motion_scores, gt_score)
+    tau, _ = kendalltau(motion_scores, gt_score)
+    print(rho, tau)
+    # 2. Plotting
+    time_steps = np.arange(len(features))
+    
+    plt.figure(figsize=(12, 4))
+    
+    # Ground Truth shade
+    plt.fill_between(time_steps, 0, gt_score, color='green', alpha=0.2, label='Ground Truth Importance')
+    plt.plot(time_steps, gt_score, color='green', alpha=0.5, linewidth=1) 
+    
+    # Motion Score line
+    plt.plot(time_steps, motion_scores, color='blue', alpha=0.6, label='Motion/Complexity (L2 Diff)')
+    
+    # Highlight top selections driven purely by motion
+    plt.scatter(top_indices, motion_scores[top_indices], 
+                color='red', zorder=5, label=f'Top {top_k} Motion Peaks')
+
+    plt.title(f"Motion & Visual Complexity Baseline - {video_name}")
+    plt.xlabel("Time step ($t$)")
+    plt.ylabel("Normalized Score")
+    plt.legend(loc="upper left")
+    plt.grid(True, linestyle='--', alpha=0.5)
+    plt.tight_layout()
+    plt.savefig(f"./results/{v_id}_motion_plot.png", format='png', dpi=300, bbox_inches='tight')
     plt.show()
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--feature_dir", type=str, default="./vslice_features",
                         help="Dir where .npz files are saved")
-    parser.add_argument("--model_type", type=str, default="qwen",
+    parser.add_argument("--model_type", type=str, default="minicpm",
                         help="qwen or minicpm")
     parser.add_argument("--root_dir", type=str, default=".",
                         help="Root dir for SumMe/TVSum H5 files")
@@ -238,14 +402,25 @@ def main():
                 save_path = f"./results/{v_id}_temporal_plot.png"
                 plt.savefig(save_path, format='png', dpi=300, bbox_inches='tight')
                 plt.show()
-                # 2. Reliability Diagram Plotting (Figure 2)
-                # Binarize GT for calibration metric purposes (standard approach for continuous summary scores)
-                # binary_targets = (gt_score >= 0.5).astype(float)
-                # plot_comparative_reliability(p_yes, p_contrast, binary_targets, video_name)
+                
+                # Load Ground Truth and H5 Visual Features
+                gt_score = h5_data[v_id]['gtscore'][()]
+                h5_features = h5_data[v_id]['features'][()] # Shape: (N, 1024)
 
-                # If we were looking for a specific ID or the best one, exit after plotting
+                # plot_hierarchical_selection(h5_features, gt_score, p_yes, v_id, video_name, num_selections=3)
+
+                # ==============================
+                # 2. Diversity Maximization Plot
+                # ==============================
+                plot_diversity_maximization(h5_features, gt_score, v_id, video_name)
+                
+                # ==============================
+                # 3. Motion Complexity Plot
+                # ==============================
+                plot_motion_complexity(h5_features, gt_score, v_id, video_name)
+
                 if args.video_id or target_video_name:
-                    return 
+                    return
 
         # If we didn't return from a specific find, just break after the first split
         break
