@@ -14,12 +14,17 @@ python ./vslice/evaluate_summarization.py --feature_dir="./vslice_features" --mo
 """
 
 import os
+import torch
+import torch.nn.functional as F
 import h5py
 import numpy as np
 import argparse
 import pandas as pd
 from tqdm import tqdm
 from extract_features import build_summe_manifest, build_tvsum_manifest
+from measure_calibration import soft_expected_calibration_error, reliability_plot, bin_strength_plot
+
+epsilon = 1e-8
 
 def knapsack_dp(values, weights, capacity):
     """
@@ -58,15 +63,66 @@ def knapsack_dp(values, weights, capacity):
             curr_w -= int(weights[i-1])
             
     return picks
-
+# TO BEAT (SUMME): 0.256 0.285
+# TVSUM 0.257 0.361
 def evaluate_video(feature_path, h5_path, h5_key=None):
     """
     Calculates F-score and correlations for a single video.
     """
     data = np.load(feature_path)
 
-    # Using raw 'p_yes' as the importance score
-    scores = data['p_yes']
+    if True:
+        yes_scores = data['p_yes']
+        no_scores = data['p_no']
+        epsilon = 1e-8
+        
+        # 1. Base Binary Probability
+        p = yes_scores / (yes_scores + no_scores + epsilon)
+        p_tensor = torch.tensor(p, dtype=torch.float32)
+        
+        # 2. The Median Guillotine (Percentile Gating)
+        # Find the median score of THIS specific video
+        median_val = torch.quantile(p_tensor, 0.50) 
+        
+        # Subtract the median and flatline everything below it
+        # This completely alters the rank-order by forcing ties in the background
+        p_foreground = F.relu(p_tensor - median_val)
+        
+        # 3. Macro-Temporal Gaussian Smoothing
+        # A massive window to capture true 5-10 second scenes
+        kernel_size = 31 
+        sigma = 5.0
+        
+        # Create a 1D Gaussian kernel
+        x = torch.arange(kernel_size, dtype=torch.float32) - (kernel_size // 2)
+        gaussian_kernel = torch.exp(-(x ** 2) / (2 * sigma ** 2))
+        gaussian_kernel = gaussian_kernel / gaussian_kernel.sum() # Normalize to 1
+        
+        # Reshape for PyTorch Conv1D
+        p_fg_reshaped = p_foreground.view(1, 1, -1)
+        kernel_reshaped = gaussian_kernel.view(1, 1, -1)
+        
+        padding = kernel_size // 2
+        p_padded = F.pad(p_fg_reshaped, (padding, padding), mode='replicate')
+        
+        # Apply Macro-Smoothing
+        smoothed_scores = F.conv1d(p_padded, kernel_reshaped).squeeze()
+        
+        # 4. Video-Level Max Calibration (for ECE)
+        # Because we subtracted the median, the values shrunk. 
+        # We divide by the Max to ensure the absolute best frame in the video is exactly 1.0
+        video_max = smoothed_scores.max()
+        if video_max > 0:
+            final_scores = smoothed_scores / video_max
+        else:
+            final_scores = smoothed_scores
+            
+        scores = final_scores.numpy()
+
+    else:
+        # Use raw 'p_yes' as the importance score
+        scores = data['p_yes']
+
     video_name = str(data['video_name'][0])
     dataset_name = str(data['dataset'][0])
 
@@ -142,15 +198,24 @@ def evaluate_video(feature_path, h5_path, h5_key=None):
     from scipy.stats import spearmanr, kendalltau
     rho, _ = spearmanr(scores, gt_scores)
     tau, _ = kendalltau(scores, gt_scores)
-        
+
+    scores = torch.tensor(scores, dtype=torch.float32)
+    gt_scores = torch.tensor(gt_scores, dtype=torch.float32)
+    global_gt_2d = torch.stack([1.0 - gt_scores, gt_scores], dim=1)
+
+    # Only track probability of Class 1
+    p_yes_preds = torch.ones_like(scores)
+
+    ece = soft_expected_calibration_error(scores, p_yes_preds, global_gt_2d, num_bins=15)
     return {
         "video": video_name,
         "dataset": dataset_name,
-        "f_score": np.max(f_scores) if dataset_name == 'summe' else f_scores[0],
+        "f_score": np.max(f_scores) if dataset_name == 'summe' else np.mean(f_scores),
         "spearman": rho,
         "kendall": tau,
         "n_frames": n_frames,
-        "n_segments": len(cps)
+        "n_segments": len(cps),
+        "ECE": ece
     }
 
 def main():
@@ -193,11 +258,11 @@ def main():
         split_f_scores = []
         split_rho_scores = []
         split_tau_scores = []
+        split_ECE_scores = []
         
         print(f"\n--- Split number {split_idx} ({len(test_set)} videos) ---")
         for video_id in tqdm(test_set):
             # Find the feature file. The file is usually named {dataset}_{video_id}.npz
-            # But the video_id in splits might match the H5 key or the video_name.
             feature_file = None
             for item in manifest:
                 if item['h5_key'] == video_id:
@@ -222,28 +287,33 @@ def main():
                 split_f_scores.append(res["f_score"])
                 split_rho_scores.append(res["spearman"])
                 split_tau_scores.append(res["kendall"])
+                split_ECE_scores.append(res["ECE"])
         
         if split_f_scores:
             mean_f = np.mean(split_f_scores)
-            mean_rho = np.nanmean(split_rho_scores)
-            mean_tau = np.nanmean(split_tau_scores)
+            mean_rho = np.mean(split_rho_scores)
+            mean_tau = np.mean(split_tau_scores)
+            mean_ECE = np.mean(split_ECE_scores)
             all_split_results.append({
                 "f1": mean_f,
                 "spearman": mean_rho,
-                "kendall": mean_tau
+                "kendall": mean_tau,
+                "ECE": mean_ECE
             })
-            print(f"Split {split_idx} | Mean F-score: {mean_f:.4f} | Tau: {mean_tau:.4f} | Rho: {mean_rho:.4f}")
+            print(f"Split {split_idx} | Mean F-score: {mean_f:.4f} | Tau: {mean_tau:.4f} | Rho: {mean_rho:.4f} | ECE: {mean_ECE:.4f}")
 
     if all_split_results:
         final_f1 = np.mean([r['f1'] for r in all_split_results])
         final_rho = np.nanmean([r['spearman'] for r in all_split_results])
         final_tau = np.nanmean([r['kendall'] for r in all_split_results])
+        final_ECE = np.nanmean([r['ECE'] for r in all_split_results])
         print("\n" + "="*70)
         print(f"FINAL BENCHMARK SUMMARY (SPLIT-BASED: {args.split_file})")
         print("="*70)
         print(f"Average F-score across {len(all_split_results)} splits: {final_f1:.4f}")
         print(f"Average Kendall Tau across splits: {final_tau:.4f}")
         print(f"Average Spearman Rho across splits: {final_rho:.4f}")
+        print(f"Average ECE across splits: {final_ECE:.4f}")
         print("="*70)
     else:
         print("No videos were evaluated. Check your feature_dir and split_file.")

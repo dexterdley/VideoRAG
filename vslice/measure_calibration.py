@@ -248,7 +248,7 @@ def diagnostic_plots(global_p_yes, global_p_contrast, global_gt):
     plt.suptitle('Model Diagnostics: P(Yes) vs Contrast Predictions', 
                  fontsize=14, fontweight='bold', y=1.02)
     plt.tight_layout()
-    plt.savefig('diagnostic_plots.png', dpi=150, bbox_inches='tight')
+    plt.savefig('./results/diagnostic_plots.png', dpi=150, bbox_inches='tight')
     
     # Print statistics
     print(f"\n{'='*60}")
@@ -325,11 +325,11 @@ def main():
     global_gt = []
 
     for split_idx, split in enumerate(splits):
-        train_set = split['train_keys']
-        print(f"\n--- Aggregating Split {split_idx} ({len(train_set)} videos) ---")
+        eval_set = split['test_keys']
+        print(f"\n--- Aggregating Split {split_idx} ({len(eval_set)} videos) ---")
         
         with h5py.File(h5_path, 'r') as h5_data:
-            for v_id in tqdm(train_set):
+            for v_id in tqdm(eval_set):
                 feature_file = None
                 video_name = None
                 

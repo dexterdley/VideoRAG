@@ -307,34 +307,44 @@ def build_tvsum_manifest(root_dir):
 
     # ── Resolve TVSum H5 keys to actual video IDs ──
     # The ECCV16 H5 has 50 entries (video_1 .. video_50).
-    # Standard mapping: keys are sorted, and they correspond to videos sorted
-    # alphabetically by their YouTube video_id.
-    sorted_video_ids = sorted(video_files.keys())
+    # The alphabetical sorting of video IDs is not reliable since they have varying lengths.
+    # We map robustly by comparing the number of frames.
+    
+    import cv2
+    from decord import VideoReader, cpu
+    
+    mp4_lengths = {}
+    for vid, vpath in video_files.items():
+        try:
+            # cv2 is often faster for frame count
+            cap = cv2.VideoCapture(vpath)
+            num_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            cap.release()
+            if num_frames <= 0:
+                vr = VideoReader(vpath, ctx=cpu(0))
+                num_frames = len(vr)
+                del vr
+            mp4_lengths[vid] = num_frames
+        except Exception as e:
+            print(f"  [WARN] Failed to read {vpath}: {e}")
+            continue
 
-    if len(sorted_video_ids) == len(manifest):
-        for item, vid in zip(manifest, sorted_video_ids):
-            item["video_name"] = vid
-            item["video_path"] = video_files[vid]
-            item["title"] = title_map.get(vid, vid)
-    else:
-        print(f"  [WARN] TVSum video count mismatch: H5 has {len(manifest)}, "
-              f"found {len(sorted_video_ids)} mp4 files. "
-              f"Will attempt to match by iterating.")
-        # Fallback: try to match by n_frames
-        from decord import VideoReader, cpu
-        for item in manifest:
-            for vid, vpath in video_files.items():
-                try:
-                    vr = VideoReader(vpath, ctx=cpu(0))
-                    if len(vr) == item["n_frames"]:
-                        item["video_name"] = vid
-                        item["video_path"] = vpath
-                        item["title"] = title_map.get(vid, vid)
-                        del vr
-                        break
-                    del vr
-                except:
-                    continue
+    # Map by length with a small tolerance for codec differences
+    for item in manifest:
+        matched_vid = None
+        for vid, length in mp4_lengths.items():
+            if abs(length - item["n_frames"]) <= 2:
+                matched_vid = vid
+                break
+        
+        if matched_vid:
+            item["video_name"] = matched_vid
+            item["video_path"] = video_files[matched_vid]
+            item["title"] = title_map.get(matched_vid, matched_vid)
+            # Remove from mp4_lengths to prevent double mapping
+            del mp4_lengths[matched_vid]
+        else:
+            print(f"  [WARN] Could not find MP4 match for {item['h5_key']} with {item['n_frames']} frames.")
 
     # Filter out unresolved entries
     resolved = [m for m in manifest if m["video_path"] is not None]
