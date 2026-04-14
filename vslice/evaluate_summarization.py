@@ -16,6 +16,7 @@ python ./vslice/evaluate_summarization.py --feature_dir="./vslice_features" --mo
 import os
 import torch
 import torch.nn.functional as F
+from scipy.ndimage import gaussian_filter1d
 import h5py
 import numpy as np
 import argparse
@@ -23,7 +24,10 @@ import pandas as pd
 from tqdm import tqdm
 from extract_features import build_summe_manifest, build_tvsum_manifest
 from measure_calibration import soft_expected_calibration_error, reliability_plot, bin_strength_plot
-
+from scipy.signal import find_peaks, peak_widths
+from sklearn.cluster import KMeans
+from sklearn.preprocessing import StandardScaler
+from scipy.ndimage import uniform_filter1d
 epsilon = 1e-8
 
 def knapsack_dp(values, weights, capacity):
@@ -61,8 +65,57 @@ def knapsack_dp(values, weights, capacity):
         if keep[i, curr_w]:
             picks.append(i-1)
             curr_w -= int(weights[i-1])
-            
     return picks
+
+def temporal_process_features(features):
+    features = torch.tensor(features, dtype=torch.float32)
+    shifted_back = torch.roll(features, shifts=1, dims=0)
+    delta_back = features - shifted_back
+    delta_back[0] = 0.0
+
+    shifted_fwd = torch.roll(features, shifts=-1, dims=0)
+    delta_fwd = features - shifted_fwd #(F_t+1 -  F_t)
+    delta_fwd[-1] = 0.0
+
+    delta_net = delta_fwd - delta_back
+
+    temporal_motion = torch.cat([delta_back, delta_fwd, delta_net], dim=1)
+    raw_motion = torch.linalg.norm(temporal_motion, dim=1)
+    return raw_motion.numpy()
+
+def temporal_process_features(features, window_size=5):
+    """
+    Calculates sliding window motion using back, forward, and net deltas.
+    """
+    features = torch.tensor(features, dtype=torch.float32)
+    
+    # 1. Delta Back (F_t - F_t-1)
+    shifted_back = torch.roll(features, shifts=1, dims=0)
+    delta_back = torch.linalg.norm(features - shifted_back, dim=1)
+    delta_back[0] = 0.0
+
+    # 2. Delta Forward (F_t - F_t+1)
+    shifted_fwd = torch.roll(features, shifts=-1, dims=0)
+    delta_fwd = torch.linalg.norm(features - shifted_fwd, dim=1)
+    delta_fwd[-1] = 0.0
+
+    # 3. Delta Net (Acceleration / Change in Flow)
+    # Using the raw vectors for net calculation to capture directional change
+    diff_back = features - shifted_back
+    diff_fwd = features - shifted_fwd
+    delta_net = torch.linalg.norm(diff_fwd - diff_back, dim=1)
+    delta_net[0] = 0.0
+    delta_net[-1] = 0.0
+
+    # Combine all motion components
+    # We sum them first, then apply the sliding window to stabilize the signal
+    combined_motion = delta_back + delta_fwd + delta_net
+    
+    # Apply sliding window average to smooth out high-frequency noise/jitter
+    motion_flow = uniform_filter1d(combined_motion.numpy(), size=window_size)
+    
+    return motion_flow
+
 # TO BEAT (SUMME): 0.256 0.285
 # TVSUM 0.257 0.361
 def evaluate_video(feature_path, h5_path, h5_key=None):
@@ -74,51 +127,38 @@ def evaluate_video(feature_path, h5_path, h5_key=None):
     if True:
         yes_scores = data['p_yes']
         no_scores = data['p_no']
-        epsilon = 1e-8
         
         # 1. Base Binary Probability
-        p = yes_scores / (yes_scores + no_scores + epsilon)
-        p_tensor = torch.tensor(p, dtype=torch.float32)
-        
-        # 2. The Median Guillotine (Percentile Gating)
-        # Find the median score of THIS specific video
-        median_val = torch.quantile(p_tensor, 0.50) 
-        
-        # Subtract the median and flatline everything below it
-        # This completely alters the rank-order by forcing ties in the background
-        p_foreground = F.relu(p_tensor - median_val)
-        
-        # 3. Macro-Temporal Gaussian Smoothing
-        # A massive window to capture true 5-10 second scenes
-        kernel_size = 31 
-        sigma = 5.0
-        
-        # Create a 1D Gaussian kernel
-        x = torch.arange(kernel_size, dtype=torch.float32) - (kernel_size // 2)
-        gaussian_kernel = torch.exp(-(x ** 2) / (2 * sigma ** 2))
-        gaussian_kernel = gaussian_kernel / gaussian_kernel.sum() # Normalize to 1
-        
-        # Reshape for PyTorch Conv1D
-        p_fg_reshaped = p_foreground.view(1, 1, -1)
-        kernel_reshaped = gaussian_kernel.view(1, 1, -1)
-        
-        padding = kernel_size // 2
-        p_padded = F.pad(p_fg_reshaped, (padding, padding), mode='replicate')
-        
-        # Apply Macro-Smoothing
-        smoothed_scores = F.conv1d(p_padded, kernel_reshaped).squeeze()
-        
-        # 4. Video-Level Max Calibration (for ECE)
-        # Because we subtracted the median, the values shrunk. 
-        # We divide by the Max to ensure the absolute best frame in the video is exactly 1.0
-        video_max = smoothed_scores.max()
-        if video_max > 0:
-            final_scores = smoothed_scores / video_max
-        else:
-            final_scores = smoothed_scores
-            
-        scores = final_scores.numpy()
+        yes_tensor = torch.tensor(yes_scores, dtype=torch.float32)
+        no_tensor = torch.tensor(no_scores, dtype=torch.float32)
 
+        diff_scores = F.relu(yes_tensor - no_tensor)
+
+        with h5py.File(h5_path, 'r') as h5_data:
+            if h5_key is None:
+                for k in h5_data.keys():
+                    vname = h5_data[k]['video_name'][...].item().decode('utf-8') if 'video_name' in h5_data[k] else k
+                    if vname == video_name or k == video_name:
+                        h5_key = k
+                        break
+            features = h5_data[h5_key]['features'][()]
+
+        motion_features = temporal_process_features(features)
+
+        smoothed_motion = gaussian_filter1d(motion_features, sigma=2.0)
+        motion_weight = smoothed_motion / (np.mean(smoothed_motion) + epsilon)
+        #import pdb; pdb.set_trace()
+
+        threshold = np.percentile(yes_scores, 95)
+        boring_mask = yes_scores < threshold
+
+        global_feat = np.mean(features[boring_mask], axis=0, keepdims=True)
+        relevance_weight = 1 - F.cosine_similarity(torch.tensor(features), torch.tensor(global_feat))
+        relevance_weight = relevance_weight/ (torch.mean(relevance_weight) + epsilon)
+
+        final_scores = yes_tensor.numpy() * motion_weight * relevance_weight.numpy()
+
+        scores = final_scores / (np.max(final_scores) + epsilon)
     else:
         # Use raw 'p_yes' as the importance score
         scores = data['p_yes']

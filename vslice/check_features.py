@@ -236,18 +236,35 @@ def plot_diversity_maximization(features, gt_score, v_id, video_name, num_select
     plt.show()
 
 
+def temporal_process_features(features):
+    features = torch.tensor(features, dtype=torch.float32)
+    shifted_back = torch.roll(features, shifts=1, dims=0)
+    delta_back = features - shifted_back
+    delta_back[0] = 0.0
+
+    shifted_fwd = torch.roll(features, shifts=-1, dims=0)
+    delta_fwd = features - shifted_fwd #(F_t+1 -  F_t)
+    delta_fwd[-1] = 0.0
+
+    delta_net = delta_fwd - delta_back
+
+    temporal_motion = torch.cat([delta_back, delta_fwd, delta_net], dim=1)
+    raw_motion = torch.linalg.norm(temporal_motion, dim=1)
+    return raw_motion.numpy()
+
+
 def plot_motion_complexity(features, gt_score, v_id, video_name, top_k=10):
     """
     Computes a simple complexity/motion score using L2 distance between consecutive 
     H5 frame features, showing how it correlates (or fails to correlate) with ground truth.
     """
     # 1. Compute frame-to-frame difference in embedding space
-    diffs = np.linalg.norm(features[1:] - features[:-1], axis=1)
-    motion_scores = np.concatenate(([0], diffs)) # Pad the first frame
+    motion_scores = temporal_process_features(features)
     
     # Normalize for visualization alongside GT scores
-    motion_scores = motion_scores / (np.max(motion_scores) + 1e-8)
-    
+    #motion_scores = motion_scores / (np.max(motion_scores) + 1e-8)
+    motion_scores =  motion_scores/ (np.mean( motion_scores) + 1e-8)
+
     # Rank frames strictly by motion score
     ranked_indices = np.argsort(motion_scores)[::-1]
     top_indices = ranked_indices[:top_k]
