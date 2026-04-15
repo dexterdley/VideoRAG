@@ -28,6 +28,14 @@ from scipy.signal import find_peaks, peak_widths
 from sklearn.cluster import KMeans
 from sklearn.preprocessing import StandardScaler
 from scipy.ndimage import uniform_filter1d
+
+# Import CSTA evaluation functions
+import sys
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'csta'))
+from generate_summary import generate_summary
+from evaluation_metrics import get_corr_coeff
+from utils import get_gt
+
 epsilon = 1e-8
 
 def knapsack_dp(values, weights, capacity):
@@ -83,7 +91,7 @@ def temporal_process_features(features):
     raw_motion = torch.linalg.norm(temporal_motion, dim=1)
     return raw_motion.numpy()
 
-def temporal_process_features(features, window_size=5):
+def temporal_process_features(features, window_size=15):
     """
     Calculates sliding window motion using back, forward, and net deltas.
     """
@@ -103,7 +111,7 @@ def temporal_process_features(features, window_size=5):
     # Using the raw vectors for net calculation to capture directional change
     diff_back = features - shifted_back
     diff_fwd = features - shifted_fwd
-    delta_net = torch.linalg.norm(diff_fwd - diff_back, dim=1)
+    delta_net = torch.linalg.norm(diff_back - diff_fwd, dim=1)
     delta_net[0] = 0.0
     delta_net[-1] = 0.0
 
@@ -118,62 +126,20 @@ def temporal_process_features(features, window_size=5):
 
 # TO BEAT (SUMME): 0.256 0.285
 # TVSUM 0.257 0.361
-def evaluate_video(feature_path, h5_path, h5_key=None):
+def evaluate_video(feature_path, h5_path, h5_key=None, user_scores=None, use_advanced_scoring=True, epsilon=1e-8):
     """
-    Calculates F-score and correlations for a single video.
+    Calculates F-score, correlations, and ECE for a single video.
+    user_scores: for TVSum, per-video list of user annotations from ydata-anno.tsv
+    use_advanced_scoring: toggles motion/relevance processing vs raw p_yes scores.
     """
+    # 1. Load basic metadata
     data = np.load(feature_path)
-
-    if True:
-        yes_scores = data['p_yes']
-        no_scores = data['p_no']
-        
-        # 1. Base Binary Probability
-        yes_tensor = torch.tensor(yes_scores, dtype=torch.float32)
-        no_tensor = torch.tensor(no_scores, dtype=torch.float32)
-
-        diff_scores = F.relu(yes_tensor - no_tensor)
-
-        with h5py.File(h5_path, 'r') as h5_data:
-            if h5_key is None:
-                for k in h5_data.keys():
-                    vname = h5_data[k]['video_name'][...].item().decode('utf-8') if 'video_name' in h5_data[k] else k
-                    if vname == video_name or k == video_name:
-                        h5_key = k
-                        break
-            features = h5_data[h5_key]['features'][()]
-
-        motion_features = temporal_process_features(features)
-
-        smoothed_motion = gaussian_filter1d(motion_features, sigma=2.0)
-        motion_weight = smoothed_motion / (np.mean(smoothed_motion) + epsilon)
-        #import pdb; pdb.set_trace()
-
-        threshold = np.percentile(yes_scores, 95)
-        boring_mask = yes_scores < threshold
-
-        global_feat = np.mean(features[boring_mask], axis=0, keepdims=True)
-        relevance_weight = 1 - F.cosine_similarity(torch.tensor(features), torch.tensor(global_feat))
-        relevance_weight = relevance_weight/ (torch.mean(relevance_weight) + epsilon)
-
-        final_scores = yes_tensor.numpy() * motion_weight * relevance_weight.numpy()
-
-        scores = final_scores / (np.max(final_scores) + epsilon)
-    else:
-        # Use raw 'p_yes' as the importance score
-        scores = data['p_yes']
-
     video_name = str(data['video_name'][0])
     dataset_name = str(data['dataset'][0])
 
-    if np.isnan(data['p_yes']).any():
-        raise ValueError(f"NaN found in p_yes for video {video_name}")
-
+    # 2. Unified HDF5 Loading (Read everything once)
     with h5py.File(h5_path, 'r') as f:
-        # Find the correct key in H5 if not provided
         if h5_key is None:
-            # For SumMe, key is usually the video name
-            # For TVSum, key is 'video_1'...'video_50'
             for k in f.keys():
                 vname = f[k]['video_name'][...].item().decode('utf-8') if 'video_name' in f[k] else k
                 if vname == video_name or k == video_name:
@@ -184,69 +150,84 @@ def evaluate_video(feature_path, h5_path, h5_key=None):
             return None
 
         grp = f[h5_key]
+        features = grp['features'][()]       # Load as numpy initially
         cps = grp['change_points'][...]      # [N_seg, 2]
         n_frames = int(grp['n_frames'][...])
         picks = grp['picks'][...]            # frame indices for features
+        gt_scores = grp['gtscore'][...]      # Ground truth importance scores
         
         # Ground truth summary info
-        # SumMe: user_summary [num_users, n_frames]
-        # TVSum: gtsummary [n_frames]
         if 'user_summary' in grp:
-            user_summaries = grp['user_summary'][...] # [20, N]
+            user_summaries = grp['user_summary'][...] # SumMe: [num_users, N]
         else:
-            user_summaries = [grp['gtsummary'][...]] # [1, N]
-        
-        # Ground truth importance scores
-        gt_scores = grp['gtscore'][...]
-            
-    # 1. Map frame-level scores [len(picks)] to all frames [n_frames]
-    # (Linear interpolation or nearest neighbor)
-    from scipy.interpolate import interp1d
-    all_scores = interp1d(picks, scores, kind='linear', fill_value="extrapolate")(np.arange(n_frames))
-    all_scores = np.clip(all_scores, 0, 1)
+            user_summaries = [grp['gtsummary'][...]]  # TVSum: [1, N]
 
-    # 2. Get segment-level scores
-    seg_scores = []
-    seg_lengths = []
-    for start, end in cps:
-        seg_scores.append(all_scores[start:end+1].mean())
-        seg_lengths.append(end - start + 1)
-    
-    # 3. Solve Knapsack (15% budget)
-    limit = int(n_frames * 0.15)
-    selected_indices = knapsack_dp(seg_scores, seg_lengths, limit)
-    
-    # 4. Generate binary summary
-    summary = np.zeros(n_frames, dtype=int)
-    for idx in selected_indices:
-        start, end = cps[idx]
-        summary[start:end+1] = 1
+    # 3. Score Calculation
+    yes_scores = data['p_yes']
+
+    if use_advanced_scoring:
+        # Motion processing
+        motion_features = temporal_process_features(features)
+        smoothed_motion = gaussian_filter1d(motion_features, sigma=2.0)
+        motion_weight = smoothed_motion / (np.mean(smoothed_motion) + epsilon)
+
+        # Relevance weighting
+        threshold = np.percentile(yes_scores, 95)
+        boring_mask = yes_scores < threshold
+        
+        # Safety check: Prevent NaN if boring_mask is completely empty
+        if not np.any(boring_mask):
+            global_feat = np.mean(features, axis=0, keepdims=True)
+        else:
+            global_feat = np.mean(features[boring_mask], axis=0, keepdims=True)
+
+        features_tensor = torch.tensor(features, dtype=torch.float32)
+        global_feat_tensor = torch.tensor(global_feat, dtype=torch.float32)
+
+        relevance_weight = 1.0 - F.cosine_similarity(features_tensor, global_feat_tensor)
+        relevance_weight = relevance_weight / (torch.mean(relevance_weight) + epsilon)
+
+        final_scores = yes_scores * motion_weight * relevance_weight.numpy()
+        scores = final_scores / (np.max(final_scores) + epsilon)
+    else:
+        # Use raw 'p_yes' as the importance score
+        scores = yes_scores
+
+    # 4. Generate Summary
+    scores_list = np.squeeze(scores).tolist()
+    summary = generate_summary([cps], [scores_list], [n_frames], [picks])[0]
         
     # 5. Evaluate F-score
     f_scores = []
     for user_summary in user_summaries:
-        intersection = np.sum(summary * user_summary)
-        precision = intersection / np.sum(summary) if np.sum(summary) > 0 else 0
-        recall = intersection / np.sum(user_summary) if np.sum(user_summary) > 0 else 0
-        if precision + recall > 0:
-            f1 = 2 * precision * recall / (precision + recall)
-        else:
-            f1 = 0
+        min_len = min(len(summary), len(user_summary))
+        s = summary[:min_len]
+        u = user_summary[:min_len]
+        
+        intersection = np.sum(s * u)
+        sum_s = np.sum(s)
+        sum_u = np.sum(u)
+        
+        precision = intersection / sum_s if sum_s > 0 else 0
+        recall = intersection / sum_u if sum_u > 0 else 0
+        
+        f1 = (2 * precision * recall / (precision + recall)) if (precision + recall) > 0 else 0
         f_scores.append(f1)
     
     # 6. Evaluate Correlations
-    from scipy.stats import spearmanr, kendalltau
-    rho, _ = spearmanr(scores, gt_scores)
-    tau, _ = kendalltau(scores, gt_scores)
+    if dataset_name == 'summe':
+        rho, tau = get_corr_coeff([summary], [h5_key], 'SumMe', user_summaries)
+    else:
+        rho, tau = get_corr_coeff([scores_list], [h5_key], 'TVSum', user_scores)
 
-    scores = torch.tensor(scores, dtype=torch.float32)
-    gt_scores = torch.tensor(gt_scores, dtype=torch.float32)
-    global_gt_2d = torch.stack([1.0 - gt_scores, gt_scores], dim=1)
-
-    # Only track probability of Class 1
-    p_yes_preds = torch.ones_like(scores)
-
-    ece = soft_expected_calibration_error(scores, p_yes_preds, global_gt_2d, num_bins=15)
+    # 7. Evaluate Calibration (ECE)
+    scores_tensor = torch.tensor(scores, dtype=torch.float32)
+    gt_scores_tensor = torch.tensor(gt_scores, dtype=torch.float32)
+    global_gt_2d = torch.stack([1.0 - gt_scores_tensor, gt_scores_tensor], dim=1)
+    
+    p_yes_preds = torch.ones_like(scores_tensor)
+    ece = soft_expected_calibration_error(scores_tensor, p_yes_preds, global_gt_2d, num_bins=15)
+    
     return {
         "video": video_name,
         "dataset": dataset_name,
@@ -262,13 +243,16 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--feature_dir", type=str, default="./vslice_features",
                         help="Dir where .npz files are saved")
-    parser.add_argument("--model_type", type=str, default="qwen",
+    parser.add_argument("--model_type", type=str, default="minicpm",
                         help="qwen or minicpm")
     parser.add_argument("--root_dir", type=str, default=".",
                         help="Root dir for SumMe/TVSum H5 files")
     parser.add_argument("--split_file", type=str, default="./dataset/summe_splits.json",
                         help="Optional JSON split file (SumMe/TVSum standard splits)")
     args = parser.parse_args()
+
+    # Load per-user annotations for TVSum correlation
+    tvsum_user_scores = get_gt('TVSum')
 
     if "summe" in args.split_file:
         manifest = build_summe_manifest(args.root_dir)
@@ -300,8 +284,7 @@ def main():
         split_tau_scores = []
         split_ECE_scores = []
         
-        print(f"\n--- Split number {split_idx} ({len(test_set)} videos) ---")
-        for video_id in tqdm(test_set):
+        for video_id in test_set:
             # Find the feature file. The file is usually named {dataset}_{video_id}.npz
             feature_file = None
             for item in manifest:
@@ -322,7 +305,7 @@ def main():
             dataset_name = "summe" if "summe" in args.split_file else "tvsum"
             h5_path = summe_h5 if dataset_name == "summe" else tvsum_h5
             
-            res = evaluate_video(fpath, h5_path, h5_key=video_id)
+            res = evaluate_video(fpath, h5_path, h5_key=video_id, user_scores=tvsum_user_scores if dataset_name == 'tvsum' else None)
             if res:
                 split_f_scores.append(res["f_score"])
                 split_rho_scores.append(res["spearman"])
@@ -355,6 +338,15 @@ def main():
         print(f"Average Spearman Rho across splits: {final_rho:.4f}")
         print(f"Average ECE across splits: {final_ECE:.4f}")
         print("="*70)
+
+        if "summe" in args.split_file:
+            if final_tau > 0.256 and final_rho > 0.285:
+                print("BEAT SUMME")
+            else:
+                print("NO SUMME")
+        else:
+            if final_tau > 0.257 and final_rho > 0.361:
+                print("BEAT TVSUM")
     else:
         print("No videos were evaluated. Check your feature_dir and split_file.")
 
