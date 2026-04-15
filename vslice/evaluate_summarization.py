@@ -164,6 +164,9 @@ def evaluate_video(feature_path, h5_path, h5_key=None, user_scores=None, use_adv
 
     # 3. Score Calculation
     yes_scores = data['p_yes']
+    no_scores = data['p_no']
+
+    log_odds = np.log(yes_scores + epsilon) - np.log(no_scores + epsilon) #Importance sampling? can use motion features too
 
     if use_advanced_scoring:
         # Motion processing

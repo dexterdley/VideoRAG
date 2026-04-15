@@ -1,5 +1,5 @@
 import numpy as np
-from scipy.stats import spearmanr, kendalltau, rankdata
+from scipy.stats import spearmanr, kendalltau
 
 # Calculate Kendall's and Spearman's coefficients
 def get_corr_coeff(pred_imp_scores, videos, dataset, user_scores=None):
@@ -8,7 +8,7 @@ def get_corr_coeff(pred_imp_scores, videos, dataset, user_scores=None):
         for pred_imp_score,video in zip(pred_imp_scores,videos):
             true = np.mean(user_scores,axis=0)
             rho_coeff.append(spearmanr(pred_imp_score,true)[0])
-            tau_coeff.append(kendalltau(rankdata(pred_imp_score),rankdata(true))[0])
+            tau_coeff.append(kendalltau(pred_imp_score,true)[0])
     elif dataset=='TVSum':
         for pred_imp_score,video in zip(pred_imp_scores,videos):
             pred_imp_score = np.squeeze(pred_imp_score).tolist()
