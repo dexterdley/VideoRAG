@@ -10,20 +10,29 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn.functional as F
+import matplotlib.pyplot as plt
 from PIL import Image
 from tqdm import tqdm
 from scipy.interpolate import interp1d
 from scipy.stats import spearmanr, kendalltau
 from torch.utils.data import Dataset, DataLoader
 from decord import VideoReader, cpu
-
 from transformers import AutoModel, AutoTokenizer, AutoProcessor, AutoModelForImageTextToText
 try:
     from qwen_vl_utils import process_vision_info
 except ImportError:
     process_vision_info = None
 
-import matplotlib.pyplot as plt
+# Evaluation dependencies
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'csta'))
+try:
+    from generate_summary import generate_summary
+    from evaluation_metrics import get_corr_coeff
+    from utils import get_gt
+except ImportError:
+    generate_summary = get_corr_coeff = get_gt = None
+
+from measure_calibration import soft_expected_calibration_error
 
 warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", message=".*not a valid Python identifier.*")
@@ -360,128 +369,161 @@ def build_tvsum_manifest(root_dir):
     print(f"[DATA] TVSum: {len(resolved)} / {len(manifest)} videos resolved")
     return resolved
 
-# ──────────────────────── MAIN EXTRACTION ────────────────────────
-def extract_all(args):
-    os.makedirs(args.output_dir, exist_ok=True)
+# ──────────────────────── EVALUATION ────────────────────────
+def compute_video_metrics(yes_scores, no_scores, h5_path, h5_key, video_name, dataset_name, user_scores=None, use_advanced_scoring=False, epsilon=1e-8):
+    """
+    Calculates F-score, correlations, and ECE purely in-memory using VLM probabilities.
+    """
+    with h5py.File(h5_path, 'r') as f:
+        grp = f[h5_key]
+        features = grp['features'][()]       
+        cps = grp['change_points'][...]      
+        n_frames = int(grp['n_frames'][...])
+        picks = grp['picks'][...]            
+        gt_scores = grp['gtscore'][...]      
+        user_summaries = grp['user_summary'][...] if 'user_summary' in grp else [grp['gtsummary'][...]]
+
+    scores = yes_scores
+    scores_list = np.squeeze(scores).tolist()
+    summary = generate_summary([cps], [scores_list], [n_frames], [picks])[0]
+        
+    # 5. Evaluate F-score
+    f_scores = []
+    for user_summary in user_summaries:
+        min_len = min(len(summary), len(user_summary))
+        s = summary[:min_len]
+        u = user_summary[:min_len]
+        
+        intersection = np.sum(s * u)
+        sum_s = np.sum(s)
+        sum_u = np.sum(u)
+        
+        precision = intersection / sum_s if sum_s > 0 else 0
+        recall = intersection / sum_u if sum_u > 0 else 0
+        
+        f1 = (2 * precision * recall / (precision + recall)) if (precision + recall) > 0 else 0
+        f_scores.append(f1)
+    
+    # 6. Evaluate Correlations
+    if dataset_name == 'summe':
+        rho, tau = get_corr_coeff([summary], [h5_key], 'SumMe', user_summaries)
+    else:
+        rho, tau = get_corr_coeff([scores_list], [h5_key], 'TVSum', user_scores)
+
+    # 7. Evaluate Calibration (ECE)
+    scores_tensor = torch.tensor(scores, dtype=torch.float32)
+    gt_scores_tensor = torch.tensor(gt_scores, dtype=torch.float32)
+    global_gt_2d = torch.stack([1.0 - gt_scores_tensor, gt_scores_tensor], dim=1)
+    
+    p_yes_preds = torch.ones_like(scores_tensor)
+    ece = soft_expected_calibration_error(scores_tensor, p_yes_preds, global_gt_2d, num_bins=15)
+    
+    return {
+        "video": video_name,
+        "dataset": dataset_name,
+        "f_score": np.max(f_scores) if dataset_name == 'summe' else np.mean(f_scores),
+        "spearman": rho,
+        "kendall": tau,
+        "n_frames": n_frames,
+        "n_segments": len(cps),
+        "ECE": ece
+    }
+
+# ──────────────────────── ZERO-SHOT PIPELINE ────────────────────────
+def evaluate_splits(args):
+    # 1. Manifest building
     manifest = []
     if args.dataset in ("summe", "both"): manifest.extend(build_summe_manifest(args.root_dir))
     if args.dataset in ("tvsum", "both"): manifest.extend(build_tvsum_manifest(args.root_dir))
-    if args.max_videos > 0: manifest = manifest[:args.max_videos]
+    
+    if "tvsum" in args.split_file.lower() and get_gt is not None:
+        tvsum_user_scores = get_gt('TVSum')
+    else:
+        tvsum_user_scores = None
 
-    # ── Load model ──
+    summe_h5 = os.path.join(args.root_dir, "SumMe", "eccv16_dataset_summe_google_pool5.h5")
+    tvsum_h5 = os.path.join(args.root_dir, "TVSum", "eccv16_dataset_tvsum_google_pool5.h5")
+
+    # 2. Load VLM
     vlm_vars = load_vlm(args.model_path, args.model_type, device)
     model, processor, yes_id, no_id = vlm_vars[0], vlm_vars[2], vlm_vars[3], vlm_vars[4]
 
-    results = [] # Initialize results list
+    # 3. Load Splits
+    splits = []
+    if args.split_file and os.path.exists(args.split_file):
+        with open(args.split_file, 'r') as f:
+            splits = json.load(f)
+        print(f"Loaded {len(splits)} splits from {args.split_file}")
 
-    for idx, item in enumerate(tqdm(manifest, desc=f"{device}")):
-        t0 = time.time()
-        video_path, title = item["video_path"], item["title"]
-        
-        picks = item["picks"] 
-        gtscore = item["gtscore"]
-        n_frames = item["n_frames"]
+    all_split_results = []
 
-        out_name = f"{args.model_type}/{item['dataset']}_features_{item['video_name']}.npz"
-        out_path = os.path.join(args.output_dir, out_name)
-        
-        print(video_path)
-        print(f"\n  [{idx+1}/{len(manifest)}] {item['dataset']}/{item['video_name']} | \"{title}\"")
-        
-        dataset = VideoSegmentDataset(video_path, segment_length=32, width=896, height=672, picks=picks)
-        loader = DataLoader(dataset, batch_size=None, shuffle=False, num_workers=4, prefetch_factor=1)
-        
-        all_p_yes = []
-        all_p_no = []
-        all_logits_yes = []
-        all_logits_no = []
-        all_contrast = []
+    for split_idx, split in enumerate(splits):
+        print(f"\n==================== SPLIT {split_idx+1}/{len(splits)} ====================")
+        test_set = split['test_keys']
+        split_results = []
 
-        pbar = tqdm(loader, desc="Segments")
-        for i, (frames, start, end) in enumerate(pbar):
-            pbar.set_description(f"    Segment {i} ({start:.1f}s - {end:.1f}s)")
+        for video_id in test_set:
+            # Match video from manifest
+            item = next((m for m in manifest if m['h5_key'] == video_id), None)
+            if not item: continue
             
-            # FIXED: Ensure your inference functions return p_no, or calculate it.
-            if args.model_type == "minicpm":
-                p_yes, p_no, yes_logits, no_logits, contrast_conf  = minicpm_inference(frames, title, model, processor, yes_id, no_id)
-            else:
-                p_yes, p_no, yes_logits, no_logits, contrast_conf  = qwen_inference(frames, title, model, yes_id, no_id)
-
-            all_p_yes.append(p_yes.detach().cpu().float().numpy())
-            all_p_no.append(p_no.detach().cpu().float().numpy())
-            all_logits_yes.append(yes_logits.detach().cpu().float().numpy())
-            all_logits_no.append(no_logits.detach().cpu().float().numpy())
-            all_contrast.append(contrast_conf.detach().cpu().float().numpy())
-
-        raw_p_yes = np.concatenate(all_p_yes)
-        raw_p_no = np.concatenate(all_p_no)
-        raw_logits_yes = np.concatenate(all_logits_yes)
-        raw_logits_no = np.concatenate(all_logits_no)
-        raw_contrast = np.concatenate(all_contrast)
-
-        # Save
-        np.savez_compressed(
-            out_path,
-            p_yes=raw_p_yes,
-            p_no=raw_p_no,
-            logits_yes=raw_logits_yes,
-            logits_no=raw_logits_no,
-            contrast_conf=raw_contrast,
-            gtscore=gtscore,
-            picks=picks,
-            n_frames=np.array(n_frames),
-            title=np.array([title]),
-            video_name=np.array([item["video_name"]]),
-            dataset=np.array([item["dataset"]]),
-        )
-
-        elapsed = time.time() - t0
-        print(f"    [OK] Saved {out_name} ({len(picks)} frames, {elapsed:.1f}s)")
-        
-        # Quick per-video correlation with GT
-        if gtscore.max() > gtscore.min():
-            rho, _ = spearmanr(raw_p_yes, gtscore)
-            tau, _ = kendalltau(raw_p_yes, gtscore)
-            print(f"    [CORR] P(Yes) vs GT: Spearman rho={rho:.4f}, Kendall tau={tau:.4f}")
-
-            rho_c, _ = spearmanr(raw_contrast, gtscore)
-            tau_c, _ = kendalltau(raw_contrast, gtscore)
-            print(f"    [CORR] Contrast vs GT: Spearman rho={rho_c:.4f}, Kendall tau={tau_c:.4f}")
+            video_path, title, dataset_name = item["video_path"], item["title"], item["dataset"]
+            picks, h5_path = item["picks"], summe_h5 if dataset_name == "summe" else tvsum_h5
             
-            results.append({
-                "dataset": item["dataset"],
-                "video": item["video_name"],
-                "title": title,
-                "n_frames": len(picks),
-                "spearman_pyes": rho,
-                "kendall_pyes": tau,
-                "spearman_contrast": rho_c,
-                "kendall_contrast": tau_c,
-            })
+            print(f"\n[EVAL] {dataset_name}/{item['video_name']} | \"{title}\"")
+            
+            # Run Inference
+            dataset = VideoSegmentDataset(video_path, segment_length=32, width=896, height=672, picks=picks)
+            loader = DataLoader(dataset, batch_size=None, shuffle=False, num_workers=4, prefetch_factor=1)
 
-    # ── Summary table ──
-    if results:
-        print("\n" + "=" * 90)
-        print("RESULTS SUMMARY")
-        print("=" * 90)
-        df = pd.DataFrame(results)
-        print(df.to_string(index=False))
-        print("-" * 90)
+            all_p_yes, all_p_no = [], []
+            
+            pbar = tqdm(loader, desc="VLM Inference")
+            for frames, start, end in pbar:
+                if args.model_type == "minicpm":
+                    p_yes, p_no, _, _, _ = minicpm_inference(frames, title, model, processor, yes_id, no_id)
+                else:
+                    p_yes, p_no, _, _, _ = qwen_inference(frames, title, model, yes_id, no_id)
 
-        for ds in df["dataset"].unique():
-            sub = df[df["dataset"] == ds]
-            print(f"\n  [{ds.upper()}] Mean Spearman(P_yes)={sub['spearman_pyes'].mean():.4f}  "
-                  f"Mean Kendall(P_yes)={sub['kendall_pyes'].mean():.4f}  "
-                  f"Mean Spearman(contrast)={sub['spearman_contrast'].mean():.4f}  "
-                  f"Mean Kendall(contrast)={sub['kendall_contrast'].mean():.4f}")
+                all_p_yes.append(p_yes.detach().cpu().float().numpy())
+                all_p_no.append(p_no.detach().cpu().float().numpy())
 
-        # Save results CSV
-        csv_path = os.path.join(args.output_dir, f"{args.model_type}_extraction_results.csv")
-        df.to_csv(csv_path, index=False)
-        print(f"\n[RESULTS] Saved to {csv_path}")
+            raw_p_yes = np.concatenate(all_p_yes)
+            raw_p_no = np.concatenate(all_p_no)
+
+            res = compute_video_metrics(
+                yes_scores=raw_p_yes, 
+                no_scores=raw_p_no, 
+                h5_path=h5_path, 
+                h5_key=video_id, 
+                video_name=item['video_name'],
+                dataset_name=dataset_name,
+                user_scores=tvsum_user_scores,
+                use_advanced_scoring=False
+            )
+            
+            print(f"  --> F-Score: {res['f_score']:.4f} | Kendall: {res['kendall']:.4f} | Spearman: {res['spearman']:.4f}")
+            split_results.append(res)
+        
+        # Aggregate Split Metrics
+        split_df = pd.DataFrame(split_results)
+        print(f"\n--- SPLIT {split_idx+1} SUMMARY ---")
+        print(f"Mean F-Score: {split_df['f_score'].mean():.4f}")
+        print(f"Mean Kendall Tau: {split_df['kendall'].mean():.4f}")
+        print(f"Mean Spearman Rho: {split_df['spearman'].mean():.4f}")
+        all_split_results.append(split_df)
+
+    # 4. Final Aggregation
+    if all_split_results:
+        final_df = pd.concat(all_split_results)
+        print("\n" + "=" * 60)
+        print("FINAL CROSS-VALIDATION BENCHMARK SUMMARY")
+        print("=" * 60)
+        print(f"Average F-Score: {final_df['f_score'].mean():.4f}")
+        print(f"Average Kendall Tau: {final_df['kendall'].mean():.4f}")
+        print(f"Average Spearman Rho: {final_df['spearman'].mean():.4f}")
 
 # ──────────────────────── CLI ────────────────────────
-
 def resolve_model_path(mtype):
     if mtype == "qwen": return "Qwen/Qwen3.5-9B"
     candidates = ["./MiniCPM-V-2_6-int4", "/home/dexter/VideoRAG/.checkpoints/MiniCPM-V-2_6-int4"]
@@ -494,13 +536,11 @@ if __name__ == "__main__":
     parser.add_argument("--model_type", type=str, default="minicpm", choices=["minicpm", "qwen"])
     parser.add_argument("--dataset", type=str, default="both", choices=["summe", "tvsum", "both"])
     parser.add_argument("--root_dir", type=str, default=".")
-    parser.add_argument("--output_dir", type=str, default="./vslice_features")
     parser.add_argument("--model_path", type=str, default=None)
-    parser.add_argument("--max_videos", type=int, default=0)
-    parser.add_argument("--skip_existing", action="store_true", default=False)
+    parser.add_argument("--split_file", type=str, default="./dataset/summe_splits.json")
     args = parser.parse_args()
     
     if args.model_path is None:
         args.model_path = resolve_model_path(args.model_type)
     
-    extract_all(args)
+    evaluate_splits(args)

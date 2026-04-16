@@ -89,30 +89,42 @@ def load_vlm(model_path, model_type, device):
 
 # ─────────────────────── VIDEO DATASET ───────────────────────
 class VideoSegmentDataset(Dataset):
-    def __init__(self, video_path, segment_length=3, width=896, height=672):
+    def __init__(self, video_path, segment_length=32, width=896, height=672, picks=None):
         self.video_path = video_path
         self.segment_length = segment_length
         self.width, self.height = width, height
 
         vr = VideoReader(self.video_path, ctx=cpu(0))
         self.fps = vr.get_avg_fps()
-        self.step = max(1, int(self.fps * 1))
         self.duration = len(vr) / self.fps
-        self.scan_range = list(range(0, int(self.duration), segment_length))
+        num_frames = len(vr)
         del vr
 
-    def __len__(self): return len(self.scan_range)
+        if picks is not None:
+            self.picks = picks
+        else:
+            # Fallback: one pick per second if no picks provided
+            self.picks = np.arange(0, num_frames, max(1, int(self.fps)))
+
+        # Chunk picks into segments
+        self.chunks = [self.picks[i : i + segment_length] for i in range(0, len(self.picks), segment_length)]
+
+    def __len__(self): 
+        return len(self.chunks)
 
     def __getitem__(self, idx):
-        start_sec = self.scan_range[idx]
-        end_sec = min(start_sec + self.segment_length, self.duration)
-        vr = VideoReader(self.video_path, ctx=cpu(0), width=self.width, height=self.height)
-        start_frame = int(start_sec * self.fps)
-        end_frame = min(int(end_sec * self.fps), len(vr) - 1)
-        indices = list(range(start_frame, end_frame, self.step))
-        if not indices: indices = [start_frame]
-        batch_npy = vr.get_batch(indices).asnumpy()
+        chunk = self.chunks[idx]
+        vr = VideoReader(self.video_path, ctx=cpu(0), num_threads=1, width=self.width, height=self.height)
+        
+        # Ensure indices are within bounds
+        safe_indices = [int(min(p, len(vr)-1)) for p in chunk]
+        batch_npy = vr.get_batch(safe_indices).asnumpy()
         frames = [Image.fromarray(f, mode='RGB') for f in batch_npy]
+        
+        # Calculate start and end seconds for logging
+        start_sec = chunk[0] / self.fps
+        end_sec = chunk[-1] / self.fps
+        
         return frames, start_sec, end_sec
 
 
@@ -379,7 +391,7 @@ def extract_all(args):
         print(video_path)
         print(f"\n  [{idx+1}/{len(manifest)}] {item['dataset']}/{item['video_name']} | \"{title}\"")
         
-        dataset = VideoSegmentDataset(video_path, segment_length=32, width=896, height=672)
+        dataset = VideoSegmentDataset(video_path, segment_length=32, width=896, height=672, picks=picks)
         loader = DataLoader(dataset, batch_size=None, shuffle=False, num_workers=4, prefetch_factor=1)
         
         all_p_yes = []

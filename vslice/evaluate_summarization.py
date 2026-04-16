@@ -32,9 +32,12 @@ from scipy.ndimage import uniform_filter1d
 # Import CSTA evaluation functions
 import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'csta'))
-from generate_summary import generate_summary
-from evaluation_metrics import get_corr_coeff
-from utils import get_gt
+try:
+    from generate_summary import generate_summary
+    from evaluation_metrics import get_corr_coeff
+    from utils import get_gt
+except ImportError:
+    generate_summary = get_corr_coeff = get_gt = None
 
 epsilon = 1e-8
 
@@ -75,22 +78,6 @@ def knapsack_dp(values, weights, capacity):
             curr_w -= int(weights[i-1])
     return picks
 
-def temporal_process_features(features):
-    features = torch.tensor(features, dtype=torch.float32)
-    shifted_back = torch.roll(features, shifts=1, dims=0)
-    delta_back = features - shifted_back
-    delta_back[0] = 0.0
-
-    shifted_fwd = torch.roll(features, shifts=-1, dims=0)
-    delta_fwd = features - shifted_fwd #(F_t+1 -  F_t)
-    delta_fwd[-1] = 0.0
-
-    delta_net = delta_fwd - delta_back
-
-    temporal_motion = torch.cat([delta_back, delta_fwd, delta_net], dim=1)
-    raw_motion = torch.linalg.norm(temporal_motion, dim=1)
-    return raw_motion.numpy()
-
 def temporal_process_features(features, window_size=15):
     """
     Calculates sliding window motion using back, forward, and net deltas.
@@ -116,17 +103,15 @@ def temporal_process_features(features, window_size=15):
     delta_net[-1] = 0.0
 
     # Combine all motion components
-    # We sum them first, then apply the sliding window to stabilize the signal
     combined_motion = delta_back + delta_fwd + delta_net
     
     # Apply sliding window average to smooth out high-frequency noise/jitter
-    motion_flow = uniform_filter1d(combined_motion.numpy(), size=window_size)
-    
-    return motion_flow
+    #motion_flow = uniform_filter1d(combined_motion.numpy(), size=window_size)
+    return combined_motion.numpy()
 
 # TO BEAT (SUMME): 0.256 0.285
 # TVSUM 0.257 0.361
-def evaluate_video(feature_path, h5_path, h5_key=None, user_scores=None, use_advanced_scoring=True, epsilon=1e-8):
+def evaluate_video(feature_path, h5_path, h5_key=None, user_scores=None, use_advanced_scoring=False, epsilon=1e-8):
     """
     Calculates F-score, correlations, and ECE for a single video.
     user_scores: for TVSum, per-video list of user annotations from ydata-anno.tsv
@@ -166,7 +151,7 @@ def evaluate_video(feature_path, h5_path, h5_key=None, user_scores=None, use_adv
     yes_scores = data['p_yes']
     no_scores = data['p_no']
 
-    log_odds = np.log(yes_scores + epsilon) - np.log(no_scores + epsilon) #Importance sampling? can use motion features too
+    yes_scores = F.sigmoid(torch.tensor(data['logits_yes']) - torch.tensor(data['logits_no'])).numpy() #Importance sampling? can use motion features too
 
     if use_advanced_scoring:
         # Motion processing
@@ -190,8 +175,8 @@ def evaluate_video(feature_path, h5_path, h5_key=None, user_scores=None, use_adv
         relevance_weight = 1.0 - F.cosine_similarity(features_tensor, global_feat_tensor)
         relevance_weight = relevance_weight / (torch.mean(relevance_weight) + epsilon)
 
-        final_scores = yes_scores * motion_weight * relevance_weight.numpy()
-        scores = final_scores / (np.max(final_scores) + epsilon)
+        final_scores = yes_scores * motion_weight #* relevance_weight.numpy()
+        scores = (final_scores - np.min(final_scores)) /(np.max(final_scores) - np.min(final_scores))
     else:
         # Use raw 'p_yes' as the importance score
         scores = yes_scores
@@ -254,8 +239,10 @@ def main():
                         help="Optional JSON split file (SumMe/TVSum standard splits)")
     args = parser.parse_args()
 
-    # Load per-user annotations for TVSum correlation
-    tvsum_user_scores = get_gt('TVSum')
+    if "tvsum" in args.split_file.lower() and get_gt is not None:
+        tvsum_user_scores = get_gt('TVSum')
+    else:
+        tvsum_user_scores = None
 
     if "summe" in args.split_file:
         manifest = build_summe_manifest(args.root_dir)
