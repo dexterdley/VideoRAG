@@ -22,22 +22,24 @@ import numpy as np
 import argparse
 import pandas as pd
 from tqdm import tqdm
-from extract_features import build_summe_manifest, build_tvsum_manifest
 from measure_calibration import soft_expected_calibration_error, reliability_plot, bin_strength_plot
 from scipy.signal import find_peaks, peak_widths
 from sklearn.cluster import KMeans
 from sklearn.preprocessing import StandardScaler
 from scipy.ndimage import uniform_filter1d
 
+from vslice_utils.dataloader import build_summe_manifest, build_tvsum_manifest
+
 # Import CSTA evaluation functions
 import sys
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'csta'))
-try:
-    from generate_summary import generate_summary
-    from evaluation_metrics import get_corr_coeff
-    from utils import get_gt
-except ImportError:
-    generate_summary = get_corr_coeff = get_gt = None
+# 1. Use absolute paths so it ALWAYS finds the folder regardless of how you run the script
+csta_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'csta'))
+sys.path.insert(0, csta_path)
+
+# 2. REMOVE the try/except block so Python tells us exactly what is actually failing
+from generate_summary import generate_summary
+from evaluation_metrics import get_corr_coeff
+from utils import get_gt
 
 epsilon = 1e-8
 
@@ -151,7 +153,7 @@ def evaluate_video(feature_path, h5_path, h5_key=None, user_scores=None, use_adv
     yes_scores = data['p_yes']
     no_scores = data['p_no']
 
-    yes_scores = F.sigmoid(torch.tensor(data['logits_yes']) - torch.tensor(data['logits_no'])).numpy() #Importance sampling? can use motion features too
+    #yes_scores = F.sigmoid(torch.tensor(data['logits_yes']) - torch.tensor(data['logits_no'])).numpy() #Importance sampling? can use motion features too
 
     if use_advanced_scoring:
         # Motion processing
