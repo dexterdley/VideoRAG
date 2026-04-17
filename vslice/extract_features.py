@@ -17,15 +17,8 @@ from scipy.stats import spearmanr, kendalltau
 from torch.utils.data import Dataset, DataLoader
 from decord import VideoReader, cpu
 
+from vslice_utils.models import load_vlm, minicpm_inference, qwen_inference
 from vslice_utils.dataloader import build_summe_manifest, build_tvsum_manifest, VideoSegmentDataset
-
-from transformers import AutoModel, AutoTokenizer, AutoProcessor, AutoModelForImageTextToText
-try:
-    from qwen_vl_utils import process_vision_info
-except ImportError:
-    process_vision_info = None
-
-import matplotlib.pyplot as plt
 
 warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", message=".*not a valid Python identifier.*")
@@ -40,132 +33,7 @@ if sys.platform == "win32":
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
     sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
 
-#  CUDA_VISIBLE_DEVICES=7 python ./VSLICE/extract_features.py --model_type="qwen" --dataset="both" --root_dir="/home/dexter/LLaVA-VLS"
-
-# ──────────────────────── MODEL LOADING ────────────────────────
-
-class QwenVLWrapper:
-    def __init__(self, model, processor):
-        self.model = model
-        self.processor = processor
-
-def load_vlm(model_path, model_type, device):
-    """Load specified VLM and return (model, tokenizer, processor, yes_id, no_id)."""
-    dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
-    print(f"[{device}] Loading {model_type} from {model_path}...")
-
-    if model_type == "minicpm":
-        model = AutoModel.from_pretrained(
-            model_path,
-            trust_remote_code=True,
-            dtype=dtype,
-            device_map=device,
-            attn_implementation="eager",
-        ).eval()
-        tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
-        processor = AutoProcessor.from_pretrained(model_path, trust_remote_code=True)
-        
-        yes_id = tokenizer.encode("Yes", add_special_tokens=False)[0]
-        no_id = tokenizer.encode("No", add_special_tokens=False)[0]
-        print(f"[{device}] [OK] MiniCPM Loaded (Yes={yes_id}, No={no_id})")
-        return model, tokenizer, processor, yes_id, no_id
-
-    elif model_type == "qwen":
-        model = AutoModelForImageTextToText.from_pretrained(
-            model_path, 
-            device_map="auto", 
-            dtype=dtype,
-            _attn_implementation="flash_attention_2",
-            trust_remote_code=True
-        ).eval()
-        processor = AutoProcessor.from_pretrained(model_path, pad_token='<|endoftext|>')
-        
-        # In Qwen, 'Yes' and 'No' IDs
-        temp_ids = processor.tokenizer(["Yes", "No"], add_special_tokens=False).input_ids
-        yes_id = temp_ids[0][0]
-        no_id = temp_ids[1][0]
-        
-        print(f"[{device}] [OK] Qwen3.5 Loaded (Yes={yes_id}, No={no_id})")
-        # Reuse same structure for convenience
-        return QwenVLWrapper(model, processor), processor.tokenizer, processor, yes_id, no_id
-
-
-# ─────────────────────── VLM INFERENCE ───────────────────────
-
-def minicpm_inference(images, title, model, processor, yes_id, no_id):
-    prompts_lists = []
-    input_images_lists = []
-    system_prompt = "You are an expert video analyst. Strictly answer only Yes or No."
-    formatted_prompt = f"Does this image contain or represent: '{title}'?"
-
-    for img in images:
-        msgs = [
-            {'role': 'system', 'content': system_prompt},
-            {'role': 'user', 'content': f"(<image>./</image>)\n{formatted_prompt}"}
-        ]
-        prompt_str = processor.tokenizer.apply_chat_template(
-            msgs, tokenize=False, add_generation_prompt=True
-        )
-        prompts_lists.append(prompt_str)
-        input_images_lists.append([img])
-
-    inputs = processor(
-        prompts_lists,
-        input_images_lists,
-        max_slice_nums=1,
-        use_image_id=False,
-        return_tensors="pt",
-        max_length=2048
-    ).to(device)
-
-    if "position_ids" not in inputs:
-        batch_size, seq_len = inputs["input_ids"].shape
-        inputs["position_ids"] = torch.arange(seq_len, dtype=torch.long, device=device).unsqueeze(0).expand(batch_size, -1)
-
-    if "image_sizes" in inputs:
-        inputs.pop("image_sizes")
-
-    with torch.inference_mode():
-        outputs = model(inputs, attention_mask=inputs.get("attention_mask"))
-        logits = outputs.logits[:, -1, :]
-        yes_logits, no_logits = logits[:, yes_id], logits[:, no_id]
-        binary_probs = F.softmax(torch.stack([yes_logits, no_logits], dim=-1), dim=-1)
-        contrast = F.relu(binary_probs[:, 0] - binary_probs[:, 1])
-    return binary_probs[:, 0], binary_probs[:, 1], yes_logits, no_logits, contrast.pow(2)
-
-def qwen_inference(images, title, wrapper, yes_id, no_id):
-    if process_vision_info is None:
-        raise ImportError("qwen_vl_utils is required for Qwen inference.")
-    
-    system_prompt = "You are an expert video analyst. Strictly answer only Yes or No."
-    formatted_prompt = f"Does this image contain or represent: '{title}'?"
-    
-    probs_yes = []
-    probs_no = []
-    confs_all = []
-    
-    for img in images:
-        msgs = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": [{"type": "image", "image": img}, {"type": "text", "text": formatted_prompt}]}
-        ]
-        text = wrapper.processor.apply_chat_template(msgs, tokenize=False, enable_thinking=False, add_generation_prompt=True)
-        image_inputs, video_inputs = process_vision_info(msgs)
-        inputs = wrapper.processor(text=[text], images=image_inputs, videos=video_inputs, padding=True, return_tensors="pt").to(device)
-        
-        with torch.inference_mode():
-            outputs = wrapper.model(**inputs)
-            logits = outputs.logits[:, -1, :]
-
-            yes_logits, no_logits = logits[:, yes_id], logits[:, no_id]
-            binary_probs = F.softmax(torch.stack([yes_logits, no_logits], dim=-1), dim=-1)
-            
-            probs_yes.append(binary_probs[:, 0])
-            probs_no.append(binary_probs[:, 1])
-            confs_all.append(F.relu(binary_probs[:, 0] - binary_probs[:, 1]).pow(2))
-    
-    return torch.cat(probs_yes), torch.cat(probs_no), yes_logits, no_logits, torch.cat(confs_all)
-
+#  CUDA_VISIBLE_DEVICES=7 python ./vslice/extract_features.py --model_type="qwen" --dataset="both" --root_dir="/home/dexter/LLaVA-VLS"
 
 # ──────────────────────── MAIN EXTRACTION ────────────────────────
 def extract_all(args):

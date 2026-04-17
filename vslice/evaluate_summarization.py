@@ -22,13 +22,13 @@ import numpy as np
 import argparse
 import pandas as pd
 from tqdm import tqdm
-from measure_calibration import soft_expected_calibration_error, reliability_plot, bin_strength_plot
 from scipy.signal import find_peaks, peak_widths
 from sklearn.cluster import KMeans
 from sklearn.preprocessing import StandardScaler
 from scipy.ndimage import uniform_filter1d
 
 from vslice_utils.dataloader import build_summe_manifest, build_tvsum_manifest
+from vslice_utils.measure_calibration import soft_expected_calibration_error, reliability_plot, bin_strength_plot
 
 # Import CSTA evaluation functions
 import sys
