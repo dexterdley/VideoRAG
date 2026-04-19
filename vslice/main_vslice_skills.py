@@ -6,6 +6,7 @@ import argparse
 import time
 import warnings
 import h5py
+import random
 import numpy as np
 import pandas as pd
 import torch
@@ -20,6 +21,7 @@ from decord import VideoReader, cpu
 from vslice_utils.models import load_vlm, minicpm_extract_title_and_keywords, qwen_extract_title_and_keywords, minicpm_inference, qwen_inference
 from vslice_utils.dataloader import build_summe_manifest, build_tvsum_manifest, VideoSegmentDataset
 from vslice_utils.measure_calibration import soft_expected_calibration_error
+from vslice_utils.metrics import set_seed
 
 # Evaluation dependencies
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'csta'))
@@ -37,6 +39,7 @@ torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
+set_seed(42)
 
 # Fix Windows console encoding for non-ASCII characters
 if sys.platform == "win32":
@@ -45,13 +48,45 @@ if sys.platform == "win32":
 
 #  CUDA_VISIBLE_DEVICES=7 python vslice/main_vslice_skills.py --dataset summe --split_file ./dataset/summe_splits.json --model_type minicpm --root_dir="/home/dexter/LLaVA-VLS"
 
+"""
+============================================================
+FINAL BENCHMARK SUMMARY (SPLIT-BASED: ./dataset/summe_splits.json)
+============================================================
+Average F-Score: 0.4600
+Average Kendall Tau: 0.1500
+Average Spearman Rho: 0.1665
+
+============================================================
+FINAL BENCHMARK SUMMARY (SPLIT-BASED: ./dataset/tvsum_splits.json)
+============================================================
+Average F-Score: 0.5531
+Average Kendall Tau: 0.2152
+Average Spearman Rho: 0.2738
+
+============================================================
+FINAL CROSS-VALIDATION BENCHMARK SUMMARY (WITH VISUAL SKILLS), ./dataset/summe_splits.json)
+============================================================
+Average F-Score: 0.5178
+Average Kendall Tau: 0.2028
+Average Spearman Rho: 0.2260
+
+============================================================
+FINAL CROSS-VALIDATION BENCHMARK SUMMARY (WITH VISUAL SKILLS), ./dataset/tvsum_splits.json)
+============================================================
+Average F-Score: 0.5800
+Average Kendall Tau: 0.2301
+Average Spearman Rho: 0.2906
+
+"""
+
 # ──────────────────────── EVALUATION ────────────────────────
-def compute_video_metrics(yes_scores, no_scores, h5_path, h5_key, video_name, dataset_name, eval_key=None, user_scores=None, use_advanced_scoring=False, epsilon=1e-8):
+def compute_video_metrics(yes_scores, no_scores, h5_path, h5_key, video_name, dataset_name, user_scores=None, use_advanced_scoring=False, epsilon=1e-8):
     """
-    Calculates F-score, correlations, and ECE purely in-memory using VLM probabilities.
+    Calculates F-score, correlations, and ECE using VLM probabilities.
     """
     with h5py.File(h5_path, 'r') as f:
         grp = f[h5_key]
+        features = grp['features'][()]       
         cps = grp['change_points'][...]      
         n_frames = int(grp['n_frames'][...])
         picks = grp['picks'][...]            
@@ -83,9 +118,7 @@ def compute_video_metrics(yes_scores, no_scores, h5_path, h5_key, video_name, da
     if dataset_name == 'summe':
         rho, tau = get_corr_coeff([summary], [h5_key], 'SumMe', user_summaries)
     else:
-        # Use eval_key (e.g. video_1) instead of h5_key for TVSum CSTA metrics
-        eval_id = eval_key if eval_key else h5_key
-        rho, tau = get_corr_coeff([scores_list], [eval_id], 'TVSum', user_scores)
+        rho, tau = get_corr_coeff([scores_list], [h5_key], 'TVSum', user_scores)
 
     # 7. Evaluate Calibration (ECE)
     scores_tensor = torch.tensor(scores, dtype=torch.float32)
@@ -110,8 +143,13 @@ def compute_video_metrics(yes_scores, no_scores, h5_path, h5_key, video_name, da
 def evaluate_splits(args):
     # 1. Manifest building
     manifest = []
-    if args.dataset in ("summe", "both"): manifest.extend(build_summe_manifest(args.root_dir))
-    if args.dataset in ("tvsum", "both"): manifest.extend(build_tvsum_manifest(args.root_dir))
+    if args.dataset in ("summe", "both"): 
+        manifest.extend(build_summe_manifest(args.root_dir))
+        dataset_name = "summe"
+
+    if args.dataset in ("tvsum", "both"): 
+        manifest.extend(build_tvsum_manifest(args.root_dir))
+        dataset_name = "tvsum"
     
     summe_h5 = os.path.join(args.root_dir, "SumMe", "eccv16_dataset_summe_google_pool5.h5")
     tvsum_h5 = os.path.join(args.root_dir, "TVSum", "eccv16_dataset_tvsum_google_pool5.h5")
@@ -133,24 +171,37 @@ def evaluate_splits(args):
         print(f"\n==================== SPLIT {split_idx+1}/{len(splits)} ====================")
         
         # Track "Good and Bad Skills Pool" for the current split
-        split_out_dir = os.path.join(args.output_dir, f"skills_split_{split_idx}")
+        split_out_dir = os.path.join(args.output_dir, f"{args.model_type}_skills/{dataset_name}_skills_split_{split_idx}")
+        
         img_dir = os.path.join(split_out_dir, "images")
         os.makedirs(split_out_dir, exist_ok=True)
         os.makedirs(img_dir, exist_ok=True)
 
-        md_content = [f"# Split {split_idx} - Visual Skills Report"]
-        md_good_skills = [f"# Split {split_idx} - Good Visual Skills"]
-        md_bad_skills = [f"# Split {split_idx} - Bad Visual Skills"]
+        good_skills_json_path = os.path.join(split_out_dir, f"{args.model_type}_good_skills_data.json")
+        bad_skills_json_path = os.path.join(split_out_dir, f"{args.model_type}_bad_skills_data.json")
 
+        good_skills_pool, bad_skills_pool = [], []
         train_set = split.get('train_keys', [])
-        # 1. Training Phase: Acquire Skills
-        if train_set:
+
+        # --- CHECK CACHE ---
+        if os.path.exists(good_skills_json_path) and os.path.exists(bad_skills_json_path):
+            print(f"[*] Found cached skills for Split {split_idx}. Skipping extraction phase!")
+            with open(good_skills_json_path, 'r', encoding='utf-8') as f:
+                good_skills_pool = json.load(f)
+            with open(bad_skills_json_path, 'r', encoding='utf-8') as f:
+                bad_skills_pool = json.load(f)
+        else:
+            # 1. Training Phase: Acquire Skills
+            md_content = [f"# Split {split_idx} - Visual Skills Report"]
+            md_good_skills = [f"# Split {split_idx} - Good Visual Skills"]
+            md_bad_skills = [f"# Split {split_idx} - Bad Visual Skills"]
+
             print(f"Acquiring visual skills from {len(train_set)} training videos...")
             for video_id in tqdm(train_set, desc="Training"):
                 item = next((m for m in manifest if m['h5_key'] == video_id), None)
                 if not item: continue
                 
-                video_path, title, dataset_name = item["video_path"], item["title"], item["dataset"]
+                video_path, title, dataset_name_item = item["video_path"], item["title"], item["dataset"]
                 picks, gtscore = item["picks"], item["gtscore"]
                 
                 # Run Inference to identify strengths/weaknesses
@@ -178,10 +229,13 @@ def evaluate_splits(args):
 
                 raw_p_yes = np.concatenate(all_p_yes)
                 error = np.abs(raw_p_yes - gtscore)
-                ranked_indices = np.argsort(error)
-                
-                # Acquire top-1 best and top-1 worst as "skills"
-                best_idx, worst_idx = ranked_indices[0], ranked_indices[-1]
+
+                tp_scores = gtscore * raw_p_yes # Measure TP
+                best_idx = np.argmax(tp_scores)
+
+                fp_scores = (1.0 - gtscore) * raw_p_yes # Measure FP
+                worst_idx = np.argmax(fp_scores)
+
                 safe_title = title.replace(" ", "_").replace("/", "_")
 
                 # --- Calculate exact timestamps ---
@@ -192,11 +246,27 @@ def evaluate_splits(args):
                 
                 # Save Best Image
                 good_img_name = f"good_{video_id}_{safe_title}.jpg"
-                all_frames_for_video[best_idx].save(os.path.join(img_dir, good_img_name))
+                good_img_path = os.path.join(img_dir, good_img_name)
+                all_frames_for_video[best_idx].save(good_img_path)
                 
                 # Save Worst Image
                 bad_img_name = f"bad_{video_id}_{safe_title}.jpg"
-                all_frames_for_video[worst_idx].save(os.path.join(img_dir, bad_img_name))
+                bad_img_path = os.path.join(img_dir, bad_img_name)
+                all_frames_for_video[worst_idx].save(bad_img_path)
+
+                good_skills_pool.append({
+                    "image_path": good_img_path,
+                    "title": cleaned_title,
+                    "keywords": keywords,
+                    "time": best_time
+                })
+                
+                bad_skills_pool.append({
+                    "image_path": bad_img_path,
+                    "title": cleaned_title,
+                    "keywords": keywords,
+                    "time": worst_time
+                })
 
                 # Append to Markdown blocks
                 md_good_skills.append(f"**Video:** {title} | **Time:** {best_time} | **GT:** {gtscore[best_idx]:.3f} | **Pred:** {raw_p_yes[best_idx]:.3f} | **Error:** {error[best_idx]:.3f}")
@@ -208,18 +278,28 @@ def evaluate_splits(args):
             # Combine and write the final Markdown file
             md_content.extend(md_good_skills)
             md_content.extend(md_bad_skills)
-            
-            with open(os.path.join(split_out_dir, "skills_visual_report.md"), 'w', encoding='utf-8') as f:
+
+            # Write files outside the train_set loop but inside the split loop
+            with open(os.path.join(split_out_dir, f"{args.model_type}_skills_visual_report.md"), 'w', encoding='utf-8') as f:
                 f.write("\n".join(md_content))
-            
-            print(f"  -> Saved visual report to {split_out_dir}")
+
+            with open(good_skills_json_path, 'w', encoding='utf-8') as f:
+                json.dump(good_skills_pool, f, indent=4)
+
+            with open(bad_skills_json_path, 'w', encoding='utf-8') as f:
+                json.dump(bad_skills_pool, f, indent=4)
+                
+            print(f"  -> Saved all skills data and visual report to {split_out_dir}")
             print(f"[SKILLS] Acquired {len(md_content)} skills.")
 
         # 2. Testing Phase: Use Skills for Reprompting
         print(f"\nEvaluating test set with acquired skills...")
         test_set = split['test_keys']
         split_results = []
-        user_scores = get_gt('TVSum', args.root_dir) if args.dataset in ('tvsum', 'both') else None
+        if "tvsum" in args.split_file.lower() and get_gt is not None:
+            tvsum_user_scores = get_gt('TVSum')
+        else:
+            tvsum_user_scores = None
 
         for video_id in test_set:
             item = next((m for m in manifest if m['h5_key'] == video_id), None)
@@ -231,38 +311,41 @@ def evaluate_splits(args):
             print(f"\n[EVAL] {dataset_name}/{item['video_name']} | \"{title}\"")
             
             # Select a small random subset of skills for this test video
-            import random
-            current_skills = random.sample(skills_pool, min(len(skills_pool), 2)) if skills_pool else None
+            good_skills = random.sample(good_skills_pool, 1)
+            bad_skills = random.sample(bad_skills_pool, 1)
+            skills = good_skills + bad_skills
 
             # Run Inference w/ Skills reprompting
             dataset = VideoSegmentDataset(video_path, segment_length=32, width=896, height=672, picks=picks)
             loader = DataLoader(dataset, batch_size=None, shuffle=False, num_workers=4)
 
+            # Extract Title Keywords
+            if args.model_type == "minicpm":
+                cleaned_title, keywords = minicpm_extract_title_and_keywords(title, model, processor)
+            else:
+                cleaned_title, keywords = qwen_extract_title_and_keywords(title, model)
+
             all_p_yes, all_p_no = [], []
             pbar = tqdm(loader, desc="Testing w/ Skills")
             for frames, _, _ in pbar:
                 if args.model_type == "minicpm":
-                    p_yes, p_no, _, _, _ = minicpm_inference(frames, title, model, processor, yes_id, no_id, skills=current_skills)
+                    p_yes, p_no, _, _, _ = minicpm_inference(frames, cleaned_title, keywords, model, processor, yes_id, no_id, skills=skills)
                 else:
-                    p_yes, p_no, _, _, _ = qwen_inference(frames, title, model, yes_id, no_id, skills=current_skills)
+                    p_yes, p_no, _, _, _ = qwen_inference(frames, cleaned_title, keywords, model, yes_id, no_id, skills=skills)
 
                 all_p_yes.append(p_yes.detach().cpu().float().numpy())
                 all_p_no.append(p_no.detach().cpu().float().numpy())
 
             raw_p_yes, raw_p_no = np.concatenate(all_p_yes), np.concatenate(all_p_no)
 
-            # If TVSum, use mapped eval_key (video_N) for CSTA correlation function
-            eval_key = f"video_{item['tvsum_idx']}" if dataset_name == 'tvsum' else None
-
             res = compute_video_metrics(
                 yes_scores=raw_p_yes, 
                 no_scores=raw_p_no, 
                 h5_path=h5_path, 
                 h5_key=video_id, 
-                eval_key=eval_key,
                 video_name=item['video_name'],
                 dataset_name=dataset_name, 
-                user_scores=user_scores,
+                user_scores=tvsum_user_scores,
                 use_advanced_scoring=True
             )
             
@@ -282,7 +365,7 @@ def evaluate_splits(args):
     if all_split_results:
         final_df = pd.concat(all_split_results)
         print("\n" + "=" * 60)
-        print("FINAL CROSS-VALIDATION BENCHMARK SUMMARY (WITH VISUAL SKILLS)")
+        print(f"FINAL CROSS-VALIDATION BENCHMARK SUMMARY (WITH VISUAL SKILLS), {args.split_file})")
         print("=" * 60)
         print(f"Average F-Score: {final_df['f_score'].mean():.4f}")
         print(f"Average Kendall Tau: {final_df['kendall'].mean():.4f}")
@@ -301,7 +384,7 @@ if __name__ == "__main__":
     parser.add_argument("--model_type", type=str, default="minicpm", choices=["minicpm", "qwen"])
     parser.add_argument("--dataset", type=str, default="both", choices=["summe", "tvsum", "both"])
     parser.add_argument("--root_dir", type=str, default=".")
-    parser.add_argument("--output_dir", type=str, default="./vslice_features/skills/")
+    parser.add_argument("--output_dir", type=str, default="./vslice_features/")
     parser.add_argument("--model_path", type=str, default=None)
     parser.add_argument("--split_file", type=str, default="./dataset/summe_splits.json")
     args = parser.parse_args()

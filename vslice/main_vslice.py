@@ -20,6 +20,7 @@ from decord import VideoReader, cpu
 from vslice_utils.models import load_vlm, minicpm_extract_title_and_keywords, qwen_extract_title_and_keywords, minicpm_inference, qwen_inference
 from vslice_utils.dataloader import build_summe_manifest, build_tvsum_manifest, VideoSegmentDataset
 from vslice_utils.measure_calibration import soft_expected_calibration_error
+from vslice_utils.metrics import set_seed
 
 # Evaluation dependencies
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'csta'))
@@ -37,6 +38,7 @@ torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
+set_seed(42)
 
 # Fix Windows console encoding for non-ASCII characters
 if sys.platform == "win32":

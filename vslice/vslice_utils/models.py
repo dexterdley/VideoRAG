@@ -1,5 +1,6 @@
 import torch
 import torch.nn.functional as F
+from PIL import Image
 from transformers import AutoModel, AutoTokenizer, AutoProcessor, AutoModelForImageTextToText
 from qwen_vl_utils import process_vision_info
 
@@ -140,22 +141,51 @@ def qwen_extract_title_and_keywords(raw_title, wrapper):
         
     return cleaned_title, keywords
 
-def minicpm_inference(images, title, keywords, model, processor, yes_id, no_id):
+def minicpm_inference(images, title, keywords, model, processor, yes_id, no_id, skills=None):
     prompts_lists = []
     input_images_lists = []
     system_prompt = "You are an expert video editor. Strictly answer only Yes or No."
     formatted_prompt = f"Does this image represent the core message of {keywords} in the video context of '{title}'?"
+        
+    # 1. Build the In-Context Learning (ICL) Prefix
+    icl_text = ""
+    icl_images = []
     
+    if skills:
+        icl_text += "Review these past evaluations to calibrate your judgment:\n"
+        for skill in skills:
+            # Check the filename to see if this was a TP (Good) or FP (Bad) example
+            is_good = "good_" in skill['image_path'].lower()
+            
+            if is_good:
+                label = "Yes"
+                explanation = "Yes, this frame provides a good summary."
+            else:
+                label = "No"
+                explanation = "You incorrectly guessed Yes for this in the past. This is actually a boring or irrelevant shot and is No."
+            
+            # Add the text and image placeholder for the example
+            icl_text += f"Example Frame (<image>./</image>) from '{skill['title']}': Should this be in the highlight reel? {label}. ({explanation})\n"
+            
+            # Load the actual image into memory
+            icl_images.append(Image.open(skill['image_path']).convert("RGB"))
+        
+        icl_text += "\nNow, keeping past mistakes in mind, evaluate the following new frame.\n"
+
     for img in images:
+        full_user_text = icl_text + f"(<image>./</image>)\n{formatted_prompt}"
+        
         msgs = [
             {'role': 'system', 'content': system_prompt},
-            {'role': 'user', 'content': f"(<image>./</image>)\n{formatted_prompt}"}
+            {'role': 'user', 'content': full_user_text} # Pass the combined text here
         ]
         prompt_str = processor.tokenizer.apply_chat_template(
             msgs, tokenize=False, add_generation_prompt=True
         )
         prompts_lists.append(prompt_str)
-        input_images_lists.append([img])
+        
+        current_input_images = icl_images + [img] 
+        input_images_lists.append(current_input_images)
 
     inputs = processor(
         prompts_lists,
@@ -163,7 +193,7 @@ def minicpm_inference(images, title, keywords, model, processor, yes_id, no_id):
         max_slice_nums=1,
         use_image_id=False,
         return_tensors="pt",
-        max_length=2048
+        max_length=1024
     ).to(device)
 
     if "position_ids" not in inputs:
@@ -181,7 +211,7 @@ def minicpm_inference(images, title, keywords, model, processor, yes_id, no_id):
         contrast = F.relu(binary_probs[:, 0] - binary_probs[:, 1])
     return binary_probs[:, 0], binary_probs[:, 1], yes_logits, no_logits, contrast.pow(2)
 
-def qwen_inference(images, title, keywords, wrapper, yes_id, no_id):
+def qwen_inference(images, title, keywords, wrapper, yes_id, no_id, skills=None):
     if process_vision_info is None:
         raise ImportError("qwen_vl_utils is required for Qwen inference.")
     
@@ -194,6 +224,31 @@ def qwen_inference(images, title, keywords, wrapper, yes_id, no_id):
     probs_no = []
     confs_all = []
     
+    # 1. Build the In-Context Learning (ICL) Prefix
+    icl_text = ""
+    icl_images = []
+    
+    if skills:
+        icl_text += "Review these past evaluations to calibrate your judgment:\n"
+        for skill in skills:
+            # Check the filename to see if this was a TP (Good) or FP (Bad) example
+            is_good = "good_" in skill['image_path'].lower()
+            
+            if is_good:
+                label = "Yes"
+                explanation = "Yes, this frame provides a good summary."
+            else:
+                label = "No"
+                explanation = "You incorrectly guessed Yes for this in the past. This is actually a boring or irrelevant shot and is No."
+            
+            # Add the text and image placeholder for the example
+            icl_text += f"Example Frame (<image>./</image>) from '{skill['title']}': Should this be in the highlight reel? {label}. ({explanation})\n"
+            
+            # Load the actual image into memory
+            icl_images.append(Image.open(skill['image_path']).convert("RGB"))
+        
+        icl_text += "\nNow, keeping past mistakes in mind, evaluate the following new frame.\n"
+
     for img in images:
         msgs = [
             {"role": "system", "content": system_prompt},
@@ -201,7 +256,13 @@ def qwen_inference(images, title, keywords, wrapper, yes_id, no_id):
         ]
         text = wrapper.processor.apply_chat_template(msgs, tokenize=False, enable_thinking=False, add_generation_prompt=True)
         image_inputs, video_inputs = process_vision_info(msgs)
-        inputs = wrapper.processor(text=[text], images=image_inputs, videos=video_inputs, padding=True, return_tensors="pt").to(device)
+        inputs = wrapper.processor(text=[text], 
+            images=image_inputs, 
+            videos=video_inputs, 
+            padding=True, 
+            return_tensors="pt",
+            max_length=1024
+        ).to(device)
         
         with torch.inference_mode():
             outputs = wrapper.model(**inputs)
