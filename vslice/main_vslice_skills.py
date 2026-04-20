@@ -21,7 +21,7 @@ from decord import VideoReader, cpu
 from vslice_utils.models import load_vlm, minicpm_extract_title_and_keywords, qwen_extract_title_and_keywords, minicpm_inference, qwen_inference
 from vslice_utils.dataloader import build_summe_manifest, build_tvsum_manifest, VideoSegmentDataset
 from vslice_utils.measure_calibration import soft_expected_calibration_error
-from vslice_utils.metrics import set_seed
+from vslice_utils.helpers import set_seed, temporal_process_features
 
 # Evaluation dependencies
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'csta'))
@@ -93,7 +93,32 @@ def compute_video_metrics(yes_scores, no_scores, h5_path, h5_key, video_name, da
         gt_scores = grp['gtscore'][...]      
         user_summaries = grp['user_summary'][...] if 'user_summary' in grp else [grp['gtsummary'][...]]
 
-    scores = yes_scores
+    if use_advanced_scoring:
+        # Motion processing
+        motion_features = temporal_process_features(features)
+        smoothed_motion = gaussian_filter1d(motion_features, sigma=2.0)
+        motion_weight = smoothed_motion / (np.mean(smoothed_motion) + epsilon)
+
+        # Relevance weighting
+        threshold = np.percentile(yes_scores, 95)
+        boring_mask = yes_scores < threshold
+        
+        # Safety check: Prevent NaN if boring_mask is completely empty
+        if not np.any(boring_mask):
+            global_feat = np.mean(features, axis=0, keepdims=True)
+        else:
+            global_feat = np.mean(features[boring_mask], axis=0, keepdims=True)
+
+        features_tensor = torch.tensor(features, dtype=torch.float32)
+        global_feat_tensor = torch.tensor(global_feat, dtype=torch.float32)
+
+        relevance_weight = 1.0 - F.cosine_similarity(features_tensor, global_feat_tensor)
+        relevance_weight = relevance_weight / (torch.mean(relevance_weight) + epsilon)
+
+        final_scores = yes_scores * motion_weight #* relevance_weight.numpy()
+        scores = (final_scores - np.min(final_scores)) /(np.max(final_scores) - np.min(final_scores))
+    else:
+        scores = yes_scores
     scores_list = np.squeeze(scores).tolist()
     summary = generate_summary([cps], [scores_list], [n_frames], [picks])[0]
         
@@ -138,6 +163,25 @@ def compute_video_metrics(yes_scores, no_scores, h5_path, h5_key, video_name, da
         "n_segments": len(cps),
         "ECE": ece
     }
+
+def save_skill(idx, pool, skill_type, error_val, picks, fps, video_id, safe_title, img_dir, all_frames_for_video, cleaned_title, keywords, embedding):
+    sec = picks[idx] / fps
+    time_str = f"{int(sec // 60):02d}:{int(sec % 60):02d}"
+    img_name = f"{skill_type}_{video_id}_{safe_title}.jpg"
+    img_path = os.path.join(img_dir, img_name)
+    all_frames_for_video[idx].save(img_path)
+    
+    if abs(error_val) > 0.5:   
+        pool.append({
+            "image_path": img_path,
+            "title": cleaned_title,
+            "keywords": keywords,
+            "time": time_str,
+            "type": skill_type,
+            "error": float(error_val),
+            "embedding": embedding.tolist()
+        })
+    return time_str, img_name
 
 # ──────────────────────── VISUAL SKILLS PIPELINE ────────────────────────
 def evaluate_splits(args):
@@ -185,7 +229,7 @@ def evaluate_splits(args):
 
         # --- CHECK CACHE ---
         if os.path.exists(good_skills_json_path) and os.path.exists(bad_skills_json_path):
-            print(f"[*] Found cached skills for Split {split_idx}. Skipping extraction phase!")
+            print(f"FOUND cached visual skills for Split {split_idx}. Skipping Extraction phase!")
             with open(good_skills_json_path, 'r', encoding='utf-8') as f:
                 good_skills_pool = json.load(f)
             with open(bad_skills_json_path, 'r', encoding='utf-8') as f:
@@ -205,7 +249,7 @@ def evaluate_splits(args):
                 picks, gtscore = item["picks"], item["gtscore"]
                 
                 # Run Inference to identify strengths/weaknesses
-                dataset = VideoSegmentDataset(video_path, segment_length=32, width=896, height=672, picks=picks)
+                dataset = VideoSegmentDataset(video_path, segment_length=64, width=896, height=672, picks=picks)
                 loader = DataLoader(dataset, batch_size=None, shuffle=False, num_workers=4)
 
                 # Extract Title Keywords
@@ -214,66 +258,59 @@ def evaluate_splits(args):
                 else:
                     cleaned_title, keywords = qwen_extract_title_and_keywords(title, model)
 
-                all_p_yes, all_frames_for_video = [], []
+                all_p_yes, all_frames_for_video, all_hidden_states = [], [], []
 
                 pbar = tqdm(loader, desc=f"VLM Inference: {title}, {cleaned_title}:, {keywords}")
                 for frames, start, end in pbar:
                     if args.model_type == "minicpm":
-                        p_yes, p_no, _, _, _ = minicpm_inference(frames, cleaned_title, keywords, model, processor, yes_id, no_id)
+                        p_yes, p_no, _, _, hidden_states = minicpm_inference(frames, cleaned_title, keywords, model, processor, yes_id, no_id)
                         
                     else:
-                        p_yes, p_no, _, _, _ = qwen_inference(frames, cleaned_title, keywords, model, yes_id, no_id)
+                        p_yes, p_no, _, _, hidden_states = qwen_inference(frames, cleaned_title, keywords, model, yes_id, no_id)
 
                     all_p_yes.append(p_yes.detach().cpu().float().numpy())
                     all_frames_for_video.extend(frames)
+                    all_hidden_states.append(hidden_states.detach().cpu().float().numpy())
 
                 raw_p_yes = np.concatenate(all_p_yes)
-                error = np.abs(raw_p_yes - gtscore)
+                raw_hidden_states = np.concatenate(all_hidden_states, axis=0)
+                error = raw_p_yes - gtscore
 
-                tp_scores = gtscore * raw_p_yes # Measure TP
-                best_idx = np.argmax(tp_scores)
+                # --- 1. THE "YES" EXAMPLES (Good Skills Pool) ---
+                # True Positive (Good Summary Frame): High GT, High Pred
+                tp_scores = gtscore * raw_p_yes
+                tp_idx = np.argmax(tp_scores)
 
-                fp_scores = (1.0 - gtscore) * raw_p_yes # Measure FP
-                worst_idx = np.argmax(fp_scores)
+                # False Negative (Hard Positive): High GT, Low Pred (Underconfidence!)
+                fn_scores = gtscore * (1.0 - raw_p_yes)
+                fn_idx = np.argmax(fn_scores)
+
+                # --- 2. THE "NO" EXAMPLES (Bad Skills Pool) ---
+                # False Positive (Hard Negative): Low GT, High Pred (Overconfidence!)
+                fp_scores = (1.0 - gtscore) * raw_p_yes
+                fp_idx = np.argmax(fp_scores)
+
+                # True Negative (Bad Summary Frame): Low GT, Low Pred
+                tn_scores = (1.0 - gtscore) * (1.0 - raw_p_yes)
+                tn_idx = np.argmax(tn_scores)
 
                 safe_title = title.replace(" ", "_").replace("/", "_")
 
-                # --- Calculate exact timestamps ---
-                best_sec = picks[best_idx] / dataset.fps
-                worst_sec = picks[worst_idx] / dataset.fps
-                best_time = f"{int(best_sec // 60):02d}:{int(best_sec % 60):02d}"
-                worst_time = f"{int(worst_sec // 60):02d}:{int(worst_sec % 60):02d}"
-                
-                # Save Best Image
-                good_img_name = f"good_{video_id}_{safe_title}.jpg"
-                good_img_path = os.path.join(img_dir, good_img_name)
-                all_frames_for_video[best_idx].save(good_img_path)
-                
-                # Save Worst Image
-                bad_img_name = f"bad_{video_id}_{safe_title}.jpg"
-                bad_img_path = os.path.join(img_dir, bad_img_name)
-                all_frames_for_video[worst_idx].save(bad_img_path)
-
-                good_skills_pool.append({
-                    "image_path": good_img_path,
-                    "title": cleaned_title,
-                    "keywords": keywords,
-                    "time": best_time
-                })
-                
-                bad_skills_pool.append({
-                    "image_path": bad_img_path,
-                    "title": cleaned_title,
-                    "keywords": keywords,
-                    "time": worst_time
-                })
+                tp_time, tp_img = save_skill(tp_idx, good_skills_pool, "tp", error[tp_idx], picks, dataset.fps, video_id, safe_title, img_dir, all_frames_for_video, cleaned_title, keywords, raw_hidden_states[tp_idx])
+                fn_time, fn_img = save_skill(fn_idx, good_skills_pool, "fn", error[fn_idx], picks, dataset.fps, video_id, safe_title, img_dir, all_frames_for_video, cleaned_title, keywords, raw_hidden_states[fn_idx])
+                fp_time, fp_img = save_skill(fp_idx, bad_skills_pool, "fp", error[fp_idx], picks, dataset.fps, video_id, safe_title, img_dir, all_frames_for_video, cleaned_title, keywords, raw_hidden_states[fp_idx])
+                tn_time, tn_img = save_skill(tn_idx, bad_skills_pool, "tn", error[tn_idx], picks, dataset.fps, video_id, safe_title, img_dir, all_frames_for_video, cleaned_title, keywords, raw_hidden_states[tn_idx])
 
                 # Append to Markdown blocks
-                md_good_skills.append(f"**Video:** {title} | **Time:** {best_time} | **GT:** {gtscore[best_idx]:.3f} | **Pred:** {raw_p_yes[best_idx]:.3f} | **Error:** {error[best_idx]:.3f}")
-                md_good_skills.append(f"<img src='./images/{good_img_name}' width='400'>\n<br>\n")
+                md_good_skills.append(f"**[TP] Video:** {title} | **Time:** {tp_time} | **GT:** {gtscore[tp_idx]:.3f} | **Pred:** {raw_p_yes[tp_idx]:.3f}")
+                md_good_skills.append(f"<img src='./images/{tp_img}' width='400'>\n<br>\n")
+                md_good_skills.append(f"**[FN] Video:** {title} | **Time:** {fn_time} | **GT:** {gtscore[fn_idx]:.3f} | **Pred:** {raw_p_yes[fn_idx]:.3f}")
+                md_good_skills.append(f"<img src='./images/{fn_img}' width='400'>\n<br>\n")
 
-                md_bad_skills.append(f"**Video:** {title}  | **Time:** {worst_time} | **GT:** {gtscore[worst_idx]:.3f} | **Pred:** {raw_p_yes[worst_idx]:.3f} | **Error:** {error[worst_idx]:.3f}")
-                md_bad_skills.append(f"<img src='./images/{bad_img_name}' width='400'>\n<br>\n")
+                md_bad_skills.append(f"**[FP] Video:** {title} | **Time:** {fp_time} | **GT:** {gtscore[fp_idx]:.3f} | **Pred:** {raw_p_yes[fp_idx]:.3f}")
+                md_bad_skills.append(f"<img src='./images/{fp_img}' width='400'>\n<br>\n")
+                md_bad_skills.append(f"**[TN] Video:** {title} | **Time:** {tn_time} | **GT:** {gtscore[tn_idx]:.3f} | **Pred:** {raw_p_yes[tn_idx]:.3f}")
+                md_bad_skills.append(f"<img src='./images/{tn_img}' width='400'>\n<br>\n")
 
             # Combine and write the final Markdown file
             md_content.extend(md_good_skills)
@@ -308,7 +345,7 @@ def evaluate_splits(args):
             video_path, title, dataset_name = item["video_path"], item["title"], item["dataset"]
             picks, h5_path = item["picks"], summe_h5 if dataset_name == "summe" else tvsum_h5
             
-            print(f"\n[EVAL] {dataset_name}/{item['video_name']} | \"{title}\"")
+            #print(f"\n[EVAL] {dataset_name}/{item['video_name']} | \"{title}\"")
             
             # Select a small random subset of skills for this test video
             good_skills = random.sample(good_skills_pool, 1)
@@ -326,10 +363,9 @@ def evaluate_splits(args):
                 cleaned_title, keywords = qwen_extract_title_and_keywords(title, model)
 
             all_p_yes, all_p_no = [], []
-            pbar = tqdm(loader, desc="Testing w/ Skills")
-            for frames, _, _ in pbar:
+            for frames, _, _ in loader:
                 if args.model_type == "minicpm":
-                    p_yes, p_no, _, _, _ = minicpm_inference(frames, cleaned_title, keywords, model, processor, yes_id, no_id, skills=skills)
+                    p_yes, p_no, _, _, hidden_states = minicpm_inference(frames, cleaned_title, keywords, model, processor, yes_id, no_id, skills=skills)
                 else:
                     p_yes, p_no, _, _, _ = qwen_inference(frames, cleaned_title, keywords, model, yes_id, no_id, skills=skills)
 
@@ -349,7 +385,7 @@ def evaluate_splits(args):
                 use_advanced_scoring=True
             )
             
-            print(f"  --> F-Score: {res['f_score']:.4f} | Kendall: {res['kendall']:.4f} | Spearman: {res['spearman']:.4f}")
+            # print(f"  --> F-Score: {res['f_score']:.4f} | Kendall: {res['kendall']:.4f} | Spearman: {res['spearman']:.4f}")
             split_results.append(res)
         
         # Aggregate Split Metrics

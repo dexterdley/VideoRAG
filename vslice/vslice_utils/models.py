@@ -152,17 +152,26 @@ def minicpm_inference(images, title, keywords, model, processor, yes_id, no_id, 
     icl_images = []
     
     if skills:
-        icl_text += "Review these past evaluations to calibrate your judgment:\n"
+        icl_text += "Review these evaluations:\n"
         for skill in skills:
-            # Check the filename to see if this was a TP (Good) or FP (Bad) example
-            is_good = "good_" in skill['image_path'].lower()
             
-            if is_good:
+            error_type = skill['type']
+            
+            if error_type == 'tp':
                 label = "Yes"
-                explanation = "Yes, this frame provides a good summary."
-            else:
+                explanation =  f"Yes, This is a core highlight. Output Yes."
+                
+            elif error_type == 'fn':
+                label = "Yes"
+                explanation = f"This is important. Output Yes."
+                
+            elif error_type == 'fp':
                 label = "No"
-                explanation = "You incorrectly guessed Yes for this in the past. This is actually a boring or irrelevant shot and is No."
+                explanation = f"This is not important. Output No."
+
+            elif error_type == 'tn':
+                label = "No"
+                explanation = f"This is not important. Output No."
             
             # Add the text and image placeholder for the example
             icl_text += f"Example Frame (<image>./</image>) from '{skill['title']}': Should this be in the highlight reel? {label}. ({explanation})\n"
@@ -171,7 +180,6 @@ def minicpm_inference(images, title, keywords, model, processor, yes_id, no_id, 
             icl_images.append(Image.open(skill['image_path']).convert("RGB"))
         
         icl_text += "\nNow, keeping past mistakes in mind, evaluate the following new frame.\n"
-
     for img in images:
         full_user_text = icl_text + f"(<image>./</image>)\n{formatted_prompt}"
         
@@ -193,7 +201,7 @@ def minicpm_inference(images, title, keywords, model, processor, yes_id, no_id, 
         max_slice_nums=1,
         use_image_id=False,
         return_tensors="pt",
-        max_length=1024
+        max_length=2048
     ).to(device)
 
     if "position_ids" not in inputs:
@@ -204,8 +212,9 @@ def minicpm_inference(images, title, keywords, model, processor, yes_id, no_id, 
         inputs.pop("image_sizes")
 
     with torch.inference_mode():
-        outputs = model(inputs, attention_mask=inputs.get("attention_mask"))
+        outputs = model(inputs, attention_mask=inputs.get("attention_mask"), output_hidden_states=True)
         logits = outputs.logits[:, -1, :]
+
         yes_logits, no_logits = logits[:, yes_id], logits[:, no_id]
         binary_probs = F.softmax(torch.stack([yes_logits, no_logits], dim=-1), dim=-1)
         contrast = F.relu(binary_probs[:, 0] - binary_probs[:, 1])
@@ -261,7 +270,7 @@ def qwen_inference(images, title, keywords, wrapper, yes_id, no_id, skills=None)
             videos=video_inputs, 
             padding=True, 
             return_tensors="pt",
-            max_length=1024
+            max_length=2048
         ).to(device)
         
         with torch.inference_mode():
