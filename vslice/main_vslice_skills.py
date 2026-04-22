@@ -16,6 +16,7 @@ from tqdm import tqdm
 from scipy.interpolate import interp1d
 from scipy.stats import spearmanr, kendalltau
 from torch.utils.data import Dataset, DataLoader
+from scipy.ndimage import gaussian_filter1d
 from decord import VideoReader, cpu
 
 from vslice_utils.models import load_vlm, minicpm_extract_title_and_keywords, qwen_extract_title_and_keywords, minicpm_inference, qwen_inference
@@ -183,6 +184,21 @@ def save_skill(idx, pool, skill_type, error_val, picks, fps, video_id, safe_titl
         })
     return time_str, img_name
 
+def apply_pairwise_calibration(p_test, good_skills, bad_skills):
+    """
+    Method 1: Bradley-Terry Anchoring
+    Recovers the raw uncalibrated probabilities of the True Positives (P_g) and False Positives (P_b)
+    directly from the JSON error field.
+    For TP: GT = 1, so P_g = 1 + error
+    For FP: GT = 0, so P_b = error
+    """
+    P_good = np.mean([1.0 + s['error'] for s in good_skills]) if good_skills else 1.0
+    P_bad = np.mean([s['error'] for s in bad_skills]) if bad_skills else 0.0
+    
+    epsilon = 1e-8
+    calibrated_p = 0.5 * (p_test / (p_test + P_bad + epsilon) + p_test / (p_test + P_good + epsilon))
+    return calibrated_p
+
 # ──────────────────────── VISUAL SKILLS PIPELINE ────────────────────────
 def evaluate_splits(args):
     # 1. Manifest building
@@ -345,7 +361,7 @@ def evaluate_splits(args):
             video_path, title, dataset_name = item["video_path"], item["title"], item["dataset"]
             picks, h5_path = item["picks"], summe_h5 if dataset_name == "summe" else tvsum_h5
             
-            #print(f"\n[EVAL] {dataset_name}/{item['video_name']} | \"{title}\"")
+            print(f"\n[EVAL] {dataset_name}/{item['video_name']} | \"{title}\"")
             
             # Select a small random subset of skills for this test video
             good_skills = random.sample(good_skills_pool, 1)
@@ -373,6 +389,9 @@ def evaluate_splits(args):
                 all_p_no.append(p_no.detach().cpu().float().numpy())
 
             raw_p_yes, raw_p_no = np.concatenate(all_p_yes), np.concatenate(all_p_no)
+            
+            # Apply pairwise calibration
+            raw_p_yes = apply_pairwise_calibration(raw_p_yes, good_skills, bad_skills)
 
             res = compute_video_metrics(
                 yes_scores=raw_p_yes, 
@@ -382,10 +401,10 @@ def evaluate_splits(args):
                 video_name=item['video_name'],
                 dataset_name=dataset_name, 
                 user_scores=tvsum_user_scores,
-                use_advanced_scoring=True
+                use_advanced_scoring=False
             )
             
-            # print(f"  --> F-Score: {res['f_score']:.4f} | Kendall: {res['kendall']:.4f} | Spearman: {res['spearman']:.4f}")
+            print(f"  --> F-Score: {res['f_score']:.4f} | Kendall: {res['kendall']:.4f} | Spearman: {res['spearman']:.4f}")
             split_results.append(res)
         
         # Aggregate Split Metrics
