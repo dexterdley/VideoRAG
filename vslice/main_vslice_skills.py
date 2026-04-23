@@ -50,6 +50,26 @@ if sys.platform == "win32":
 #  CUDA_VISIBLE_DEVICES=7 python vslice/main_vslice_skills.py --dataset summe --split_file ./dataset/summe_splits.json --model_type minicpm --root_dir="/home/dexter/LLaVA-VLS"
 
 """
+[EVAL] summe/Playing_on_water_slide | "Playing on water slide"                  
+  --> F-Score: 0.4984 | Kendall: 0.0168 | Spearman: 0.0189                      
+                                                                                
+[EVAL] summe/Uncut_Evening_Flight | "Uncut Evening Flight"                      
+  --> F-Score: 0.2906 | Kendall: 0.0071 | Spearman: 0.0078                      
+                                                                                
+[EVAL] summe/playing_ball | "playing ball"                                      
+  --> F-Score: 0.4597 | Kendall: 0.0146 | Spearman: 0.0165                      
+
+[EVAL] summe/Bike Polo | "Bike Polo"
+  --> F-Score: 0.4781 | Kendall: 0.2949 | Spearman: 0.3278
+
+[EVAL] summe/Eiffel Tower | "Eiffel Tower"
+  --> F-Score: 0.4615 | Kendall: 0.1949 | Spearman: 0.2161
+
+--- SPLIT 1 SUMMARY ---
+Mean F-Score: 0.4377 
+Mean Kendall Tau: 0.1057
+Mean Spearman Rho: 0.1174
+NEED a way to split TP and FP
 ============================================================
 FINAL BENCHMARK SUMMARY (SPLIT-BASED: ./dataset/summe_splits.json)
 ============================================================
@@ -172,8 +192,7 @@ def save_skill(idx, pool, skill_type, error_val, picks, fps, video_id, safe_titl
     img_path = os.path.join(img_dir, img_name)
     all_frames_for_video[idx].save(img_path)
     
-    if abs(error_val) > 0.5:   
-        pool.append({
+    pool.append({
             "image_path": img_path,
             "title": cleaned_title,
             "keywords": keywords,
@@ -184,21 +203,87 @@ def save_skill(idx, pool, skill_type, error_val, picks, fps, video_id, safe_titl
         })
     return time_str, img_name
 
-def apply_pairwise_calibration(p_test, good_skills, bad_skills):
+def apply_similarity_calibration(p_test, hidden_states_test, good_skills, bad_skills, scale=0.5):
     """
-    Method 1: Bradley-Terry Anchoring
-    Recovers the raw uncalibrated probabilities of the True Positives (P_g) and False Positives (P_b)
-    directly from the JSON error field.
-    For TP: GT = 1, so P_g = 1 + error
-    For FP: GT = 0, so P_b = error
+    Calibrates test probabilities using mean-centered cosine similarity.
     """
-    P_good = np.mean([1.0 + s['error'] for s in good_skills]) if good_skills else 1.0
-    P_bad = np.mean([s['error'] for s in bad_skills]) if bad_skills else 0.0
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
-    epsilon = 1e-8
-    calibrated_p = 0.5 * (p_test / (p_test + P_bad + epsilon) + p_test / (p_test + P_good + epsilon))
-    return calibrated_p
+    p_calibrated = torch.as_tensor(p_test, dtype=torch.float32, device=device)
+    features_test = torch.as_tensor(hidden_states_test, dtype=torch.float32, device=device)
+    
+    # 1. MEAN-CENTERING: Find the average feature of the test video
+    # This strips out the constant text-prompt embedding that makes everything look similar
+    video_mean = features_test.mean(dim=0, keepdim=True)
+    features_test_centered = features_test - video_mean
+    
+    if good_skills and bad_skills:
+        # Load and center the Good Anchor
+        good_features = torch.tensor([s['embedding'] for s in good_skills], dtype=torch.float32, device=device)
+        good_anchor = good_features.mean(dim=0)
+        good_anchor_centered = good_anchor - video_mean.squeeze(0)
+        
+        # Load and center the Bad Anchor
+        bad_features = torch.tensor([s['embedding'] for s in bad_skills], dtype=torch.float32, device=device)
+        bad_anchor = bad_features.mean(dim=0)
+        bad_anchor_centered = bad_anchor - video_mean.squeeze(0)
+        
+        # 2. Compute similarities in the new, centered space
+        sim_good = F.cosine_similarity(features_test_centered, good_anchor_centered.unsqueeze(0), dim=-1)
+        sim_bad = F.cosine_similarity(features_test_centered, bad_anchor_centered.unsqueeze(0), dim=-1)
+        
+        # 3. RELATIVE MARGIN: Amplify the difference between Good and Bad similarities
+        # If a frame is more similar to Good than Bad, margin is positive (Boost)
+        # If a frame is more similar to Bad than Good, margin is negative (Penalty)
+        margin = sim_good - sim_bad
+        
+        # Apply the scaled margin to the raw probabilities
+        p_calibrated += scale * margin
 
+    # Ensure probabilities remain valid
+    p_calibrated = torch.clamp(p_calibrated, min=0.0, max=1.0)
+    return p_calibrated.cpu().numpy()
+
+def apply_similarity_calibration1(scores, test_embeddings, good_pool, bad_pool, alpha=0.2, beta=0.3):
+    """
+    Adjusts VLM scores based on embedding similarity to known Good (TP) and Bad (FP) skills.
+    alpha: Boost factor for looking like a TP.
+    beta: Penalty factor for looking like a FP/TN.
+    """
+    calibrated_scores = np.copy(scores)
+    
+    # Extract TP and FP/TN embeddings from the pools
+    tp_embs = [s['embedding'] for s in good_pool if s['type'] == 'tp']
+    bad_embs = [s['embedding'] for s in bad_pool] # FPs and TNs
+    
+    if not tp_embs or not bad_embs:
+        return calibrated_scores # Skip if pools are empty
+        
+    tp_tensor = torch.tensor(np.array(tp_embs), dtype=torch.float32).to(device)
+    bad_tensor = torch.tensor(np.array(bad_embs), dtype=torch.float32).to(device)
+    test_tensor = torch.tensor(test_embeddings, dtype=torch.float32).to(device)
+    
+    # Flatten if using 3D hidden states
+    if test_tensor.ndim > 2:
+        test_tensor = test_tensor.view(test_tensor.shape[0], -1)
+        tp_tensor = tp_tensor.view(tp_tensor.shape[0], -1)
+        bad_tensor = bad_tensor.view(bad_tensor.shape[0], -1)
+
+    # Calculate similarities for each test frame
+    for i in range(len(scores)):
+        test_feat = test_tensor[i].unsqueeze(0)
+        
+        # Max similarity to any known True Positive
+        sim_to_tp = torch.max(F.cosine_similarity(test_feat, tp_tensor)).item()
+        
+        # Max similarity to any known Error/Boring frame
+        sim_to_bad = torch.max(F.cosine_similarity(test_feat, bad_tensor)).item()
+        
+        # Adjust score: Boost if it matches a TP, penalize if it matches a FP
+        calibrated_scores[i] = scores[i] + (alpha * sim_to_tp) - (beta * sim_to_bad)
+        
+    # Clamp back to [0, 1] range
+    return np.clip(calibrated_scores, 0.0, 1.0)
 # ──────────────────────── VISUAL SKILLS PIPELINE ────────────────────────
 def evaluate_splits(args):
     # 1. Manifest building
@@ -289,6 +374,7 @@ def evaluate_splits(args):
                     all_hidden_states.append(hidden_states.detach().cpu().float().numpy())
 
                 raw_p_yes = np.concatenate(all_p_yes)
+
                 raw_hidden_states = np.concatenate(all_hidden_states, axis=0)
                 error = raw_p_yes - gtscore
 
@@ -345,6 +431,7 @@ def evaluate_splits(args):
             print(f"  -> Saved all skills data and visual report to {split_out_dir}")
             print(f"[SKILLS] Acquired {len(md_content)} skills.")
 
+            
         # 2. Testing Phase: Use Skills for Reprompting
         print(f"\nEvaluating test set with acquired skills...")
         test_set = split['test_keys']
@@ -363,9 +450,12 @@ def evaluate_splits(args):
             
             print(f"\n[EVAL] {dataset_name}/{item['video_name']} | \"{title}\"")
             
+            tp_pool = [s for s in good_skills_pool if s['type'] == 'tp']
+            fp_pool = [s for s in bad_skills_pool if s['type'] == 'fp']
+            
             # Select a small random subset of skills for this test video
-            good_skills = random.sample(good_skills_pool, 1)
-            bad_skills = random.sample(bad_skills_pool, 1)
+            good_skills = random.sample(tp_pool, 1)
+            bad_skills = random.sample(fp_pool, 1)
             skills = good_skills + bad_skills
 
             # Run Inference w/ Skills reprompting
@@ -378,20 +468,22 @@ def evaluate_splits(args):
             else:
                 cleaned_title, keywords = qwen_extract_title_and_keywords(title, model)
 
-            all_p_yes, all_p_no = [], []
+            all_p_yes, all_p_no, all_hidden_states = [], [], []
             for frames, _, _ in loader:
                 if args.model_type == "minicpm":
-                    p_yes, p_no, _, _, hidden_states = minicpm_inference(frames, cleaned_title, keywords, model, processor, yes_id, no_id, skills=skills)
+                    p_yes, p_no, _, _, hidden_states_test = minicpm_inference(frames, cleaned_title, keywords, model, processor, yes_id, no_id, skills=skills)
                 else:
                     p_yes, p_no, _, _, _ = qwen_inference(frames, cleaned_title, keywords, model, yes_id, no_id, skills=skills)
 
                 all_p_yes.append(p_yes.detach().cpu().float().numpy())
                 all_p_no.append(p_no.detach().cpu().float().numpy())
+                all_hidden_states.append(hidden_states_test.detach().cpu().float().numpy())
 
             raw_p_yes, raw_p_no = np.concatenate(all_p_yes), np.concatenate(all_p_no)
+            hidden_states_test = np.concatenate(all_hidden_states, axis=0)
             
             # Apply pairwise calibration
-            raw_p_yes = apply_pairwise_calibration(raw_p_yes, good_skills, bad_skills)
+            raw_p_yes = apply_similarity_calibration1(raw_p_yes, hidden_states_test, good_skills, bad_skills)
 
             res = compute_video_metrics(
                 yes_scores=raw_p_yes, 

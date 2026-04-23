@@ -167,7 +167,7 @@ def minicpm_inference(images, title, keywords, model, processor, yes_id, no_id, 
                 
             elif error_type == 'fp':
                 label = "No"
-                explanation = f"This is not important. Output No."
+                explanation = f"Output No."
 
             elif error_type == 'tn':
                 label = "No"
@@ -214,11 +214,12 @@ def minicpm_inference(images, title, keywords, model, processor, yes_id, no_id, 
     with torch.inference_mode():
         outputs = model(inputs, attention_mask=inputs.get("attention_mask"), output_hidden_states=True)
         logits = outputs.logits[:, -1, :]
+        hidden_states = outputs.hidden_states[-2][:, -1, :]
 
         yes_logits, no_logits = logits[:, yes_id], logits[:, no_id]
         binary_probs = F.softmax(torch.stack([yes_logits, no_logits], dim=-1), dim=-1)
         contrast = F.relu(binary_probs[:, 0] - binary_probs[:, 1])
-    return binary_probs[:, 0], binary_probs[:, 1], yes_logits, no_logits, contrast.pow(2)
+    return binary_probs[:, 0], binary_probs[:, 1], yes_logits, no_logits, hidden_states
 
 def qwen_inference(images, title, keywords, wrapper, yes_id, no_id, skills=None):
     if process_vision_info is None:
