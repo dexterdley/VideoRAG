@@ -15,6 +15,7 @@ from tqdm import tqdm
 from scipy.interpolate import interp1d
 from scipy.stats import spearmanr, kendalltau
 from torch.utils.data import Dataset, DataLoader
+from scipy.ndimage import gaussian_filter1d
 from decord import VideoReader, cpu
 
 from vslice_utils.models import load_vlm, minicpm_extract_title_and_keywords, qwen_extract_title_and_keywords, minicpm_inference, qwen_inference
@@ -40,6 +41,42 @@ torch.backends.cudnn.allow_tf32 = True
 device = "cuda" if torch.cuda.is_available() else "cpu"
 set_seed(42)
 
+"""
+SUMME: TO BEAT 0.256 0.285, TVSUM: 0.195 0.255
+Average F-Score: 0.4889
+Average Kendall Tau: 0.1712
+Average Spearman Rho: 0.1907
+
+============================================================
+FINAL BENCHMARK SUMMARY (SPLIT-BASED: ./dataset/summe_splits.json)
+============================================================
+Average F-Score: 0.4600
+Average Kendall Tau: 0.1500 -> 0.1860
+Average Spearman Rho: 0.1665 -> 0.2069
+
+============================================================
+FINAL BENCHMARK SUMMARY (SPLIT-BASED: ./dataset/tvsum_splits.json)
+============================================================
+Average F-Score: 0.5531
+Average Kendall Tau: 0.2152 -> 0.2216
+Average Spearman Rho: 0.2738 -> 0.2895
+
+============================================================
+FINAL CROSS-VALIDATION BENCHMARK SUMMARY (WITH VISUAL SKILLS), ./dataset/summe_splits.json)
+============================================================
+Average F-Score: 0.5178
+Average Kendall Tau: 0.2028
+Average Spearman Rho: 0.2260
+
+============================================================
+FINAL CROSS-VALIDATION BENCHMARK SUMMARY (WITH VISUAL SKILLS), ./dataset/tvsum_splits.json)
+============================================================
+Average F-Score: 0.5800
+Average Kendall Tau: 0.2301
+Average Spearman Rho: 0.2906
+
+"""
+
 # Fix Windows console encoding for non-ASCII characters
 if sys.platform == "win32":
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
@@ -62,7 +99,18 @@ def compute_video_metrics(yes_scores, no_scores, h5_path, h5_key, video_name, da
         gt_scores = grp['gtscore'][...]      
         user_summaries = grp['user_summary'][...] if 'user_summary' in grp else [grp['gtsummary'][...]]
 
-    scores = yes_scores
+    if use_advanced_scoring:
+        # Motion processing
+        motion_features = temporal_process_features(features)
+        smoothed_motion = gaussian_filter1d(motion_features, sigma=2.0)
+        motion_weight = smoothed_motion / (np.mean(smoothed_motion) + epsilon)
+
+        final_scores = yes_scores * motion_weight
+        scores = (final_scores - np.min(final_scores)) /(np.max(final_scores) - np.min(final_scores))
+        #import pdb; pdb.set_trace()
+    else:
+        scores = yes_scores
+
     scores_list = np.squeeze(scores).tolist()
     summary = generate_summary([cps], [scores_list], [n_frames], [picks])[0]
         
@@ -185,7 +233,7 @@ def evaluate_splits(args):
                 video_name=item['video_name'],
                 dataset_name=dataset_name,
                 user_scores=tvsum_user_scores,
-                use_advanced_scoring=False
+                use_advanced_scoring=True
             )
             
             print(f"  --> F-Score: {res['f_score']:.4f} | Kendall: {res['kendall']:.4f} | Spearman: {res['spearman']:.4f}")

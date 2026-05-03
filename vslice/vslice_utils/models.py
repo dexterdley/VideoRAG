@@ -152,26 +152,18 @@ def minicpm_inference(images, title, keywords, model, processor, yes_id, no_id, 
     icl_images = []
     
     if skills:
-        icl_text += "Review these evaluations:\n"
+        icl_text += "### CALIBRATION EXAMPLES\nReview these previous evaluations to avoid common errors:\n"
         for skill in skills:
-            
             error_type = skill['type']
             
             if error_type == 'tp':
-                label = "Yes"
-                explanation =  f"Yes, This is a core highlight. Output Yes."
-                
+                label, explanation = "Yes", "This is a perfect core highlight."
             elif error_type == 'fn':
-                label = "Yes"
-                explanation = f"This is important. Output Yes."
-                
+                label, explanation = "Yes", "This is important action that must be included."
             elif error_type == 'fp':
-                label = "No"
-                explanation = f"Output No."
-
+                label, explanation = "No", "CRITICAL: This is a deceptive frame (background/noise). Output No."
             elif error_type == 'tn':
-                label = "No"
-                explanation = f"This is not important. Output No."
+                label, explanation = "No", "This is correctly identified as a non-highlight."
             
             # Add the text and image placeholder for the example
             icl_text += f"Example Frame (<image>./</image>) from '{skill['title']}': Should this be in the highlight reel? {label}. ({explanation})\n"

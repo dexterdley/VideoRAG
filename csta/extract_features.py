@@ -155,7 +155,7 @@ def minicpm_inference(images, title, model, processor, yes_id, no_id):
         return_tensors="pt",
         max_length=2048
     ).to(device)
-
+    
     if "position_ids" not in inputs:
         batch_size, seq_len = inputs["input_ids"].shape
         inputs["position_ids"] = torch.arange(seq_len, dtype=torch.long, device=device).unsqueeze(0).expand(batch_size, -1)

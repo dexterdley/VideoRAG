@@ -10,6 +10,7 @@ import random
 import numpy as np
 import pandas as pd
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 import matplotlib.pyplot as plt
 from tqdm import tqdm
@@ -50,25 +51,10 @@ if sys.platform == "win32":
 #  CUDA_VISIBLE_DEVICES=7 python vslice/main_vslice_skills.py --dataset summe --split_file ./dataset/summe_splits.json --model_type minicpm --root_dir="/home/dexter/LLaVA-VLS"
 
 """
-[EVAL] summe/Playing_on_water_slide | "Playing on water slide"                  
-  --> F-Score: 0.4984 | Kendall: 0.0168 | Spearman: 0.0189                      
-                                                                                
-[EVAL] summe/Uncut_Evening_Flight | "Uncut Evening Flight"                      
-  --> F-Score: 0.2906 | Kendall: 0.0071 | Spearman: 0.0078                      
-                                                                                
-[EVAL] summe/playing_ball | "playing ball"                                      
-  --> F-Score: 0.4597 | Kendall: 0.0146 | Spearman: 0.0165                      
+Average F-Score: 0.4816
+Average Kendall Tau: 0.1739
+Average Spearman Rho: 0.1933
 
-[EVAL] summe/Bike Polo | "Bike Polo"
-  --> F-Score: 0.4781 | Kendall: 0.2949 | Spearman: 0.3278
-
-[EVAL] summe/Eiffel Tower | "Eiffel Tower"
-  --> F-Score: 0.4615 | Kendall: 0.1949 | Spearman: 0.2161
-
---- SPLIT 1 SUMMARY ---
-Mean F-Score: 0.4377 
-Mean Kendall Tau: 0.1057
-Mean Spearman Rho: 0.1174
 NEED a way to split TP and FP
 ============================================================
 FINAL BENCHMARK SUMMARY (SPLIT-BASED: ./dataset/summe_splits.json)
@@ -99,6 +85,41 @@ Average Kendall Tau: 0.2301
 Average Spearman Rho: 0.2906
 
 """
+class VisualSkillPredictor(nn.Module):
+    def __init__(self, input_dim=4096):
+        super().__init__()
+        self.temporal_model = nn.GRU(input_dim, 256, batch_first=True, bidirectional=True)
+        
+        self.head = nn.Sequential(
+            nn.Linear(512, 1),
+            nn.Sigmoid()
+        )
+        self.tp_head = nn.Linear(512, 1) 
+        self.fp_head = nn.Linear(512, 1)
+
+    def forward(self, x):
+        features, _ = self.temporal_model(x)
+        pred_importance = self.head(features)
+
+        tp_logits = importance * self.tp_head(features)
+        fp_logits = importance * self.fp_head(features)
+        return pred_importance.squeeze(-1), tp_logits.squeeze(-1), fp_logits.squeeze(-1)
+
+def apply_motion_weighting(features, yes_scores, sigma=2.0, epsilon=1e-8):
+    motion_features = temporal_process_features(features)
+    smoothed_motion = gaussian_filter1d(motion_features, sigma=sigma)
+    
+    # 2. Mean-normalized motion weight
+    motion_weight = smoothed_motion / (np.mean(smoothed_motion) + epsilon)
+
+    # 3. Multiplicative fusion (Logical AND)
+    final_scores = yes_scores * motion_weight
+    
+    # 4. Min-max normalization safely
+    score_range = np.max(final_scores) - np.min(final_scores)
+    scores = (final_scores - np.min(final_scores)) / (score_range + epsilon)
+    
+    return scores
 
 # ──────────────────────── EVALUATION ────────────────────────
 def compute_video_metrics(yes_scores, no_scores, h5_path, h5_key, video_name, dataset_name, user_scores=None, use_advanced_scoring=False, epsilon=1e-8):
@@ -116,30 +137,10 @@ def compute_video_metrics(yes_scores, no_scores, h5_path, h5_key, video_name, da
 
     if use_advanced_scoring:
         # Motion processing
-        motion_features = temporal_process_features(features)
-        smoothed_motion = gaussian_filter1d(motion_features, sigma=2.0)
-        motion_weight = smoothed_motion / (np.mean(smoothed_motion) + epsilon)
-
-        # Relevance weighting
-        threshold = np.percentile(yes_scores, 95)
-        boring_mask = yes_scores < threshold
-        
-        # Safety check: Prevent NaN if boring_mask is completely empty
-        if not np.any(boring_mask):
-            global_feat = np.mean(features, axis=0, keepdims=True)
-        else:
-            global_feat = np.mean(features[boring_mask], axis=0, keepdims=True)
-
-        features_tensor = torch.tensor(features, dtype=torch.float32)
-        global_feat_tensor = torch.tensor(global_feat, dtype=torch.float32)
-
-        relevance_weight = 1.0 - F.cosine_similarity(features_tensor, global_feat_tensor)
-        relevance_weight = relevance_weight / (torch.mean(relevance_weight) + epsilon)
-
-        final_scores = yes_scores * motion_weight #* relevance_weight.numpy()
-        scores = (final_scores - np.min(final_scores)) /(np.max(final_scores) - np.min(final_scores))
+        scores = apply_motion_weighting(features, yes_scores)
     else:
         scores = yes_scores
+
     scores_list = np.squeeze(scores).tolist()
     summary = generate_summary([cps], [scores_list], [n_frames], [picks])[0]
         
@@ -203,87 +204,6 @@ def save_skill(idx, pool, skill_type, error_val, picks, fps, video_id, safe_titl
         })
     return time_str, img_name
 
-def apply_similarity_calibration(p_test, hidden_states_test, good_skills, bad_skills, scale=0.5):
-    """
-    Calibrates test probabilities using mean-centered cosine similarity.
-    """
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    
-    p_calibrated = torch.as_tensor(p_test, dtype=torch.float32, device=device)
-    features_test = torch.as_tensor(hidden_states_test, dtype=torch.float32, device=device)
-    
-    # 1. MEAN-CENTERING: Find the average feature of the test video
-    # This strips out the constant text-prompt embedding that makes everything look similar
-    video_mean = features_test.mean(dim=0, keepdim=True)
-    features_test_centered = features_test - video_mean
-    
-    if good_skills and bad_skills:
-        # Load and center the Good Anchor
-        good_features = torch.tensor([s['embedding'] for s in good_skills], dtype=torch.float32, device=device)
-        good_anchor = good_features.mean(dim=0)
-        good_anchor_centered = good_anchor - video_mean.squeeze(0)
-        
-        # Load and center the Bad Anchor
-        bad_features = torch.tensor([s['embedding'] for s in bad_skills], dtype=torch.float32, device=device)
-        bad_anchor = bad_features.mean(dim=0)
-        bad_anchor_centered = bad_anchor - video_mean.squeeze(0)
-        
-        # 2. Compute similarities in the new, centered space
-        sim_good = F.cosine_similarity(features_test_centered, good_anchor_centered.unsqueeze(0), dim=-1)
-        sim_bad = F.cosine_similarity(features_test_centered, bad_anchor_centered.unsqueeze(0), dim=-1)
-        
-        # 3. RELATIVE MARGIN: Amplify the difference between Good and Bad similarities
-        # If a frame is more similar to Good than Bad, margin is positive (Boost)
-        # If a frame is more similar to Bad than Good, margin is negative (Penalty)
-        margin = sim_good - sim_bad
-        
-        # Apply the scaled margin to the raw probabilities
-        p_calibrated += scale * margin
-
-    # Ensure probabilities remain valid
-    p_calibrated = torch.clamp(p_calibrated, min=0.0, max=1.0)
-    return p_calibrated.cpu().numpy()
-
-def apply_similarity_calibration1(scores, test_embeddings, good_pool, bad_pool, alpha=0.2, beta=0.3):
-    """
-    Adjusts VLM scores based on embedding similarity to known Good (TP) and Bad (FP) skills.
-    alpha: Boost factor for looking like a TP.
-    beta: Penalty factor for looking like a FP/TN.
-    """
-    calibrated_scores = np.copy(scores)
-    
-    # Extract TP and FP/TN embeddings from the pools
-    tp_embs = [s['embedding'] for s in good_pool if s['type'] == 'tp']
-    bad_embs = [s['embedding'] for s in bad_pool] # FPs and TNs
-    
-    if not tp_embs or not bad_embs:
-        return calibrated_scores # Skip if pools are empty
-        
-    tp_tensor = torch.tensor(np.array(tp_embs), dtype=torch.float32).to(device)
-    bad_tensor = torch.tensor(np.array(bad_embs), dtype=torch.float32).to(device)
-    test_tensor = torch.tensor(test_embeddings, dtype=torch.float32).to(device)
-    
-    # Flatten if using 3D hidden states
-    if test_tensor.ndim > 2:
-        test_tensor = test_tensor.view(test_tensor.shape[0], -1)
-        tp_tensor = tp_tensor.view(tp_tensor.shape[0], -1)
-        bad_tensor = bad_tensor.view(bad_tensor.shape[0], -1)
-
-    # Calculate similarities for each test frame
-    for i in range(len(scores)):
-        test_feat = test_tensor[i].unsqueeze(0)
-        
-        # Max similarity to any known True Positive
-        sim_to_tp = torch.max(F.cosine_similarity(test_feat, tp_tensor)).item()
-        
-        # Max similarity to any known Error/Boring frame
-        sim_to_bad = torch.max(F.cosine_similarity(test_feat, bad_tensor)).item()
-        
-        # Adjust score: Boost if it matches a TP, penalize if it matches a FP
-        calibrated_scores[i] = scores[i] + (alpha * sim_to_tp) - (beta * sim_to_bad)
-        
-    # Clamp back to [0, 1] range
-    return np.clip(calibrated_scores, 0.0, 1.0)
 # ──────────────────────── VISUAL SKILLS PIPELINE ────────────────────────
 def evaluate_splits(args):
     # 1. Manifest building
@@ -302,6 +222,7 @@ def evaluate_splits(args):
     # 2. Load VLM
     vlm_vars = load_vlm(args.model_path, args.model_type, device)
     model, processor, yes_id, no_id = vlm_vars[0], vlm_vars[2], vlm_vars[3], vlm_vars[4]
+    predictor = VisualSkillPredictor(input_dim=model.config.hidden_size).to(model.device) # visual skills head
 
     # 3. Load Splits
     splits = []
@@ -336,11 +257,10 @@ def evaluate_splits(args):
             with open(bad_skills_json_path, 'r', encoding='utf-8') as f:
                 bad_skills_pool = json.load(f)
         else:
-            # 1. Training Phase: Acquire Skills
-            md_content = [f"# Split {split_idx} - Visual Skills Report"]
-            md_good_skills = [f"# Split {split_idx} - Good Visual Skills"]
-            md_bad_skills = [f"# Split {split_idx} - Bad Visual Skills"]
-
+            # 1. Initialize memory
+            tp_memory_bank = []
+            fp_memory_bank = []
+            
             print(f"Acquiring visual skills from {len(train_set)} training videos...")
             for video_id in tqdm(train_set, desc="Training"):
                 item = next((m for m in manifest if m['h5_key'] == video_id), None)
@@ -359,6 +279,11 @@ def evaluate_splits(args):
                 else:
                     cleaned_title, keywords = qwen_extract_title_and_keywords(title, model)
 
+                h5_path = summe_h5 if dataset_name_item == "summe" else tvsum_h5
+                with h5py.File(h5_path, 'r') as f:
+                    grp = f[video_id]
+                    video_features = grp['features'][()]
+
                 all_p_yes, all_frames_for_video, all_hidden_states = [], [], []
 
                 pbar = tqdm(loader, desc=f"VLM Inference: {title}, {cleaned_title}:, {keywords}")
@@ -369,72 +294,50 @@ def evaluate_splits(args):
                     else:
                         p_yes, p_no, _, _, hidden_states = qwen_inference(frames, cleaned_title, keywords, model, yes_id, no_id)
 
-                    all_p_yes.append(p_yes.detach().cpu().float().numpy())
+                    all_p_yes.append(p_yes.detach().float())
                     all_frames_for_video.extend(frames)
-                    all_hidden_states.append(hidden_states.detach().cpu().float().numpy())
+                    all_hidden_states.append(hidden_states.detach().float())
 
-                raw_p_yes = np.concatenate(all_p_yes)
+                raw_p_yes = torch.cat(all_p_yes, dim=0)
+                raw_hidden_states = torch.cat(all_hidden_states, dim=0)
+                gt_tensor = torch.from_numpy(gtscore).to(device).float()
 
-                raw_hidden_states = np.concatenate(all_hidden_states, axis=0)
-                error = raw_p_yes - gtscore
+                video_mean = raw_hidden_states.mean(dim=0, keepdim=True)
+                video_std = raw_hidden_states.std(dim=0, keepdim=True) + 1e-8
+                raw_hidden_states = (raw_hidden_states - video_mean)/ video_std
 
-                # --- 1. THE "YES" EXAMPLES (Good Skills Pool) ---
-                # True Positive (Good Summary Frame): High GT, High Pred
-                tp_scores = gtscore * raw_p_yes
-                tp_idx = np.argmax(tp_scores)
+                # temp_diffs = temporal_process_features(video_features)
+                # raw_p_yes = apply_motion_weighting(video_features, raw_p_yes)
+                # import pdb; pdb.set_trace()
 
-                # False Negative (Hard Positive): High GT, Low Pred (Underconfidence!)
-                fn_scores = gtscore * (1.0 - raw_p_yes)
-                fn_idx = np.argmax(fn_scores)
+                # --- MINE ANCHORS FROM ERROR ---
+                error = raw_p_yes - gt_tensor
+                error_mask = error >= 0.3
 
-                # --- 2. THE "NO" EXAMPLES (Bad Skills Pool) ---
-                # False Positive (Hard Negative): Low GT, High Pred (Overconfidence!)
-                fp_scores = (1.0 - gtscore) * raw_p_yes
-                fp_idx = np.argmax(fp_scores)
+                tp_mask = (error < 0.2) & (gt_tensor > 0.5)
+                fp_mask = error_mask & (gt_tensor < 0.5)
 
-                # True Negative (Bad Summary Frame): Low GT, Low Pred
-                tn_scores = (1.0 - gtscore) * (1.0 - raw_p_yes)
-                tn_idx = np.argmax(tn_scores)
+                if tp_mask.any():
+                    tp_memory_bank.append(raw_hidden_states[tp_mask].detach())
+                if fp_mask.any():
+                    fp_memory_bank.append(raw_hidden_states[fp_mask].detach())
 
-                safe_title = title.replace(" ", "_").replace("/", "_")
+            # Consolidate memory banks into global split-level tensors
+            # We use F.normalize to ensure we operate on the hypersphere (better for cosine similarity)
+            tp_anchors = F.normalize(torch.cat(tp_memory_bank, dim=0), p=2, dim=1)
+            fp_anchors = F.normalize(torch.cat(fp_memory_bank, dim=0), p=2, dim=1)
 
-                tp_time, tp_img = save_skill(tp_idx, good_skills_pool, "tp", error[tp_idx], picks, dataset.fps, video_id, safe_title, img_dir, all_frames_for_video, cleaned_title, keywords, raw_hidden_states[tp_idx])
-                fn_time, fn_img = save_skill(fn_idx, good_skills_pool, "fn", error[fn_idx], picks, dataset.fps, video_id, safe_title, img_dir, all_frames_for_video, cleaned_title, keywords, raw_hidden_states[fn_idx])
-                fp_time, fp_img = save_skill(fp_idx, bad_skills_pool, "fp", error[fp_idx], picks, dataset.fps, video_id, safe_title, img_dir, all_frames_for_video, cleaned_title, keywords, raw_hidden_states[fp_idx])
-                tn_time, tn_img = save_skill(tn_idx, bad_skills_pool, "tn", error[tn_idx], picks, dataset.fps, video_id, safe_title, img_dir, all_frames_for_video, cleaned_title, keywords, raw_hidden_states[tn_idx])
-
-                # Append to Markdown blocks
-                md_good_skills.append(f"**[TP] Video:** {title} | **Time:** {tp_time} | **GT:** {gtscore[tp_idx]:.3f} | **Pred:** {raw_p_yes[tp_idx]:.3f}")
-                md_good_skills.append(f"<img src='./images/{tp_img}' width='400'>\n<br>\n")
-                md_good_skills.append(f"**[FN] Video:** {title} | **Time:** {fn_time} | **GT:** {gtscore[fn_idx]:.3f} | **Pred:** {raw_p_yes[fn_idx]:.3f}")
-                md_good_skills.append(f"<img src='./images/{fn_img}' width='400'>\n<br>\n")
-
-                md_bad_skills.append(f"**[FP] Video:** {title} | **Time:** {fp_time} | **GT:** {gtscore[fp_idx]:.3f} | **Pred:** {raw_p_yes[fp_idx]:.3f}")
-                md_bad_skills.append(f"<img src='./images/{fp_img}' width='400'>\n<br>\n")
-                md_bad_skills.append(f"**[TN] Video:** {title} | **Time:** {tn_time} | **GT:** {gtscore[tn_idx]:.3f} | **Pred:** {raw_p_yes[tn_idx]:.3f}")
-                md_bad_skills.append(f"<img src='./images/{tn_img}' width='400'>\n<br>\n")
-
-            # Combine and write the final Markdown file
-            md_content.extend(md_good_skills)
-            md_content.extend(md_bad_skills)
-
-            # Write files outside the train_set loop but inside the split loop
-            with open(os.path.join(split_out_dir, f"{args.model_type}_skills_visual_report.md"), 'w', encoding='utf-8') as f:
-                f.write("\n".join(md_content))
-
-            with open(good_skills_json_path, 'w', encoding='utf-8') as f:
-                json.dump(good_skills_pool, f, indent=4)
-
-            with open(bad_skills_json_path, 'w', encoding='utf-8') as f:
-                json.dump(bad_skills_pool, f, indent=4)
-                
-            print(f"  -> Saved all skills data and visual report to {split_out_dir}")
-            print(f"[SKILLS] Acquired {len(md_content)} skills.")
-
-            
+            print(f"Memory Bank Sizes | TP: {tp_anchors.size(0)}, FP: {fp_anchors.size(0)}")
+            #av = F.cosine_similarity(tp_anchors.mean(0), fp_anchors.mean(0), 0)
+            #print(av)
+            #import pdb; pdb.set_trace()
+        
+        quality_axis = tp_anchors.mean(0) - fp_anchors.mean(0)
+        quality_axis = F.normalize(quality_axis, p=2, dim=0)
+        
         # 2. Testing Phase: Use Skills for Reprompting
         print(f"\nEvaluating test set with acquired skills...")
-        test_set = split['test_keys']
+        test_set = split['train_keys']
         split_results = []
         if "tvsum" in args.split_file.lower() and get_gt is not None:
             tvsum_user_scores = get_gt('TVSum')
@@ -450,17 +353,9 @@ def evaluate_splits(args):
             
             print(f"\n[EVAL] {dataset_name}/{item['video_name']} | \"{title}\"")
             
-            tp_pool = [s for s in good_skills_pool if s['type'] == 'tp']
-            fp_pool = [s for s in bad_skills_pool if s['type'] == 'fp']
-            
-            # Select a small random subset of skills for this test video
-            good_skills = random.sample(tp_pool, 1)
-            bad_skills = random.sample(fp_pool, 1)
-            skills = good_skills + bad_skills
-
-            # Run Inference w/ Skills reprompting
+            # Run Inference WITHOUT Skills reprompting
             dataset = VideoSegmentDataset(video_path, segment_length=32, width=896, height=672, picks=picks)
-            loader = DataLoader(dataset, batch_size=None, shuffle=False, num_workers=4)
+            loader = DataLoader(dataset, batch_size=None, shuffle=False, num_workers=2)
 
             # Extract Title Keywords
             if args.model_type == "minicpm":
@@ -471,24 +366,43 @@ def evaluate_splits(args):
             all_p_yes, all_p_no, all_hidden_states = [], [], []
             for frames, _, _ in loader:
                 if args.model_type == "minicpm":
-                    p_yes, p_no, _, _, hidden_states_test = minicpm_inference(frames, cleaned_title, keywords, model, processor, yes_id, no_id, skills=skills)
+                    p_yes, p_no, _, _, hidden_states_test = minicpm_inference(frames, cleaned_title, keywords, model, processor, yes_id, no_id)
                 else:
-                    p_yes, p_no, _, _, _ = qwen_inference(frames, cleaned_title, keywords, model, yes_id, no_id, skills=skills)
+                    p_yes, p_no, _, _, hidden_states_test = qwen_inference(frames, cleaned_title, keywords, model, yes_id, no_id)
 
-                all_p_yes.append(p_yes.detach().cpu().float().numpy())
-                all_p_no.append(p_no.detach().cpu().float().numpy())
-                all_hidden_states.append(hidden_states_test.detach().cpu().float().numpy())
+                # Keep as float tensors on device for fast matrix math
+                all_p_yes.append(p_yes.detach().float())
+                all_p_no.append(p_no.detach().float())
+                all_hidden_states.append(hidden_states_test.detach().float())
 
-            raw_p_yes, raw_p_no = np.concatenate(all_p_yes), np.concatenate(all_p_no)
-            hidden_states_test = np.concatenate(all_hidden_states, axis=0)
+            # Concatenate tensors
+            raw_p_yes = torch.cat(all_p_yes, dim=0)
+            raw_p_no = torch.cat(all_p_no, dim=0)
+            test_hiddens = torch.cat(all_hidden_states, dim=0)
             
-            # Apply pairwise calibration
-            raw_p_yes = apply_similarity_calibration1(raw_p_yes, hidden_states_test, good_skills, bad_skills)
+            # --- APPLY GEOMETRIC WARP ---
+            # 1. Center test hidden states
+            test_mean = test_hiddens.mean(dim=0, keepdim=True)
+            centered_test = test_hiddens - test_mean
+            
+            # 2. Project onto the Quality Axis
+            projection = torch.matmul(centered_test, quality_axis)
+            
+            # 3. Standardize projection scale
+            projection = (projection - projection.mean()) / (projection.std() + 1e-8)
+            
+            # 4. Warp the probabilities to shift the ranking (lmbda controls intensity)
+            lmbda = 0.2 
+            warped_p_yes = torch.clamp(raw_p_yes + (lmbda * projection), 0, 1)
 
+            # Convert to numpy for metric evaluation
+            final_yes_scores = warped_p_yes.cpu().numpy()
+            final_no_scores = raw_p_no.cpu().numpy()
+            
             res = compute_video_metrics(
-                yes_scores=raw_p_yes, 
-                no_scores=raw_p_no, 
-                h5_path=h5_path, 
+                yes_scores=final_yes_scores, 
+                no_scores=final_no_scores, 
+                h5_path=h5_path,
                 h5_key=video_id, 
                 video_name=item['video_name'],
                 dataset_name=dataset_name, 

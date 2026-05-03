@@ -41,3 +41,82 @@ def temporal_process_features(features, window_size=15):
     # Apply sliding window average to smooth out high-frequency noise/jitter
     #motion_flow = uniform_filter1d(combined_motion.numpy(), size=window_size)
     return combined_motion.numpy()
+
+def build_dpo_dataset(manifest, top_p=0.2, bot_p=0.2):
+    dpo_data = []
+    
+    for vid_id, data in manifest.items():
+        gt = np.array(data['gtscore'])
+        frame_paths = data['frame_paths']
+        
+        # Calculate thresholds for this specific video
+        high_val = np.quantile(gt, 1.0 - top_p)
+        low_val = np.quantile(gt, bot_p)
+        
+        # Indices for Chosen and Rejected
+        chosen_indices = np.where(gt >= high_val)[0]
+        rejected_indices = np.where(gt <= low_val)[0]
+        
+        # Generate pairs (Sampling to avoid combinatorial explosion)
+        # We want to pair high-GT frames with low-GT frames
+        for c_idx in np.random.choice(chosen_indices, size=min(10, len(chosen_indices)), replace=False):
+            for r_idx in np.random.choice(rejected_indices, size=min(10, len(rejected_indices)), replace=False):
+                
+                dpo_data.append({
+                    "prompt": f"System: You are an expert video editor. Strictly answer only Yes or No.\nUser: Does this image represent the core message of {data['keywords']} in the video context of '{data['title']}'?",
+                    "chosen": "Yes",    # The 'Winner' frame should evoke a 'Yes'
+                    "rejected": "Yes",  # We compare the PROBABILITY of 'Yes' between the two images
+                    "chosen_image": frame_paths[c_idx],
+                    "rejected_image": frame_paths[r_idx]
+                })
+    return dpo_data
+
+
+def build_quadrant_dpo_dataset(manifest_data):
+    """
+    manifest_data: dict containing {video_id: {tp_mask, fp_mask, tn_mask, fn_mask, frame_paths, ...}}
+    """
+    dpo_entries = []
+    system_prompt = "You are an expert video editor. Strictly answer only Yes or No."
+
+    for vid_id, data in manifest_data.items():
+        frames = data['frame_paths']
+        # Convert masks to indices
+        tp_idx = np.where(data['tp_mask'])[0]
+        fp_idx = np.where(data['fp_mask'])[0]
+        tn_idx = np.where(data['tn_mask'])[0]
+        fn_idx = np.where(data['fn_mask'])[0]
+
+        prompt = f"{system_prompt}\nDoes this image represent the core message of {data['keywords']} in the video context of '{data['title']}'?"
+
+        # --- 1. Fix Hallucinations: TN > FP ---
+        # "Prefer the boring frame we got right over the boring frame we hallucinated."
+        for _ in range(min(len(tn_idx), len(fp_idx), 5)):
+            dpo_entries.append({
+                "prompt": prompt,
+                "chosen_image": frames[random.choice(tn_idx)],
+                "rejected_image": frames[random.choice(fp_idx)],
+                "output": "Yes" # We are comparing likelihood of saying 'Yes'
+            })
+
+        # --- 2. Fix Misses: TP > FN ---
+        # "Prefer the highlight we got right over the highlight we missed."
+        for _ in range(min(len(tp_idx), len(fn_idx), 5)):
+            dpo_entries.append({
+                "prompt": prompt,
+                "chosen_image": frames[random.choice(tp_idx)],
+                "rejected_image": frames[random.choice(fn_idx)],
+                "output": "Yes"
+            })
+
+        # --- 3. The Spearman Fix: FN > FP ---
+        # "The highlight we missed is MORE important than the background we hallucinated."
+        for _ in range(min(len(fn_idx), len(fp_idx), 10)):
+            dpo_entries.append({
+                "prompt": prompt,
+                "chosen_image": frames[random.choice(fn_idx)],
+                "rejected_image": frames[random.choice(fp_idx)],
+                "output": "Yes"
+            })
+
+    return dpo_entries
