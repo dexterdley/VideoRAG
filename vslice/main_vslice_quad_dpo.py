@@ -470,7 +470,7 @@ if __name__ == "__main__":
     parser.add_argument("--lora_output_dir", type=str, default="./vslice_dpo_lora_checkpoints")
     parser.add_argument("--epochs", type=int, default=2)
     parser.add_argument("--learning_rate", type=float, default=1e-5)
-    parser.add_argument("--beta", type=float, default=0.5)
+    parser.add_argument("--beta", type=float, default=1)
     args = parser.parse_args()
     
     if args.model_path is None:

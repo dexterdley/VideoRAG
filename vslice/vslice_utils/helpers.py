@@ -176,20 +176,16 @@ def build_quadrant_dpo_dataset(manifest_data):
         prompt = f"{system_prompt}\nDoes this image represent the core message of {data['keywords']} in the video context of '{data['title']}'?"
 
         # --- 1. Encouraging "No": TN > TP (Target: "No") ---
-        # A boring frame is a "Better No" than a highlight frame.
-        # This prevents the model from hallucinating "Yes" for everything.
         for _ in range(min(len(tn_idx), len(tp_idx), 50)):
             dpo_entries.append({
                 "prompt": prompt,
-                "chosen_image": frames[random.choice(tn_idx)],    # The "Better" No
-                "rejected_image": frames[random.choice(tp_idx)],  # The "Worse" No
+                "chosen_image": frames[random.choice(tn_idx)],
+                "rejected_image": frames[random.choice(tp_idx)],
                 "output": "No"
             })
 
         # --- 2. Correcting Hallucinations: TN > FP (Target: "No") ---
-        # A correctly identified valley is a "Better No" than a hallucination.
-        # This specifically targets the FP quadrant to push its "No" probability up.
-        for _ in range(min(len(tn_idx), len(fp_idx), 100)):
+        for _ in range(min(len(tn_idx), len(fp_idx), 50)):
             dpo_entries.append({
                 "prompt": prompt,
                 "chosen_image": frames[random.choice(tn_idx)],
@@ -198,7 +194,6 @@ def build_quadrant_dpo_dataset(manifest_data):
             })
 
         # --- 3. Encouraging "Yes": TP > TN (Target: "Yes") ---
-        # The classic baseline: A highlight is a better "Yes" than a valley.
         for _ in range(min(len(tp_idx), len(tn_idx), 50)):
             dpo_entries.append({
                 "prompt": prompt,
@@ -208,7 +203,6 @@ def build_quadrant_dpo_dataset(manifest_data):
             })
 
         # --- 4. The Spearman Fix: FN > FP (Target: "Yes") ---
-        # Force the model to prefer the missed peak over the hallucinated peak.
         for _ in range(min(len(fn_idx), len(fp_idx), 100)):
             dpo_entries.append({
                 "prompt": prompt,
@@ -217,4 +211,39 @@ def build_quadrant_dpo_dataset(manifest_data):
                 "output": "Yes"
             })
 
+        # --- 5. The Calibration King: TP > FP (Target: "Yes") ---
+        for _ in range(min(len(tp_idx), len(fp_idx), 200)):
+            dpo_entries.append({
+                "prompt": prompt,
+                "chosen_image": frames[random.choice(tp_idx)],
+                "rejected_image": frames[random.choice(fp_idx)],
+                "output": "Yes"
+            })
+
+        # --- 6. Recovering Missed Peaks: FN > TN (Target: "Yes") ---
+        for _ in range(min(len(fn_idx), len(tn_idx), 50)):
+            dpo_entries.append({
+                "prompt": prompt,
+                "chosen_image": frames[random.choice(fn_idx)],
+                "rejected_image": frames[random.choice(tn_idx)],
+                "output": "Yes"
+            })
+
+        # --- 7. Reduce False Negatives for "No": TN > FN (Target: "No") ---
+        for _ in range(min(len(tn_idx), len(fn_idx), 50)):
+            dpo_entries.append({
+                "prompt": prompt,
+                "chosen_image": frames[random.choice(tn_idx)],
+                "rejected_image": frames[random.choice(fn_idx)],
+                "output": "No"
+            })
+
+        # --- 8. Calibrate "No" Confidence: FP > TP (Target: "No") ---
+        for _ in range(min(len(fp_idx), len(tp_idx), 50)):
+            dpo_entries.append({
+                "prompt": prompt,
+                "chosen_image": frames[random.choice(fp_idx)],
+                "rejected_image": frames[random.choice(tp_idx)],
+                "output": "No"
+            })
     return dpo_entries
