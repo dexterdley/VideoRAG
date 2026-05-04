@@ -37,3 +37,4 @@ openai
 tenacity
 ollama==0.5.3
 sentence-transformers
+peft

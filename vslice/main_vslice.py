@@ -12,16 +12,13 @@ import torch
 import torch.nn.functional as F
 import matplotlib.pyplot as plt
 from tqdm import tqdm
-from scipy.interpolate import interp1d
-from scipy.stats import spearmanr, kendalltau
 from torch.utils.data import Dataset, DataLoader
-from scipy.ndimage import gaussian_filter1d
 from decord import VideoReader, cpu
 
 from vslice_utils.models import load_vlm, minicpm_extract_title_and_keywords, qwen_extract_title_and_keywords, minicpm_inference, qwen_inference
 from vslice_utils.dataloader import build_summe_manifest, build_tvsum_manifest, VideoSegmentDataset
 from vslice_utils.measure_calibration import soft_expected_calibration_error
-from vslice_utils.helpers import set_seed, temporal_process_features
+from vslice_utils.helpers import set_seed, compute_video_metrics
 
 # Evaluation dependencies
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'csta'))
@@ -84,77 +81,6 @@ if sys.platform == "win32":
 
 #  CUDA_VISIBLE_DEVICES=7 python vslice/main_vslice.py --dataset summe --split_file ./dataset/summe_splits.json --model_type minicpm --root_dir="/home/dexter/LLaVA-VLS"
 #  CUDA_VISIBLE_DEVICES=7 python vslice/main_vslice.py --dataset tvsum --split_file ./dataset/tvsum_splits.json --model_type minicpm --root_dir="/home/dexter/LLaVA-VLS"
-
-# ──────────────────────── EVALUATION ────────────────────────
-def compute_video_metrics(yes_scores, no_scores, h5_path, h5_key, video_name, dataset_name, user_scores=None, use_advanced_scoring=False, epsilon=1e-8):
-    """
-    Calculates F-score, correlations, and ECE using VLM probabilities.
-    """
-    with h5py.File(h5_path, 'r') as f:
-        grp = f[h5_key]
-        features = grp['features'][()]       
-        cps = grp['change_points'][...]      
-        n_frames = int(grp['n_frames'][...])
-        picks = grp['picks'][...]            
-        gt_scores = grp['gtscore'][...]      
-        user_summaries = grp['user_summary'][...] if 'user_summary' in grp else [grp['gtsummary'][...]]
-
-    if use_advanced_scoring:
-        # Motion processing
-        motion_features = temporal_process_features(features)
-        smoothed_motion = gaussian_filter1d(motion_features, sigma=2.0)
-        motion_weight = smoothed_motion / (np.mean(smoothed_motion) + epsilon)
-
-        final_scores = yes_scores * motion_weight
-        scores = (final_scores - np.min(final_scores)) /(np.max(final_scores) - np.min(final_scores))
-        #import pdb; pdb.set_trace()
-    else:
-        scores = yes_scores
-
-    scores_list = np.squeeze(scores).tolist()
-    summary = generate_summary([cps], [scores_list], [n_frames], [picks])[0]
-        
-    # 5. Evaluate F-score
-    f_scores = []
-    for user_summary in user_summaries:
-        min_len = min(len(summary), len(user_summary))
-        s = summary[:min_len]
-        u = user_summary[:min_len]
-        
-        intersection = np.sum(s * u)
-        sum_s = np.sum(s)
-        sum_u = np.sum(u)
-        
-        precision = intersection / sum_s if sum_s > 0 else 0
-        recall = intersection / sum_u if sum_u > 0 else 0
-        
-        f1 = (2 * precision * recall / (precision + recall)) if (precision + recall) > 0 else 0
-        f_scores.append(f1)
-    
-    # 6. Evaluate Correlations
-    if dataset_name == 'summe':
-        rho, tau = get_corr_coeff([summary], [h5_key], 'SumMe', user_summaries)
-    else:
-        rho, tau = get_corr_coeff([scores_list], [h5_key], 'TVSum', user_scores)
-
-    # 7. Evaluate Calibration (ECE)
-    scores_tensor = torch.tensor(scores, dtype=torch.float32)
-    gt_scores_tensor = torch.tensor(gt_scores, dtype=torch.float32)
-    global_gt_2d = torch.stack([1.0 - gt_scores_tensor, gt_scores_tensor], dim=1)
-    
-    p_yes_preds = torch.ones_like(scores_tensor)
-    ece = soft_expected_calibration_error(scores_tensor, p_yes_preds, global_gt_2d, num_bins=15)
-    
-    return {
-        "video": video_name,
-        "dataset": dataset_name,
-        "f_score": np.max(f_scores) if dataset_name == 'summe' else np.mean(f_scores),
-        "spearman": rho,
-        "kendall": tau,
-        "n_frames": n_frames,
-        "n_segments": len(cps),
-        "ECE": ece
-    }
 
 # ──────────────────────── INFERENCE PIPELINE ────────────────────────
 def evaluate_splits(args):
