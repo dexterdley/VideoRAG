@@ -20,7 +20,7 @@ from peft import LoraConfig, get_peft_model
 
 from vslice_utils.models import load_vlm, minicpm_extract_title_and_keywords, qwen_extract_title_and_keywords, minicpm_inference, qwen_inference
 from vslice_utils.dataloader import build_summe_manifest, build_tvsum_manifest, VideoSegmentDataset
-from vslice_utils.helpers import set_seed, build_quadrant_dpo_dataset, compute_video_metrics
+from vslice_utils.helpers import set_seed, build_quadrant_dpo_dataset, compute_video_metrics, temporal_process_features
 
 # Evaluation dependencies
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'csta'))
@@ -77,6 +77,9 @@ if sys.platform == "win32":
 
 #  CUDA_VISIBLE_DEVICES=7 python vslice/main_vslice_quad_dpo.py --dataset summe --split_file ./dataset/summe_splits.json --model_type minicpm --root_dir="/home/dexter/LLaVA-VLS"
 #  CUDA_VISIBLE_DEVICES=7 python vslice/main_vslice_quad_dpo.py --dataset tvsum --split_file ./dataset/tvsum_splits.json --model_type minicpm --root_dir="/home/dexter/LLaVA-VLS"
+
+def get_safe_mask(action_mask, base_mask):
+    return action_mask if action_mask.any() else base_mask
 
 # ──────────────────────── EXTRACTION PIPELINE ────────────────────────
 def create_dpo_splits(args):
@@ -153,6 +156,14 @@ def create_dpo_splits(args):
             raw_p_yes = np.concatenate(all_p_yes)
             raw_p_no = np.concatenate(all_p_no)
 
+            with h5py.File(h5_path, 'r') as f:
+                grp = f[video_id]
+                video_features = grp['features'][()]
+
+            temp_diffs = temporal_process_features(video_features)
+            temp_diffs = torch.tensor(temp_diffs, dtype=torch.float32)
+            high_action_mask = (temp_diffs > temp_diffs.mean())
+
             res = compute_video_metrics(
                 yes_scores=raw_p_yes, 
                 no_scores=raw_p_no, 
@@ -178,6 +189,16 @@ def create_dpo_splits(args):
             tn_mask = (torch.abs(error) < 0.2) & (gt_tensor < 0.5)
             fn_mask = (error <= -0.3) & (gt_tensor > 0.5)
             
+            #tp_mask_action = tp_mask & high_action_mask
+            #fp_mask_action = fp_mask & high_action_mask
+            #tn_mask_action = tn_mask & high_action_mask
+            #fn_mask_action = fn_mask & high_action_mask
+
+            #tp_mask = get_safe_mask(tp_mask_action, tp_mask)
+            #fp_mask = get_safe_mask(fp_mask_action, fp_mask)
+            #tn_mask = get_safe_mask(tn_mask_action, tn_mask)
+            #fn_mask = get_safe_mask(fn_mask_action, fn_mask)
+
             vid_img_dir = os.path.join(img_dir, f"{video_id}_{cleaned_title}")
             os.makedirs(vid_img_dir, exist_ok=True)
             

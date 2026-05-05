@@ -20,7 +20,7 @@ from decord import VideoReader, cpu
 from vslice_utils.models import load_vlm, minicpm_extract_title_and_keywords, qwen_extract_title_and_keywords, minicpm_inference, qwen_inference
 from vslice_utils.dataloader import build_summe_manifest, build_tvsum_manifest, VideoSegmentDataset
 from vslice_utils.measure_calibration import soft_expected_calibration_error
-from vslice_utils.helpers import set_seed, compute_video_metrics
+from vslice_utils.helpers import set_seed, compute_video_metrics, temporal_process_features
 
 # Evaluation dependencies
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'csta'))
