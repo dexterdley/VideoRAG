@@ -16,6 +16,7 @@ from tqdm import tqdm
 from torch.utils.data import Dataset, DataLoader
 from decord import VideoReader, cpu
 from PIL import Image
+from peft import LoraConfig, get_peft_model
 
 from vslice_utils.models import load_vlm, minicpm_extract_title_and_keywords, qwen_extract_title_and_keywords, minicpm_inference, qwen_inference
 from vslice_utils.dataloader import build_summe_manifest, build_tvsum_manifest, VideoSegmentDataset
@@ -111,7 +112,7 @@ def create_dpo_splits(args):
         split_results = []
         manifest_data = {}
         
-        split_out_dir = os.path.join(args.root_dir, f"dpo_data_{args.dataset}_{args.model_type}_split_{split_idx}")
+        split_out_dir = os.path.join("./", f"dpo_data_{args.dataset}_{args.model_type}_split_{split_idx}")
         img_dir = os.path.join(split_out_dir, "images")
         os.makedirs(img_dir, exist_ok=True)
 
@@ -160,7 +161,7 @@ def create_dpo_splits(args):
                 video_name=item['video_name'],
                 dataset_name=dataset_name,
                 user_scores=tvsum_user_scores,
-                use_advanced_scoring=True
+                use_advanced_scoring=False
             )
             
             print(f"  --> F-Score: {res['f_score']:.4f} | Kendall: {res['kendall']:.4f} | Spearman: {res['spearman']:.4f}")
@@ -196,7 +197,8 @@ def create_dpo_splits(args):
                 'fn_mask': fn_mask.numpy(),
                 'frame_paths': frame_paths,
                 'title': cleaned_title,
-                'keywords': keywords
+                'keywords': keywords,
+                'gtscore': gt_tensor.numpy()
             }
             print(f"  --> Extracted: TP={tp_mask.sum().item()} FP={fp_mask.sum().item()} TN={tn_mask.sum().item()} FN={fn_mask.sum().item()}")
         
@@ -289,23 +291,17 @@ def get_target_logp(image_path, raw_prompt, model, processor, target_id, model_t
     return log_probs[0, target_id]
 
 def train_dpo_lora(args):
-    try:
-        from peft import LoraConfig, get_peft_model
-    except ImportError:
-        print("ERROR: 'peft' library is required. Please install it using 'pip install peft'.")
-        return
-
     print(f"Starting LoRA DPO Training on {args.dataset} split {args.split_idx}...")
     
     # Load dataset
-    dpo_json_path = os.path.join(args.root_dir, f"dpo_data_{args.dataset}_{args.model_type}_split_{args.split_idx}", f"dpo_dataset_split_{args.split_idx}.json")
+    dpo_json_path = os.path.join("./", f"dpo_data_{args.dataset}_{args.model_type}_split_{args.split_idx}", f"dpo_dataset_split_{args.split_idx}.json")
     if not os.path.exists(dpo_json_path):
         print(f"ERROR: DPO dataset not found at {dpo_json_path}. Please run with --create_splits first.")
         return
         
     with open(dpo_json_path, 'r', encoding='utf-8') as f:
         dpo_data = json.load(f)
-        
+    
     print(f"Loaded {len(dpo_data)} pairs.")
     
     # Load VLM
@@ -357,7 +353,9 @@ def train_dpo_lora(args):
             ref_ratio = ref_logp_c - ref_logp_r
             logits = pi_ratio - ref_ratio
             
-            loss = -F.logsigmoid(beta * logits)
+            # Apply margin based on GT
+            margin = 0       
+            loss = -F.logsigmoid(beta * logits - margin)
             
             optimizer.zero_grad()
             loss.backward()
@@ -429,7 +427,7 @@ def train_dpo_lora(args):
     else:
         eval_model = peft_model
     
-    print("\n--- Evaluating Base Model (Before DPO) ---")
+    #print("\n--- Evaluating Base Model (Before DPO) ---")
     #with peft_model.disable_adapter():
     #    with torch.no_grad():
     #        df_base = evaluate_model(eval_model, "Base")
@@ -441,9 +439,13 @@ def train_dpo_lora(args):
     print("\n" + "="*50)
     print("COMPARISON RESULTS (TEST SET):")
     print("="*50)
-    print(f"Base F-Score: 0.4311  | Quad-DPO (LoRA) F-Score: {df_lora['f_score'].mean():.4f}")
-    print(f"Base Kendall: 0.1237  | Quad-DPO (LoRA) Kendall: {df_lora['kendall'].mean():.4f}")
-    print(f"Base Spearman: 0.1376 | Quad-DPO (LoRA) Spearman: {df_lora['spearman'].mean():.4f}")
+    #print(f"Base F-Score: {df_base['f_score'].mean():.4f}  | Quad-DPO (LoRA) F-Score: {df_lora['f_score'].mean():.4f}")
+    #print(f"Base Kendall: {df_base['kendall'].mean():.4f}  | Quad-DPO (LoRA) Kendall: {df_lora['kendall'].mean():.4f}")
+    #print(f"Base Spearman: {df_base['spearman'].mean():.4f} | Quad-DPO (LoRA) Spearman: {df_lora['spearman'].mean():.4f}")
+
+    print(f"Base F-Score: 0.4311  | Quad-DPO (LoRA) F-Score: {df_lora['f_score'].mean():.4f}") # 0.4750
+    print(f"Base Kendall: 0.1237  | Quad-DPO (LoRA) Kendall: {df_lora['kendall'].mean():.4f}") # 0.1604
+    print(f"Base Spearman: 0.1376 | Quad-DPO (LoRA) Spearman: {df_lora['spearman'].mean():.4f}") # 0.1784
     print("="*50)
 
     out_dir = os.path.join(args.lora_output_dir, f"{args.dataset}_{args.model_type}_split_{args.split_idx}_lora")
@@ -467,9 +469,9 @@ if __name__ == "__main__":
     parser.add_argument("--split_file", type=str, default="./dataset/summe_splits.json")
     parser.add_argument("--train_lora", action="store_true", help="Run LoRA DPO training")
     parser.add_argument("--split_idx", type=int, default=0, help="Which split to train on")
-    parser.add_argument("--lora_output_dir", type=str, default="./vslice_dpo_lora_checkpoints")
-    parser.add_argument("--epochs", type=int, default=2)
-    parser.add_argument("--learning_rate", type=float, default=1e-5)
+    parser.add_argument("--lora_output_dir", type=str, default="./checkpoints")
+    parser.add_argument("--epochs", type=int, default=4)
+    parser.add_argument("--learning_rate", type=float, default=5e-5)
     parser.add_argument("--beta", type=float, default=1)
     args = parser.parse_args()
     

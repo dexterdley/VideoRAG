@@ -167,6 +167,7 @@ def build_quadrant_dpo_dataset(manifest_data):
 
     for vid_id, data in manifest_data.items():
         frames = data['frame_paths']
+        gt = data.get('gtscore', np.zeros(len(frames)))
         # Convert masks to indices
         tp_idx = np.where(data['tp_mask'])[0]
         fp_idx = np.where(data['fp_mask'])[0]
@@ -175,75 +176,105 @@ def build_quadrant_dpo_dataset(manifest_data):
 
         prompt = f"{system_prompt}\nDoes this image represent the core message of {data['keywords']} in the video context of '{data['title']}'?"
 
-        # --- 1. Encouraging "No": TN > TP (Target: "No") ---
-        for _ in range(min(len(tn_idx), len(tp_idx), 50)):
-            dpo_entries.append({
-                "prompt": prompt,
-                "chosen_image": frames[random.choice(tn_idx)],
-                "rejected_image": frames[random.choice(tp_idx)],
-                "output": "No"
-            })
-
-        # --- 2. Correcting Hallucinations: TN > FP (Target: "No") ---
-        for _ in range(min(len(tn_idx), len(fp_idx), 50)):
-            dpo_entries.append({
-                "prompt": prompt,
-                "chosen_image": frames[random.choice(tn_idx)],
-                "rejected_image": frames[random.choice(fp_idx)],
-                "output": "No"
-            })
-
-        # --- 3. Encouraging "Yes": TP > TN (Target: "Yes") ---
-        for _ in range(min(len(tp_idx), len(tn_idx), 50)):
-            dpo_entries.append({
-                "prompt": prompt,
-                "chosen_image": frames[random.choice(tp_idx)],
-                "rejected_image": frames[random.choice(tn_idx)],
-                "output": "Yes"
-            })
-
-        # --- 4. The Spearman Fix: FN > FP (Target: "Yes") ---
-        for _ in range(min(len(fn_idx), len(fp_idx), 100)):
-            dpo_entries.append({
-                "prompt": prompt,
-                "chosen_image": frames[random.choice(fn_idx)],
-                "rejected_image": frames[random.choice(fp_idx)],
-                "output": "Yes"
-            })
-
-        # --- 5. The Calibration King: TP > FP (Target: "Yes") ---
+        # --- 1. Encouraging Yes: TP > FP (Target: "Yes") ---
         for _ in range(min(len(tp_idx), len(fp_idx), 200)):
+            c_idx = random.choice(tp_idx)
+            r_idx = random.choice(fp_idx)
             dpo_entries.append({
                 "prompt": prompt,
-                "chosen_image": frames[random.choice(tp_idx)],
-                "rejected_image": frames[random.choice(fp_idx)],
-                "output": "Yes"
+                "chosen_image": frames[c_idx],
+                "rejected_image": frames[r_idx],
+                "output": "Yes",
+                "margin": float(abs(gt[c_idx] - gt[r_idx]))
             })
 
-        # --- 6. Recovering Missed Peaks: FN > TN (Target: "Yes") ---
+        # --- 2. Encouraging Yes: FN > TN (Target: "Yes") ---
         for _ in range(min(len(fn_idx), len(tn_idx), 50)):
+            c_idx = random.choice(fn_idx)
+            r_idx = random.choice(tn_idx)
             dpo_entries.append({
                 "prompt": prompt,
-                "chosen_image": frames[random.choice(fn_idx)],
-                "rejected_image": frames[random.choice(tn_idx)],
-                "output": "Yes"
+                "chosen_image": frames[c_idx],
+                "rejected_image": frames[r_idx],
+                "output": "Yes",
+                "margin": float(abs(gt[c_idx] - gt[r_idx]))
             })
 
-        # --- 7. Reduce False Negatives for "No": TN > FN (Target: "No") ---
+        # --- 3. Encouraging No: TN > FN (Target: "No") ---
         for _ in range(min(len(tn_idx), len(fn_idx), 50)):
+            c_idx = random.choice(tn_idx)
+            r_idx = random.choice(fn_idx)
             dpo_entries.append({
                 "prompt": prompt,
-                "chosen_image": frames[random.choice(tn_idx)],
-                "rejected_image": frames[random.choice(fn_idx)],
-                "output": "No"
+                "chosen_image": frames[c_idx],
+                "rejected_image": frames[r_idx],
+                "output": "No",
+                "margin": float(abs(gt[c_idx] - gt[r_idx]))
             })
 
-        # --- 8. Calibrate "No" Confidence: FP > TP (Target: "No") ---
-        for _ in range(min(len(fp_idx), len(tp_idx), 50)):
+        # --- 4. Encouraging No: FP > TP (Target: "No") ---
+        for _ in range(min(len(fp_idx), len(tp_idx), 100)):
+            c_idx = random.choice(fp_idx)
+            r_idx = random.choice(tp_idx)
             dpo_entries.append({
                 "prompt": prompt,
-                "chosen_image": frames[random.choice(fp_idx)],
-                "rejected_image": frames[random.choice(tp_idx)],
-                "output": "No"
+                "chosen_image": frames[c_idx],
+                "rejected_image": frames[r_idx],
+                "output": "No",
+                "margin": float(abs(gt[c_idx] - gt[r_idx]))
             })
+        
+        # --- 5. THE SPEARMAN KING: FN > FP (Target: "Yes") ---
+        # Crucial for rank-order: Preference for missed peaks over hallucinated peaks.
+        for _ in range(min(len(fn_idx), len(fp_idx), 100)):
+            c_idx = random.choice(fn_idx)
+            r_idx = random.choice(fp_idx)
+            dpo_entries.append({
+                "prompt": prompt,
+                "chosen_image": frames[c_idx],
+                "rejected_image": frames[r_idx],
+                "output": "Yes",
+                "margin": float(abs(gt[c_idx] - gt[r_idx]))
+            })
+
+        # --- 6. Baseline Anchor: TP > TN (Target: "Yes") ---
+        # Absolute range calibration: Highlight vs Boring.
+        for _ in range(min(len(tp_idx), len(tn_idx), 50)):
+            c_idx = random.choice(tp_idx)
+            r_idx = random.choice(tn_idx)
+            dpo_entries.append({
+                "prompt": prompt,
+                "chosen_image": frames[c_idx],
+                "rejected_image": frames[r_idx],
+                "output": "Yes",
+                "margin": float(abs(gt[c_idx] - gt[r_idx]))
+            })
+
+        # --- 7. Hallucination Suppression: TN > FP (Target: "No") ---
+        # Direct correction of the FP quadrant.
+        for _ in range(min(len(tn_idx), len(fp_idx), 50)):
+            c_idx = random.choice(tn_idx)
+            r_idx = random.choice(fp_idx)
+            dpo_entries.append({
+                "prompt": prompt,
+                "chosen_image": frames[c_idx],
+                "rejected_image": frames[r_idx],
+                "output": "No",
+                "margin": float(abs(gt[c_idx] - gt[r_idx]))
+            })
+
+        # --- 8. Humility Anchor: TN > TP (Target: "No") ---
+        # Prevents overconfidence: Even highlights should have low "No" prob.
+        for _ in range(min(len(tn_idx), len(tp_idx), 50)):
+            c_idx = random.choice(tn_idx)
+            r_idx = random.choice(tp_idx)
+            dpo_entries.append({
+                "prompt": prompt,
+                "chosen_image": frames[c_idx],
+                "rejected_image": frames[r_idx],
+                "output": "No",
+                "margin": float(abs(gt[c_idx] - gt[r_idx]))
+            })
+
+        
     return dpo_entries
