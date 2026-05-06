@@ -109,7 +109,7 @@ def create_dpo_splits(args):
 
     all_split_results = []
 
-    for split_idx, split in enumerate(splits[:1]):
+    for split_idx, split in enumerate(splits):
         print(f"\n==================== SPLIT {split_idx+1}/{len(splits)} ====================")
         train_set = split['train_keys']
         split_results = []
@@ -311,167 +311,186 @@ def get_target_logp(image_path, raw_prompt, model, processor, target_id, model_t
     log_probs = F.log_softmax(logits, dim=-1)
     return log_probs[0, target_id]
 
-def train_dpo_lora(args):
-    print(f"Starting LoRA DPO Training on {args.dataset} split {args.split_idx}...")
-    
-    # Load dataset
-    dpo_json_path = os.path.join("./", f"dpo_data_{args.dataset}_{args.model_type}_split_{args.split_idx}", f"dpo_dataset_split_{args.split_idx}.json")
-    if not os.path.exists(dpo_json_path):
-        print(f"ERROR: DPO dataset not found at {dpo_json_path}. Please run with --create_splits first.")
-        return
-        
-    with open(dpo_json_path, 'r', encoding='utf-8') as f:
-        dpo_data = json.load(f)
-    
-    print(f"Loaded {len(dpo_data)} pairs.")
-    
-    # Load VLM
-    vlm_vars = load_vlm(args.model_path, args.model_type, device)
-    wrapper_or_model, tokenizer, processor, yes_id, no_id = vlm_vars
-    actual_model = wrapper_or_model.model if args.model_type == "qwen" else wrapper_or_model
-    
-    # Setup LoRA
-    config = LoraConfig(
-        r=8,
-        lora_alpha=16,
-        target_modules=["q_proj", "v_proj", "k_proj", "o_proj"],
-        lora_dropout=0.05,
-        bias="none",
-        task_type="CAUSAL_LM"
-    )
-    
-    peft_model = get_peft_model(actual_model, config)
-    peft_model.train()
-    
-    optimizer = torch.optim.AdamW(peft_model.parameters(), lr=args.learning_rate)
-    beta = args.beta
-    
-    os.makedirs(args.lora_output_dir, exist_ok=True)
-    
-    for epoch in range(args.epochs):
-        print(f"\n--- Epoch {epoch+1}/{args.epochs} ---")
-        epoch_loss = 0.0
-        
-        pbar = tqdm(dpo_data, desc="DPO Training")
-        for pair in pbar:
-            chosen_img_path = pair['chosen_image']
-            rejected_img_path = pair['rejected_image']
-            prompt = pair['prompt']
-            
-            target_id = yes_id if pair.get('output', 'Yes') == 'Yes' else no_id
-            
-            # Policy Logps (LoRA Enabled)
-            pi_logp_c = get_target_logp(chosen_img_path, prompt, peft_model, processor, target_id, args.model_type, device)
-            pi_logp_r = get_target_logp(rejected_img_path, prompt, peft_model, processor, target_id, args.model_type, device)
-            
-            # Reference Logps (LoRA Disabled)
-            with peft_model.disable_adapter():
-                with torch.no_grad():
-                    ref_logp_c = get_target_logp(chosen_img_path, prompt, peft_model, processor, target_id, args.model_type, device)
-                    ref_logp_r = get_target_logp(rejected_img_path, prompt, peft_model, processor, target_id, args.model_type, device)
-                    
-            pi_ratio = pi_logp_c - pi_logp_r
-            ref_ratio = ref_logp_c - ref_logp_r
-            logits = pi_ratio - ref_ratio
-            
-            # Apply margin based on GT
-            margin = 0       
-            loss = -F.logsigmoid(beta * logits - margin)
-            
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-            
-            epoch_loss += loss.item()
-            pbar.set_postfix({"loss": f"{loss.item():.4f}"})
-            
-        print(f"Epoch {epoch+1} Avg Loss: {epoch_loss / len(dpo_data):.4f}")
 
-    print("\n" + "="*50)
-    print("EVALUATING FULL VIDEO METRICS (TRAIN SET)")
-    print("="*50)
+def evaluate_model(model, model_name, train_set, manifest, h5_paths, args, processor, yes_id, no_id, tvsum_user_scores):
+    split_results = []
     
-    # 1. Load Manifest & Splits for evaluation
+    # Pre-initialize wrapper once if using Qwen to avoid overhead
+    wrapper_model = None
+    if args.model_type != "minicpm":
+        from vslice_utils.models import QwenVLWrapper
+        wrapper_model = QwenVLWrapper(model, processor)
+
+    for video_id in train_set:
+        item = next((m for m in manifest if m['h5_key'] == video_id), None)
+        if not item: continue
+        
+        video_path, title, dataset_name = item["video_path"], item["title"], item["dataset"]
+        picks = item["picks"]
+        h5_path = h5_paths.get(dataset_name.lower())
+
+        dataset = VideoSegmentDataset(video_path, segment_length=32, width=896, height=672, picks=picks)
+        loader = DataLoader(dataset, batch_size=None, shuffle=False, num_workers=2, prefetch_factor=1)
+        
+        if args.model_type == "minicpm":
+            cleaned_title, keywords = minicpm_extract_title_and_keywords(title, model, processor)
+        else:
+            cleaned_title, keywords = qwen_extract_title_and_keywords(title, model)
+            
+        all_p_yes, all_p_no = [], []
+        pbar = tqdm(loader, desc=f"[{model_name}] {title}", leave=False)
+        for frames, start, end in pbar:
+            if args.model_type == "minicpm":
+                p_yes, p_no, _, _, _ = minicpm_inference(frames, cleaned_title, keywords, model, processor, yes_id, no_id)
+            else:
+                p_yes, p_no, _, _, _ = qwen_inference(frames, cleaned_title, keywords, wrapper_model, yes_id, no_id)
+                
+            all_p_yes.append(p_yes.detach().cpu().float().numpy())
+            all_p_no.append(p_no.detach().cpu().float().numpy())
+            
+        res = compute_video_metrics(
+            np.concatenate(all_p_yes), np.concatenate(all_p_no), 
+            h5_path, video_id, item['video_name'], dataset_name, tvsum_user_scores, use_advanced_scoring=False
+        )
+        split_results.append(res)
+        
+    return pd.DataFrame(split_results)
+
+def train_dpo_lora(args):
+
     manifest = []
     if args.dataset in ("summe", "both"): manifest.extend(build_summe_manifest(args.root_dir))
     if args.dataset in ("tvsum", "both"): manifest.extend(build_tvsum_manifest(args.root_dir))
     
-    tvsum_user_scores = get_gt('TVSum') if "tvsum" in args.split_file.lower() and get_gt else None
-    summe_h5 = os.path.join(args.root_dir, "SumMe", "eccv16_dataset_summe_google_pool5.h5")
-    tvsum_h5 = os.path.join(args.root_dir, "TVSum", "eccv16_dataset_tvsum_google_pool5.h5")
-    
-    with open(args.split_file, 'r') as f:
-        splits = json.load(f)
-    train_set = splits[args.split_idx]['train_keys']
-    
-    def evaluate_model(model, model_name):
-        split_results = []
-        for video_id in train_set:
-            item = next((m for m in manifest if m['h5_key'] == video_id), None)
-            if not item: continue
-            
-            video_path, title, dataset_name = item["video_path"], item["title"], item["dataset"]
-            picks, h5_path = item["picks"], summe_h5 if dataset_name == "summe" else tvsum_h5
-            
-            dataset = VideoSegmentDataset(video_path, segment_length=32, width=896, height=672, picks=picks)
-            loader = DataLoader(dataset, batch_size=None, shuffle=False, num_workers=2, prefetch_factor=1)
-            
-            if args.model_type == "minicpm":
-                cleaned_title, keywords = minicpm_extract_title_and_keywords(title, model, processor)
-            else:
-                cleaned_title, keywords = qwen_extract_title_and_keywords(title, model)
-                
-            all_p_yes, all_p_no = [], []
-            pbar = tqdm(loader, desc=f"[{model_name}] {title}")
-            for frames, start, end in pbar:
-                if args.model_type == "minicpm":
-                    p_yes, p_no, _, _, _ = minicpm_inference(frames, cleaned_title, keywords, model, processor, yes_id, no_id)
-                else:
-                    from vslice_utils.models import QwenVLWrapper
-                    wrapper_model = QwenVLWrapper(model, processor)
-                    p_yes, p_no, _, _, _ = qwen_inference(frames, cleaned_title, keywords, wrapper_model, yes_id, no_id)
-                    
-                all_p_yes.append(p_yes.detach().cpu().float().numpy())
-                all_p_no.append(p_no.detach().cpu().float().numpy())
-                
-            res = compute_video_metrics(
-                np.concatenate(all_p_yes), np.concatenate(all_p_no), 
-                h5_path, video_id, item['video_name'], dataset_name, tvsum_user_scores, use_advanced_scoring=False
-            )
-            split_results.append(res)
-        return pd.DataFrame(split_results)
-
-    peft_model.eval()
-    # Resolve base model to bypass PEFT wrapper signature
-    if hasattr(peft_model, "base_model"):
-        eval_model = peft_model.base_model
+    if "tvsum" in args.split_file.lower() and get_gt is not None:
+        tvsum_user_scores = get_gt('TVSum')
     else:
-        eval_model = peft_model
+        tvsum_user_scores = None
+
+    h5_paths = {
+        "summe": os.path.join(args.root_dir, "SumMe", "eccv16_dataset_summe_google_pool5.h5"),
+        "tvsum": os.path.join(args.root_dir, "TVSum", "eccv16_dataset_tvsum_google_pool5.h5")
+    }
+
+    # Load VLM
+    vlm_vars = load_vlm(args.model_path, args.model_type, device)
+    wrapper_or_model, tokenizer, processor, yes_id, no_id = vlm_vars
+    actual_model = wrapper_or_model.model if args.model_type == "qwen" else wrapper_or_model
+
+    # Load Splits
+    splits = []
+    if args.split_file and os.path.exists(args.split_file):
+        with open(args.split_file, 'r') as f:
+            splits = json.load(f)
+        print(f"Loaded {len(splits)} splits from {args.split_file}")
+
+    all_split_results = []
+
+    for split_idx, split in enumerate(splits):
+        print(f"Starting LoRA DPO Training on {args.dataset} split {split_idx+1}/{len(splits)}...")
+        train_set = split['train_keys']
     
-    #print("\n--- Evaluating Base Model (Before DPO) ---")
-    #with peft_model.disable_adapter():
-    #    with torch.no_grad():
-    #        df_base = evaluate_model(eval_model, "Base")
-            
-    print("\n--- Evaluating LoRA Model (After Quad-DPO) ---")
-    with torch.no_grad():
-        df_lora = evaluate_model(eval_model, "Quad-DPO")
+        # Load DPO split preference pairs
+        dpo_json_path = os.path.join("./", f"dpo_data_{args.dataset}_{args.model_type}_split_{split_idx}", f"dpo_dataset_split_{split_idx}.json")
+
+        with open(dpo_json_path, 'r', encoding='utf-8') as f:
+            dpo_data = json.load(f)
         
-    print("\n" + "="*50)
-    print("COMPARISON RESULTS (TEST SET):")
-    print("="*50)
-    #print(f"Base F-Score: {df_base['f_score'].mean():.4f}  | Quad-DPO (LoRA) F-Score: {df_lora['f_score'].mean():.4f}")
-    #print(f"Base Kendall: {df_base['kendall'].mean():.4f}  | Quad-DPO (LoRA) Kendall: {df_lora['kendall'].mean():.4f}")
-    #print(f"Base Spearman: {df_base['spearman'].mean():.4f} | Quad-DPO (LoRA) Spearman: {df_lora['spearman'].mean():.4f}")
+        print(f"Loaded {len(dpo_data)} pairs.")
+        
+        # Setup LoRA
+        config = LoraConfig(
+            r=8,
+            lora_alpha=16,
+            target_modules=["q_proj", "v_proj", "k_proj", "o_proj"],
+            lora_dropout=0.05,
+            bias="none",
+            task_type="CAUSAL_LM"
+        )
+        
+        peft_model = get_peft_model(actual_model, config)
+        peft_model.train()
+        
+        optimizer = torch.optim.AdamW(peft_model.parameters(), lr=args.learning_rate)
+        beta = args.beta
+        
+        os.makedirs(args.lora_output_dir, exist_ok=True)
+        
+        for epoch in range(args.epochs):
+            print(f"\n--- Epoch {epoch+1}/{args.epochs} ---")
+            epoch_loss = 0.0
+            
+            pbar = tqdm(dpo_data, desc="DPO Training")
+            for pair in pbar:
+                chosen_img_path = pair['chosen_image']
+                rejected_img_path = pair['rejected_image']
+                prompt = pair['prompt']
+                
+                target_id = yes_id if pair.get('output', 'Yes') == 'Yes' else no_id
+                
+                # Policy Logps (LoRA Enabled)
+                pi_logp_c = get_target_logp(chosen_img_path, prompt, peft_model, processor, target_id, args.model_type, device)
+                pi_logp_r = get_target_logp(rejected_img_path, prompt, peft_model, processor, target_id, args.model_type, device)
+                
+                # Reference Logps (LoRA Disabled)
+                with peft_model.disable_adapter():
+                    with torch.no_grad():
+                        ref_logp_c = get_target_logp(chosen_img_path, prompt, peft_model, processor, target_id, args.model_type, device)
+                        ref_logp_r = get_target_logp(rejected_img_path, prompt, peft_model, processor, target_id, args.model_type, device)
+                        
+                pi_ratio = pi_logp_c - pi_logp_r
+                ref_ratio = ref_logp_c - ref_logp_r
+                logits = pi_ratio - ref_ratio
+                
+                # Apply margin based on GT
+                margin = 0       
+                loss = -F.logsigmoid(beta * logits - margin)
+                
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+                
+                epoch_loss += loss.item()
+                pbar.set_postfix({"loss": f"{loss.item():.4f}"})
+                
+            print(f"Epoch {epoch+1} Avg Loss: {epoch_loss / len(dpo_data):.4f}")
 
-    print(f"Base F-Score: 0.4311  | Quad-DPO (LoRA) F-Score: {df_lora['f_score'].mean():.4f}") # 0.4750
-    print(f"Base Kendall: 0.1237  | Quad-DPO (LoRA) Kendall: {df_lora['kendall'].mean():.4f}") # 0.1604
-    print(f"Base Spearman: 0.1376 | Quad-DPO (LoRA) Spearman: {df_lora['spearman'].mean():.4f}") # 0.1784
-    print("="*50)
+        print("\n" + "="*50)
+        print("EVALUATING FULL VIDEO METRICS (TRAIN SET)")
+        print("="*50)
 
-    out_dir = os.path.join(args.lora_output_dir, f"{args.dataset}_{args.model_type}_split_{args.split_idx}_lora")
-    peft_model.save_pretrained(out_dir)
-    print(f"Saved LoRA weights to {out_dir}")
+        peft_model.eval()
+        if hasattr(peft_model, "base_model"):
+            eval_model = peft_model.base_model
+        else:
+            eval_model = peft_model
+        
+        print("\n--- Evaluating Base Model (Before DPO) ---")
+        with peft_model.disable_adapter():
+            with torch.no_grad():
+                df_base = evaluate_model(
+                    eval_model, "Base", train_set, manifest, h5_paths, 
+                    args, processor, yes_id, no_id, tvsum_user_scores
+                )
+                
+        print("\n--- Evaluating LoRA Model (After Quad-DPO) ---")
+        with torch.no_grad():
+            df_lora = evaluate_model(
+                eval_model, "Quad-DPO", train_set, manifest, h5_paths, 
+                args, processor, yes_id, no_id, tvsum_user_scores
+            )
+            
+        print("\n" + "="*50)
+        print("COMPARISON RESULTS (TEST SET):")
+        print("="*50)
+        print(f"Base F-Score: {df_base['f_score'].mean():.4f}  | Quad-DPO (LoRA) F-Score: {df_lora['f_score'].mean():.4f}")
+        print(f"Base Kendall: {df_base['kendall'].mean():.4f}  | Quad-DPO (LoRA) Kendall: {df_lora['kendall'].mean():.4f}")
+        print(f"Base Spearman: {df_base['spearman'].mean():.4f} | Quad-DPO (LoRA) Spearman: {df_lora['spearman'].mean():.4f}")
+        print("="*50)
+
+        out_dir = os.path.join(args.lora_output_dir, f"{args.dataset}_{args.model_type}_split_{split_idx}_lora")
+        peft_model.save_pretrained(out_dir)
+        print(f"Saved LoRA weights to {out_dir}")
 
 # ──────────────────────── CLI ────────────────────────
 def resolve_model_path(mtype):
@@ -489,7 +508,6 @@ if __name__ == "__main__":
     parser.add_argument("--model_path", type=str, default=None)
     parser.add_argument("--split_file", type=str, default="./dataset/summe_splits.json")
     parser.add_argument("--train_lora", action="store_true", help="Run LoRA DPO training")
-    parser.add_argument("--split_idx", type=int, default=0, help="Which split to train on")
     parser.add_argument("--lora_output_dir", type=str, default="./checkpoints")
     parser.add_argument("--epochs", type=int, default=4)
     parser.add_argument("--learning_rate", type=float, default=5e-5)
