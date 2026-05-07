@@ -39,6 +39,10 @@ device = "cuda" if torch.cuda.is_available() else "cpu"
 set_seed(42)
 
 """
+TBD 
+FIX Evaluating LoRA Model (After Quad-DPO) ---
+[WARN] Format failed for 'Air Force One', falling back to raw title.
+
 SUMME: TO BEAT 0.256 0.285, TVSUM: 0.195 0.255
 ============================================================
 FINAL BENCHMARK SUMMARY (SPLIT-BASED: ./dataset/summe_splits.json)
@@ -384,7 +388,9 @@ def train_dpo_lora(args):
             splits = json.load(f)
         print(f"Loaded {len(splits)} splits from {args.split_file}")
 
-    all_split_results = []
+    # Lists to store the mean metrics per split for final aggregation
+    all_base_split_metrics = []
+    all_dpo_split_metrics = []
 
     for split_idx, split in enumerate(splits):
         print(f"Starting LoRA DPO Training on {args.dataset} split {split_idx+1}/{len(splits)}...")
@@ -411,9 +417,7 @@ def train_dpo_lora(args):
         peft_model = get_peft_model(actual_model, config)
         peft_model.train()
         
-        optimizer = torch.optim.AdamW(peft_model.parameters(), lr=args.learning_rate)
-        beta = args.beta
-        
+        optimizer = torch.optim.AdamW(peft_model.parameters(), lr=args.learning_rate)        
         os.makedirs(args.lora_output_dir, exist_ok=True)
         
         for epoch in range(args.epochs):
@@ -443,8 +447,8 @@ def train_dpo_lora(args):
                 logits = pi_ratio - ref_ratio
                 
                 # Apply margin based on GT
-                margin = 0       
-                loss = -F.logsigmoid(beta * logits - margin)
+                margin = 0
+                loss = -F.logsigmoid(args.beta * logits - margin)
                 
                 optimizer.zero_grad()
                 loss.backward()
@@ -480,6 +484,21 @@ def train_dpo_lora(args):
                 args, processor, yes_id, no_id, tvsum_user_scores
             )
             
+        # Aggregate Split Metrics
+        base_summary = {
+            'f_score': df_base['f_score'].mean(),
+            'kendall': df_base['kendall'].mean(),
+            'spearman': df_base['spearman'].mean()
+        }
+        dpo_summary = {
+            'f_score': df_lora['f_score'].mean(),
+            'kendall': df_lora['kendall'].mean(),
+            'spearman': df_lora['spearman'].mean()
+        }
+
+        all_base_split_metrics.append(base_summary)
+        all_dpo_split_metrics.append(dpo_summary)
+
         print("\n" + "="*50)
         print("COMPARISON RESULTS (TEST SET):")
         print("="*50)
@@ -491,6 +510,41 @@ def train_dpo_lora(args):
         out_dir = os.path.join(args.lora_output_dir, f"{args.dataset}_{args.model_type}_split_{split_idx}_lora")
         peft_model.save_pretrained(out_dir)
         print(f"Saved LoRA weights to {out_dir}")
+
+    # 4. Final Aggregation
+    if all_base_split_metrics:
+        # Convert lists of dicts to DataFrames for easy averaging
+        final_base_df = pd.DataFrame(all_base_split_metrics)
+        final_dpo_df = pd.DataFrame(all_dpo_split_metrics)
+
+        print("\n" + "═"*60)
+        print(f"FINAL GLOBAL BENCHMARK SUMMARY ({len(splits)} SPLITS)")
+        print("═"*60)
+        
+        comparison_data = {
+            "Metric": ["F-Score", "Kendall Tau", "Spearman Rho"],
+            "Base Model": [
+                final_base_df['f_score'].mean(),
+                final_base_df['kendall'].mean(),
+                final_base_df['spearman'].mean()
+            ],
+            "Quad-DPO (LoRA)": [
+                final_dpo_df['f_score'].mean(),
+                final_dpo_df['kendall'].mean(),
+                final_dpo_df['spearman'].mean()
+            ]
+        }
+        
+        summary_table = pd.DataFrame(comparison_data)
+        print(summary_table.to_string(index=False))
+        
+        # Calculate Percentage Improvement for Spearman (your primary KPI)
+        base_s = final_base_df['spearman'].mean()
+        dpo_s = final_dpo_df['spearman'].mean()
+        improvement = ((dpo_s - base_s) / base_s) * 100
+        print("─"*60)
+        print(f"Global Spearman Improvement: {improvement:+.2f}%")
+        print("═"*60)
 
 # ──────────────────────── CLI ────────────────────────
 def resolve_model_path(mtype):
