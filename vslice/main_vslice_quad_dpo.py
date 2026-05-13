@@ -182,38 +182,34 @@ def create_dpo_splits(args):
             print(f"  --> F-Score: {res['f_score']:.4f} | Kendall: {res['kendall']:.4f} | Spearman: {res['spearman']:.4f}")
             split_results.append(res)
             
-            # ─── EXTRACT DPO PAIRS ───
+            # ─── EXTRACT DPO PAIRS (Adaptive Percentile Quadrants) ───
             gt_tensor = torch.tensor(item['gtscore'], dtype=torch.float32)
             p_yes_tensor = torch.tensor(raw_p_yes, dtype=torch.float32)
             
-            error = p_yes_tensor - gt_tensor
+            # Per-video adaptive thresholds: ensures balanced quadrants
+            gt_thresh = gt_tensor.median().item()
+            pred_thresh = p_yes_tensor.median().item()
             
-            tp_mask = (error < 0.2) & (gt_tensor > 0.5)
-            fp_mask = (error >= 0.3) & (gt_tensor < 0.5)
-            tn_mask = (torch.abs(error) < 0.2) & (gt_tensor < 0.5)
-            fn_mask = (error <= -0.3) & (gt_tensor > 0.5)
+            gt_high = gt_tensor > gt_thresh
+            gt_low = ~gt_high
+            pred_high = p_yes_tensor > pred_thresh
+            pred_low = ~pred_high
             
-            #tp_mask_action = tp_mask & high_action_mask
-            #fp_mask_action = fp_mask & high_action_mask
-            #tn_mask_action = tn_mask & high_action_mask
-            #fn_mask_action = fn_mask & high_action_mask
-
-            #tp_mask = get_safe_mask(tp_mask_action, tp_mask)
-            #fp_mask = get_safe_mask(fp_mask_action, fp_mask)
-            #tn_mask = get_safe_mask(tn_mask_action, tn_mask)
-            #fn_mask = get_safe_mask(fn_mask_action, fn_mask)
+            # Mutually exclusive quadrants (every frame in exactly one)
+            tp_mask = pred_high & gt_high   # Correct highlight
+            fp_mask = pred_high & gt_low    # Hallucinated highlight
+            fn_mask = pred_low & gt_high    # Missed highlight
+            tn_mask = pred_low & gt_low     # Correct non-highlight
 
             vid_img_dir = os.path.join(img_dir, f"{video_id}_{cleaned_title}")
             os.makedirs(vid_img_dir, exist_ok=True)
             
+            # Save ALL classified frames (every frame belongs to a quadrant)
             frame_paths = []
             for i, img in enumerate(all_frames_for_video):
-                if tp_mask[i] or fp_mask[i] or tn_mask[i] or fn_mask[i]:
-                    path = os.path.join(vid_img_dir, f"frame_{i}.jpg")
-                    img.save(path)
-                    frame_paths.append(path)
-                else:
-                    frame_paths.append(None)
+                path = os.path.join(vid_img_dir, f"frame_{i}.jpg")
+                img.save(path)
+                frame_paths.append(path)
             
             manifest_data[video_id] = {
                 'tp_mask': tp_mask.numpy(),
@@ -223,9 +219,10 @@ def create_dpo_splits(args):
                 'frame_paths': frame_paths,
                 'title': cleaned_title,
                 'keywords': keywords,
-                'gtscore': gt_tensor.numpy()
+                'gtscore': gt_tensor.numpy(),
+                'p_yes': raw_p_yes
             }
-            print(f"  --> Extracted: TP={tp_mask.sum().item()} FP={fp_mask.sum().item()} TN={tn_mask.sum().item()} FN={fn_mask.sum().item()}")
+            print(f"  --> Quadrants (adaptive gt>{gt_thresh:.2f}, pred>{pred_thresh:.2f}): TP={tp_mask.sum().item()} FP={fp_mask.sum().item()} TN={tn_mask.sum().item()} FN={fn_mask.sum().item()}")
         
         # Aggregate Split Metrics
         split_df = pd.DataFrame(split_results)
@@ -392,7 +389,7 @@ def train_dpo_lora(args):
     all_base_split_metrics = []
     all_dpo_split_metrics = []
 
-    for split_idx, split in enumerate(splits):
+    for split_idx, split in enumerate(splits[:1]):
         print(f"Starting LoRA DPO Training on {args.dataset} split {split_idx+1}/{len(splits)}...")
         train_set = split['train_keys']
     
@@ -500,7 +497,7 @@ def train_dpo_lora(args):
         all_dpo_split_metrics.append(dpo_summary)
 
         print("\n" + "="*50)
-        print("COMPARISON RESULTS (TEST SET):")
+        print("COMPARISON RESULTS (TRAIN SET):")
         print("="*50)
         print(f"Base F-Score: {df_base['f_score'].mean():.4f}  | Quad-DPO (LoRA) F-Score: {df_lora['f_score'].mean():.4f}")
         print(f"Base Kendall: {df_base['kendall'].mean():.4f}  | Quad-DPO (LoRA) Kendall: {df_lora['kendall'].mean():.4f}")

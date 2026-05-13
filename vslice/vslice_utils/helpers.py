@@ -160,121 +160,83 @@ def build_dpo_dataset(manifest, top_p=0.2, bot_p=0.2):
 
 def build_quadrant_dpo_dataset(manifest_data):
     """
-    manifest_data: dict containing {video_id: {tp_mask, fp_mask, tn_mask, fn_mask, frame_paths, ...}}
+    Build DPO preference pairs from quadrant-classified frames.
+    
+    Design principles:
+    1. Only one target per pair type to avoid conflicting gradients
+    2. All pairs target "Yes" — we always ask "should chosen have HIGHER p(Yes)?"
+       This directly optimizes rank correlation (Spearman/Kendall).
+    3. GT-weighted sampling: pairs with larger GT gaps are prioritized
+    4. Deduplicated pairs to avoid wasting training steps
+    
+    manifest_data: {video_id: {tp_mask, fp_mask, tn_mask, fn_mask, frame_paths, gtscore, p_yes, ...}}
     """
     dpo_entries = []
     system_prompt = "You are an expert video editor. Strictly answer only Yes or No."
-
+    
     for vid_id, data in manifest_data.items():
         frames = data['frame_paths']
         gt = data.get('gtscore', np.zeros(len(frames)))
-        # Convert masks to indices
+        p_yes = data.get('p_yes', np.zeros(len(frames)))
+
         tp_idx = np.where(data['tp_mask'])[0]
         fp_idx = np.where(data['fp_mask'])[0]
         tn_idx = np.where(data['tn_mask'])[0]
         fn_idx = np.where(data['fn_mask'])[0]
 
         prompt = f"{system_prompt}\nDoes this image represent the core message of {data['keywords']} in the video context of '{data['title']}'?"
-
-        # --- 1. Encouraging Yes: TP > FP (Target: "Yes") ---
-        for _ in range(min(len(tp_idx), len(fp_idx), 200)):
-            c_idx = random.choice(tp_idx)
-            r_idx = random.choice(fp_idx)
-            dpo_entries.append({
-                "prompt": prompt,
-                "chosen_image": frames[c_idx],
-                "rejected_image": frames[r_idx],
-                "output": "Yes",
-                "margin": float(abs(gt[c_idx] - gt[r_idx]))
-            })
-
-        # --- 2. Encouraging Yes: FN > TN (Target: "Yes") ---
-        for _ in range(min(len(fn_idx), len(tn_idx), 50)):
-            c_idx = random.choice(fn_idx)
-            r_idx = random.choice(tn_idx)
-            dpo_entries.append({
-                "prompt": prompt,
-                "chosen_image": frames[c_idx],
-                "rejected_image": frames[r_idx],
-                "output": "Yes",
-                "margin": float(abs(gt[c_idx] - gt[r_idx]))
-            })
-
-        # --- 3. Encouraging No: TN > FN (Target: "No") ---
-        for _ in range(min(len(tn_idx), len(fn_idx), 50)):
-            c_idx = random.choice(tn_idx)
-            r_idx = random.choice(fn_idx)
-            dpo_entries.append({
-                "prompt": prompt,
-                "chosen_image": frames[c_idx],
-                "rejected_image": frames[r_idx],
-                "output": "No",
-                "margin": float(abs(gt[c_idx] - gt[r_idx]))
-            })
-
-        # --- 4. Encouraging No: FP > TP (Target: "No") ---
-        for _ in range(min(len(fp_idx), len(tp_idx), 100)):
-            c_idx = random.choice(fp_idx)
-            r_idx = random.choice(tp_idx)
-            dpo_entries.append({
-                "prompt": prompt,
-                "chosen_image": frames[c_idx],
-                "rejected_image": frames[r_idx],
-                "output": "No",
-                "margin": float(abs(gt[c_idx] - gt[r_idx]))
-            })
         
-        # --- 5. THE SPEARMAN KING: FN > FP (Target: "Yes") ---
-        # Crucial for rank-order: Preference for missed peaks over hallucinated peaks.
-        for _ in range(min(len(fn_idx), len(fp_idx), 100)):
-            c_idx = random.choice(fn_idx)
-            r_idx = random.choice(fp_idx)
-            dpo_entries.append({
-                "prompt": prompt,
-                "chosen_image": frames[c_idx],
-                "rejected_image": frames[r_idx],
-                "output": "Yes",
-                "margin": float(abs(gt[c_idx] - gt[r_idx]))
-            })
+        seen_pairs = set()
 
-        # --- 6. Baseline Anchor: TP > TN (Target: "Yes") ---
-        # Absolute range calibration: Highlight vs Boring.
-        for _ in range(min(len(tp_idx), len(tn_idx), 50)):
-            c_idx = random.choice(tp_idx)
-            r_idx = random.choice(tn_idx)
-            dpo_entries.append({
-                "prompt": prompt,
-                "chosen_image": frames[c_idx],
-                "rejected_image": frames[r_idx],
-                "output": "Yes",
-                "margin": float(abs(gt[c_idx] - gt[r_idx]))
-            })
+        def _add_pairs(chosen_pool, rejected_pool, max_pairs, label="Yes"):
+            """GT-weighted hard-negative mining: sort by GT gap, take top-k."""
+            if len(chosen_pool) == 0 or len(rejected_pool) == 0:
+                return
+            
+            # Generate candidate pairs with GT gaps
+            candidates = []
+            n_samples = min(max_pairs * 3, len(chosen_pool) * len(rejected_pool))
+            for _ in range(n_samples):
+                c = random.choice(chosen_pool)
+                r = random.choice(rejected_pool)
+                if (c, r) in seen_pairs or frames[c] is None or frames[r] is None:
+                    continue
+                gap = abs(float(gt[c]) - float(gt[r]))
+                candidates.append((c, r, gap))
+            
+            # Sort by GT gap descending — largest disagreements first
+            candidates.sort(key=lambda x: x[2], reverse=True)
+            
+            for c_idx, r_idx, gap in candidates[:max_pairs]:
+                if (c_idx, r_idx) in seen_pairs:
+                    continue
+                seen_pairs.add((c_idx, r_idx))
+                dpo_entries.append({
+                    "prompt": prompt,
+                    "chosen_image": frames[c_idx],
+                    "rejected_image": frames[r_idx],
+                    "output": label,
+                    "margin": gap
+                })
 
-        # --- 7. Hallucination Suppression: TN > FP (Target: "No") ---
-        # Direct correction of the FP quadrant.
-        for _ in range(min(len(tn_idx), len(fp_idx), 50)):
-            c_idx = random.choice(tn_idx)
-            r_idx = random.choice(fp_idx)
-            dpo_entries.append({
-                "prompt": prompt,
-                "chosen_image": frames[c_idx],
-                "rejected_image": frames[r_idx],
-                "output": "No",
-                "margin": float(abs(gt[c_idx] - gt[r_idx]))
-            })
+        # --- 1. ERROR CORRECTION: FN > FP (Target: "Yes") ---
+        # Most impactful for Spearman: missed highlights should rank above false alarms.
+        # Both are model errors — this pair directly fixes rank inversions.
+        _add_pairs(fn_idx, fp_idx, max_pairs=150)
 
-        # --- 8. Humility Anchor: TN > TP (Target: "No") ---
-        # Prevents overconfidence: Even highlights should have low "No" prob.
-        for _ in range(min(len(tn_idx), len(tp_idx), 50)):
-            c_idx = random.choice(tn_idx)
-            r_idx = random.choice(tp_idx)
-            dpo_entries.append({
-                "prompt": prompt,
-                "chosen_image": frames[c_idx],
-                "rejected_image": frames[r_idx],
-                "output": "No",
-                "margin": float(abs(gt[c_idx] - gt[r_idx]))
-            })
+        # --- 2. PRECISION FIX: TP > FP (Target: "Yes") ---
+        # Correct highlights should produce higher p(Yes) than hallucinated ones.
+        # Teaches the model to discriminate real vs fake highlights.
+        _add_pairs(tp_idx, fp_idx, max_pairs=150)
 
-        
+        # --- 3. RECALL FIX: FN > TN (Target: "Yes") ---
+        # Missed highlights should still rank above boring frames.
+        # Pushes up the score of underscored highlights.
+        _add_pairs(fn_idx, tn_idx, max_pairs=100)
+
+        # --- 4. CALIBRATION: TP > TN (Target: "Yes") ---
+        # Baseline anchor: confirmed highlights vs confirmed non-highlights.
+        # Reinforces the overall separation of the score distribution.
+        _add_pairs(tp_idx, tn_idx, max_pairs=100)
+
     return dpo_entries
