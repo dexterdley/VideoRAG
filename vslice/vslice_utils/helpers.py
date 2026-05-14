@@ -128,35 +128,74 @@ def compute_video_metrics(yes_scores, no_scores, h5_path, h5_key, video_name, da
         "ECE": ece
     }
 
-def build_dpo_dataset(manifest, top_p=0.2, bot_p=0.2):
-    dpo_data = []
-    
-    for vid_id, data in manifest.items():
-        gt = np.array(data['gtscore'])
-        frame_paths = data['frame_paths']
-        
-        # Calculate thresholds for this specific video
-        high_val = np.quantile(gt, 1.0 - top_p)
-        low_val = np.quantile(gt, bot_p)
-        
-        # Indices for Chosen and Rejected
-        chosen_indices = np.where(gt >= high_val)[0]
-        rejected_indices = np.where(gt <= low_val)[0]
-        
-        # Generate pairs (Sampling to avoid combinatorial explosion)
-        # We want to pair high-GT frames with low-GT frames
-        for c_idx in np.random.choice(chosen_indices, size=min(10, len(chosen_indices)), replace=False):
-            for r_idx in np.random.choice(rejected_indices, size=min(10, len(rejected_indices)), replace=False):
-                
-                dpo_data.append({
-                    "prompt": f"System: You are an expert video editor. Strictly answer only Yes or No.\nUser: Does this image represent the core message of {data['keywords']} in the video context of '{data['title']}'?",
-                    "chosen": "Yes",    # The 'Winner' frame should evoke a 'Yes'
-                    "rejected": "Yes",  # We compare the PROBABILITY of 'Yes' between the two images
-                    "chosen_image": frame_paths[c_idx],
-                    "rejected_image": frame_paths[r_idx]
-                })
-    return dpo_data
+def get_highlight_peaks(gt_np, min_frames=2, num_peaks=10):
 
+    frames = np.arange(len(gt_np))
+    threshold = np.mean(gt_np) + np.std(gt_np)
+    above_thresh = gt_np > threshold
+    peaks_mask = np.zeros_like(gt_np)
+    
+    # 2. Find contiguous regions (starts and ends)
+    diff = np.diff(above_thresh.astype(int))
+    starts = np.where(diff == 1)[0] + 1
+    ends = np.where(diff == -1)[0] + 1
+    
+    # Handle edge cases (if the array starts or ends above threshold)
+    if above_thresh[0]:
+        starts = np.insert(starts, 0, 0)
+    if above_thresh[-1]:
+        ends = np.append(ends, len(gt_np) - 1)
+    
+    # 3. Extract regions and calculate their metrics
+    regions = []
+    
+    for s, e in zip(starts, ends):
+        if (e - s) >= min_frames: 
+            peak_val = float(np.max(gt_np[s:e]))
+            # Calculate Area Under Curve (AUC) for this region
+            auc = float(np.trapezoid(gt_np[s:e])) 
+            regions.append({"start": s, "end": e, "peak": peak_val, "auc": auc})
+    
+    top_regions = sorted(regions, key=lambda x: x["auc"], reverse=True)[:num_peaks]    
+    for i, reg in enumerate(top_regions):
+        s, e = reg["start"], reg["end"]
+        mask = (frames >= s) & (frames <= e)
+        peaks_mask[mask] = 1.0
+    return peaks_mask
+
+def build_dpo_dataset(manifest_data):    
+    dpo_entries = []
+    system_prompt = "You are an expert video editor. Strictly answer only Yes or No."
+    
+    for vid_id, data in manifest_data.items():
+        frames = data['frame_paths']
+        gt = data.get('gtscore', np.zeros(len(frames)))
+        p_yes = data.get('p_yes', np.zeros(len(frames)))
+        
+        peaks = np.where(data['peaks'])[0]
+        valleys = np.where(data['valleys'])[0]
+
+        prompt = f"{system_prompt}\nDoes this image represent the core message of {data['keywords']} in the video context of '{data['title']}'?"
+
+        seen_pairs = set()
+        
+        for r in valleys:
+            c = random.choice(peaks)
+            if (c, r) not in seen_pairs:
+                seen_pairs.add((c,r))
+
+                # Calculate the confidence gap
+                gap = float(gt[c] - gt[r])
+
+                dpo_entries.append({
+                    "prompt": prompt,
+                    "chosen_image": frames[c],
+                    "rejected_image": frames[r],
+                    "chosen_response": "Yes",
+                    "rejected_response": "No",
+                    "margin": gap
+                })
+    return dpo_entries
 
 def build_quadrant_dpo_dataset(manifest_data):
     """
@@ -192,7 +231,7 @@ def build_quadrant_dpo_dataset(manifest_data):
             """GT-weighted hard-negative mining: sort by GT gap, take top-k."""
             if len(chosen_pool) == 0 or len(rejected_pool) == 0:
                 return
-            
+            # import pdb; pdb.set_trace()
             # Generate candidate pairs with GT gaps
             candidates = []
             n_samples = min(max_pairs * 3, len(chosen_pool) * len(rejected_pool))

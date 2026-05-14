@@ -18,9 +18,10 @@ from decord import VideoReader, cpu
 from PIL import Image
 from peft import LoraConfig, get_peft_model
 
+from scipy.ndimage import gaussian_filter1d
 from vslice_utils.models import load_vlm, minicpm_extract_title_and_keywords, qwen_extract_title_and_keywords, minicpm_inference, qwen_inference
 from vslice_utils.dataloader import build_summe_manifest, build_tvsum_manifest, VideoSegmentDataset
-from vslice_utils.helpers import set_seed, build_quadrant_dpo_dataset, compute_video_metrics, temporal_process_features
+from vslice_utils.helpers import set_seed, build_dpo_dataset, compute_video_metrics, temporal_process_features, get_highlight_peaks
 
 # Evaluation dependencies
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'csta'))
@@ -111,15 +112,12 @@ def create_dpo_splits(args):
             splits = json.load(f)
         print(f"Loaded {len(splits)} splits from {args.split_file}")
 
-    all_split_results = []
-
-    for split_idx, split in enumerate(splits):
+    for split_idx, split in enumerate(splits[:1]):
         print(f"\n==================== SPLIT {split_idx+1}/{len(splits)} ====================")
         train_set = split['train_keys']
-        split_results = []
         manifest_data = {}
         
-        split_out_dir = os.path.join("./", f"dpo_data_{args.dataset}_{args.model_type}_split_{split_idx}")
+        split_out_dir = os.path.join("./dpo_data/", f"{args.dataset}_{args.model_type}_split_{split_idx}")
         img_dir = os.path.join(split_out_dir, "images")
         os.makedirs(img_dir, exist_ok=True)
 
@@ -168,39 +166,15 @@ def create_dpo_splits(args):
             temp_diffs = torch.tensor(temp_diffs, dtype=torch.float32)
             high_action_mask = (temp_diffs > temp_diffs.mean())
 
-            res = compute_video_metrics(
-                yes_scores=raw_p_yes, 
-                no_scores=raw_p_no, 
-                h5_path=h5_path, 
-                h5_key=video_id, 
-                video_name=item['video_name'],
-                dataset_name=dataset_name,
-                user_scores=tvsum_user_scores,
-                use_advanced_scoring=False
-            )
-            
-            print(f"  --> F-Score: {res['f_score']:.4f} | Kendall: {res['kendall']:.4f} | Spearman: {res['spearman']:.4f}")
-            split_results.append(res)
             
             # ─── EXTRACT DPO PAIRS (Adaptive Percentile Quadrants) ───
-            gt_tensor = torch.tensor(item['gtscore'], dtype=torch.float32)
+            gt_np = gaussian_filter1d(item['gtscore'], sigma=2.0)
+            gt_tensor = torch.tensor(gt_np, dtype=torch.float32)
             p_yes_tensor = torch.tensor(raw_p_yes, dtype=torch.float32)
             
-            # Per-video adaptive thresholds: ensures balanced quadrants
-            gt_thresh = gt_tensor.median().item()
-            pred_thresh = p_yes_tensor.median().item()
+            peaks = get_highlight_peaks(gt_np, min_frames=2, num_peaks=10)
+            fp_mask = (raw_p_yes >= raw_p_yes.mean() ) & (peaks == 0)
             
-            gt_high = gt_tensor > gt_thresh
-            gt_low = ~gt_high
-            pred_high = p_yes_tensor > pred_thresh
-            pred_low = ~pred_high
-            
-            # Mutually exclusive quadrants (every frame in exactly one)
-            tp_mask = pred_high & gt_high   # Correct highlight
-            fp_mask = pred_high & gt_low    # Hallucinated highlight
-            fn_mask = pred_low & gt_high    # Missed highlight
-            tn_mask = pred_low & gt_low     # Correct non-highlight
-
             vid_img_dir = os.path.join(img_dir, f"{video_id}_{cleaned_title}")
             os.makedirs(vid_img_dir, exist_ok=True)
             
@@ -212,44 +186,25 @@ def create_dpo_splits(args):
                 frame_paths.append(path)
             
             manifest_data[video_id] = {
-                'tp_mask': tp_mask.numpy(),
-                'fp_mask': fp_mask.numpy(),
-                'tn_mask': tn_mask.numpy(),
-                'fn_mask': fn_mask.numpy(),
+                'peaks': peaks,
+                'valleys': fp_mask,
                 'frame_paths': frame_paths,
                 'title': cleaned_title,
                 'keywords': keywords,
                 'gtscore': gt_tensor.numpy(),
                 'p_yes': raw_p_yes
             }
-            print(f"  --> Quadrants (adaptive gt>{gt_thresh:.2f}, pred>{pred_thresh:.2f}): TP={tp_mask.sum().item()} FP={fp_mask.sum().item()} TN={tn_mask.sum().item()} FN={fn_mask.sum().item()}")
-        
-        # Aggregate Split Metrics
-        split_df = pd.DataFrame(split_results)
-        print(f"\n--- SPLIT {split_idx+1} SUMMARY ---")
-        print(f"Mean F-Score: {split_df['f_score'].mean():.4f}")
-        print(f"Mean Kendall Tau: {split_df['kendall'].mean():.4f}")
-        print(f"Mean Spearman Rho: {split_df['spearman'].mean():.4f}")
-        all_split_results.append(split_df)
-        
+            print(f"  --> Peaks = {peaks.sum().item()}, Valleys = {fp_mask.sum().item()}")
+
+
         # Build DPO Dataset for the Split
-        dpo_entries = build_quadrant_dpo_dataset(manifest_data)
+        dpo_entries = build_dpo_dataset(manifest_data)
         dpo_json_path = os.path.join(split_out_dir, f"dpo_dataset_split_{split_idx}.json")
         with open(dpo_json_path, 'w', encoding='utf-8') as f:
             json.dump(dpo_entries, f, ensure_ascii=False, indent=2)
             
         print(f"Total DPO Pairs Created: {len(dpo_entries)}")
         print(f"Saved DPO dataset to {dpo_json_path}")
-
-    # 4. Final Aggregation
-    if all_split_results:
-        final_df = pd.concat(all_split_results)
-        print("\n" + "=" * 60)
-        print(f"FINAL BENCHMARK SUMMARY (SPLIT-BASED: {args.split_file})")
-        print("=" * 60)
-        print(f"Average F-Score: {final_df['f_score'].mean():.4f}")
-        print(f"Average Kendall Tau: {final_df['kendall'].mean():.4f}")
-        print(f"Average Spearman Rho: {final_df['spearman'].mean():.4f}")
 
 # ──────────────────────── DPO TRAINING PIPELINE ────────────────────────
 def get_target_logp(image_path, raw_prompt, model, processor, target_id, model_type, device):
@@ -394,7 +349,7 @@ def train_dpo_lora(args):
         train_set = split['train_keys']
     
         # Load DPO split preference pairs
-        dpo_json_path = os.path.join("./", f"dpo_data_{args.dataset}_{args.model_type}_split_{split_idx}", f"dpo_dataset_split_{split_idx}.json")
+        dpo_json_path = os.path.join("./dpo_data/", f"{args.dataset}_{args.model_type}_split_{split_idx}", f"dpo_dataset_split_{split_idx}.json")
 
         with open(dpo_json_path, 'r', encoding='utf-8') as f:
             dpo_data = json.load(f)
@@ -560,7 +515,7 @@ if __name__ == "__main__":
     parser.add_argument("--split_file", type=str, default="./dataset/summe_splits.json")
     parser.add_argument("--train_lora", action="store_true", help="Run LoRA DPO training")
     parser.add_argument("--lora_output_dir", type=str, default="./checkpoints")
-    parser.add_argument("--epochs", type=int, default=4)
+    parser.add_argument("--epochs", type=int, default=2)
     parser.add_argument("--learning_rate", type=float, default=5e-5)
     parser.add_argument("--beta", type=float, default=1)
     args = parser.parse_args()
