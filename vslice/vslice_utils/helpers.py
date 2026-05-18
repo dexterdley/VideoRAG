@@ -180,11 +180,18 @@ def build_dpo_dataset(manifest_data):
         valleys = np.where(data['valleys'])[0]
 
         prompt = f"{system_prompt}\nDoes this image represent the core message of {data['keywords']} in the video context of '{data['title']}'?"
-
         seen_pairs = set()
         
-        for r in valleys:
-            c = random.choice(peaks)
+        for c in peaks:
+            gaps = gt[c] - gt[valleys]
+            valid_indices = np.where(gaps > 0)[0]
+
+            valid_valleys = valleys[valid_indices]
+            valid_gaps = gaps[valid_indices]
+            gap_probs = valid_gaps / np.sum(valid_gaps)
+
+            r = np.random.choice(valid_valleys, p=gap_probs)
+            #c = random.choice(peaks)
             if (c, r) not in seen_pairs:
                 seen_pairs.add((c,r))
 
