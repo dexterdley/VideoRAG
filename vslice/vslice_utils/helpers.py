@@ -17,6 +17,8 @@ try:
 except ImportError:
     generate_summary = get_corr_coeff = get_gt = None
 
+epsilon = 1e-6
+
 def set_seed(seed):
     """Set all random seeds for reproducible training."""
     random.seed(seed)
@@ -25,6 +27,8 @@ def set_seed(seed):
     if torch.cuda.is_available():
         torch.cuda.manual_seed(seed)
         torch.cuda.manual_seed_all(seed)
+
+set_seed(42)
 
 def temporal_process_features(features, window_size=15):
     """
@@ -185,7 +189,8 @@ def build_dpo_dataset(manifest_data):
                 seen_pairs.add((c,r))
 
                 # Calculate the confidence gap
-                gap = float(gt[c] - gt[r])
+                gap = gt[c] - gt[r]
+                log_gap = np.log(gt[c] + epsilon) - np.log(gt[r] + epsilon)
 
                 dpo_entries.append({
                     "prompt": prompt,
@@ -193,7 +198,10 @@ def build_dpo_dataset(manifest_data):
                     "rejected_image": frames[r],
                     "chosen_response": "Yes",
                     "rejected_response": "No",
-                    "margin": gap
+                    "chosen_gt": float(gt[c]),
+                    "rejected_gt": float(gt[r]),
+                    "margin": float(gap),
+                    "log_margin": float(log_gap),
                 })
     return dpo_entries
 

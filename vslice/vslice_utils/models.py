@@ -3,6 +3,7 @@ import torch.nn.functional as F
 from PIL import Image
 from transformers import AutoModel, AutoTokenizer, AutoProcessor, AutoModelForImageTextToText
 from qwen_vl_utils import process_vision_info
+from peft import PeftModel
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -68,8 +69,7 @@ def minicpm_extract_title_and_keywords(raw_title, model, processor):
     )
     
     msgs = [{'role': 'user', 'content': prompt}]
-    
-    # Text-only generation (no images)
+       
     res = model.chat(
         image=None,
         msgs=msgs,

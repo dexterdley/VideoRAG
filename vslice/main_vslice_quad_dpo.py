@@ -40,9 +40,7 @@ device = "cuda" if torch.cuda.is_available() else "cpu"
 set_seed(42)
 
 """
-TBD 
-FIX Evaluating LoRA Model (After Quad-DPO) ---
-[WARN] Format failed for 'Air Force One', falling back to raw title.
+TBD: 
 
 SUMME: TO BEAT 0.256 0.285, TVSUM: 0.195 0.255
 ============================================================
@@ -72,6 +70,28 @@ FINAL CROSS-VALIDATION BENCHMARK SUMMARY (WITH VISUAL SKILLS), ./dataset/tvsum_s
 Average F-Score: 0.5800
 Average Kendall Tau: 0.2301
 Average Spearman Rho: 0.2906
+
+
+════════════════════════════════════════════════════════════                    
+FINAL GLOBAL BENCHMARK SUMMARY (5 SPLITS)                                       
+════════════════════════════════════════════════════════════                    
+      Metric  Base Model  Quad-DPO (LoRA)                                       
+     F-Score    0.437657         0.442469                                       
+ Kendall Tau    0.105671         0.140379                                       
+Spearman Rho    0.117432         0.157086                                       
+────────────────────────────────────────────────────────────                    
+Global Spearman Improvement: +33.77%        
+
+════════════════════════════════════════════════════════════                    
+FINAL GLOBAL BENCHMARK SUMMARY (5 SPLITS)                                       
+════════════════════════════════════════════════════════════                    
+      Metric  Base Model  Quad-DPO (LoRA)                                       
+     F-Score    0.437657         0.466289                                       
+ Kendall Tau    0.105671         0.157541                                       
+Spearman Rho    0.117432         0.175632                                       
+────────────────────────────────────────────────────────────                    
+Global Spearman Improvement: +49.56%                                            
+════════════════════════════════════════════════════════════
 
 """
 
@@ -232,7 +252,7 @@ def get_target_logp(image_path, raw_prompt, model, processor, target_id, model_t
             return_tensors="pt",
             max_length=2048
         ).to(device)
-        
+
         if "position_ids" not in inputs:
             batch_size, seq_len = inputs["input_ids"].shape
             inputs["position_ids"] = torch.arange(seq_len, dtype=torch.long, device=device).unsqueeze(0).expand(batch_size, -1)
@@ -244,7 +264,7 @@ def get_target_logp(image_path, raw_prompt, model, processor, target_id, model_t
             outputs = model.base_model(inputs, attention_mask=inputs.get("attention_mask"))
         else:
             outputs = model(inputs, attention_mask=inputs.get("attention_mask"))
-        logits = outputs.logits[:, -1, :] 
+        logits = outputs.logits[:, -1, :]
         
     elif model_type == "qwen":
         from qwen_vl_utils import process_vision_info
@@ -347,7 +367,8 @@ def train_dpo_lora(args):
     for split_idx, split in enumerate(splits[:1]):
         print(f"Starting LoRA DPO Training on {args.dataset} split {split_idx+1}/{len(splits)}...")
         train_set = split['train_keys']
-    
+        test_set = split['test_keys']
+        
         # Load DPO split preference pairs
         dpo_json_path = os.path.join("./dpo_data/", f"{args.dataset}_{args.model_type}_split_{split_idx}", f"dpo_dataset_split_{split_idx}.json")
 
@@ -377,12 +398,12 @@ def train_dpo_lora(args):
             epoch_loss = 0.0
             
             pbar = tqdm(dpo_data, desc="DPO Training")
-            for pair in pbar:
+            for step, pair in enumerate(pbar):
                 chosen_img_path = pair['chosen_image']
                 rejected_img_path = pair['rejected_image']
                 prompt = pair['prompt']
                 
-                target_id = yes_id if pair.get('output', 'Yes') == 'Yes' else no_id
+                target_id = yes_id if pair.get('chosen_response', None) == 'Yes' else no_id
                 
                 # Policy Logps (LoRA Enabled)
                 pi_logp_c = get_target_logp(chosen_img_path, prompt, peft_model, processor, target_id, args.model_type, device)
@@ -399,12 +420,16 @@ def train_dpo_lora(args):
                 logits = pi_ratio - ref_ratio
                 
                 # Apply margin based on GT
-                margin = 0
-                loss = -F.logsigmoid(args.beta * logits - margin)
+                log_margin = torch.tensor(pair['margin'], device=device)
+                loss = -F.logsigmoid(args.beta * (logits - log_margin))
                 
-                optimizer.zero_grad()
+                #target_prob = torch.tensor(0.5 + (pair['margin'] / 2.0), dtype=logits.dtype, device=logits.device)
+                #target_prob_tensor = target_prob.expand_as(logits)
+                #loss = F.binary_cross_entropy_with_logits(logits, target_prob_tensor)
+                
                 loss.backward()
                 optimizer.step()
+                optimizer.zero_grad()
                 
                 epoch_loss += loss.item()
                 pbar.set_postfix({"loss": f"{loss.item():.4f}"})
@@ -425,14 +450,14 @@ def train_dpo_lora(args):
         with peft_model.disable_adapter():
             with torch.no_grad():
                 df_base = evaluate_model(
-                    eval_model, "Base", train_set, manifest, h5_paths, 
+                    eval_model, "Base", test_set, manifest, h5_paths, 
                     args, processor, yes_id, no_id, tvsum_user_scores
                 )
                 
         print("\n--- Evaluating LoRA Model (After Quad-DPO) ---")
         with torch.no_grad():
             df_lora = evaluate_model(
-                eval_model, "Quad-DPO", train_set, manifest, h5_paths, 
+                eval_model, "Quad-DPO", test_set, manifest, h5_paths, 
                 args, processor, yes_id, no_id, tvsum_user_scores
             )
             
@@ -516,7 +541,8 @@ if __name__ == "__main__":
     parser.add_argument("--train_lora", action="store_true", help="Run LoRA DPO training")
     parser.add_argument("--lora_output_dir", type=str, default="./checkpoints")
     parser.add_argument("--epochs", type=int, default=2)
-    parser.add_argument("--learning_rate", type=float, default=5e-5)
+    parser.add_argument("--learning_rate", type=float, default=1e-5)
+    parser.add_argument("--accumulation_steps", type=int, default=8)
     parser.add_argument("--beta", type=float, default=1)
     args = parser.parse_args()
     

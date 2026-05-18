@@ -60,9 +60,13 @@ def evaluate_model(model, model_name, video_keys, manifest, h5_paths, args, proc
 
         dataset = VideoSegmentDataset(video_path, segment_length=32, width=896, height=672, picks=picks)
         loader = DataLoader(dataset, batch_size=None, shuffle=False, num_workers=2, prefetch_factor=1)
-        
+
         if args.model_type == "minicpm":
-            cleaned_title, keywords = minicpm_extract_title_and_keywords(title, model, processor)
+            if isinstance(model, PeftModel):
+                with model.disable_adapter():
+                    cleaned_title, keywords = minicpm_extract_title_and_keywords(title, model.base_model, processor)
+            else:
+                cleaned_title, keywords = minicpm_extract_title_and_keywords(title, model, processor)
         else:
             cleaned_title, keywords = qwen_extract_title_and_keywords(title, model)
             
@@ -70,7 +74,7 @@ def evaluate_model(model, model_name, video_keys, manifest, h5_paths, args, proc
         pbar = tqdm(loader, desc=f"[{model_name}] {title}", leave=False)
         for frames, start, end in pbar:
             if args.model_type == "minicpm":
-                p_yes, p_no, _, _, _ = minicpm_inference(frames, cleaned_title, keywords, model, processor, yes_id, no_id)
+                p_yes, p_no, _, _, _ = minicpm_inference(frames, cleaned_title, keywords, model.base_model, processor, yes_id, no_id)
             else:
                 p_yes, p_no, _, _, _ = qwen_inference(frames, cleaned_title, keywords, wrapper_model, yes_id, no_id)
                 
@@ -142,18 +146,12 @@ def test_dpo_lora(args):
         peft_model = PeftModel.from_pretrained(actual_model, lora_dir)
         peft_model.eval()
 
-        # For evaluation, we need the PEFT base_model (has LoRA layers injected)
-        if hasattr(peft_model, "base_model"):
-            eval_model = peft_model.base_model
-        else:
-            eval_model = peft_model
-
         # ─── Evaluate Base Model (LoRA disabled) ───
         print(f"\n--- Base Model (No LoRA) on test split {split_idx+1} ---")
         with peft_model.disable_adapter():
             with torch.no_grad():
                 df_base = evaluate_model(
-                    eval_model, "Base", test_set, manifest, h5_paths,
+                    actual_model, "Base", test_set, manifest, h5_paths,
                     args, processor, yes_id, no_id, tvsum_user_scores
                 )
 
@@ -161,7 +159,7 @@ def test_dpo_lora(args):
         print(f"\n--- Quad-DPO LoRA on test split {split_idx+1} ---")
         with torch.no_grad():
             df_lora = evaluate_model(
-                eval_model, "Quad-DPO", test_set, manifest, h5_paths,
+                peft_model, "Quad-DPO", test_set, manifest, h5_paths,
                 args, processor, yes_id, no_id, tvsum_user_scores
             )
 
