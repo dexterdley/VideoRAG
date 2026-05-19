@@ -219,7 +219,7 @@ def create_dpo_splits(args):
 
         # Build DPO Dataset for the Split
         dpo_entries = build_dpo_dataset(manifest_data)
-        dpo_json_path = os.path.join(split_out_dir, f"dpo_dataset_split_{split_idx}.json")
+        dpo_json_path = os.path.join(split_out_dir, f"peaks_dpo_dataset_split_{split_idx}.json")
         with open(dpo_json_path, 'w', encoding='utf-8') as f:
             json.dump(dpo_entries, f, ensure_ascii=False, indent=2)
             
@@ -392,11 +392,34 @@ def train_dpo_lora(args):
         
         optimizer = torch.optim.AdamW(peft_model.parameters(), lr=args.learning_rate)        
         os.makedirs(args.lora_output_dir, exist_ok=True)
-        
+
+        # Evaluate base model on train set once before training
+        '''
+        actual_model.eval()
+        print("\n--- Evaluating Base Model on Train Set (Before DPO) ---")
+        with torch.no_grad():
+            df_base_train = evaluate_model(
+                actual_model, "Base", train_set, manifest, h5_paths, 
+                args, processor, yes_id, no_id, tvsum_user_scores
+            )
+        base_train_f = df_base_train['f_score'].mean()
+        base_train_k = df_base_train['kendall'].mean()
+        base_train_s = df_base_train['spearman'].mean()
+        '''
+        base_train_f = 0.4311
+        base_train_k = 0.1237
+        base_train_s = 0.1376
+        print(f"Base Train — F={base_train_f:.4f} | τ={base_train_k:.4f} | ρ={base_train_s:.4f}")
         for epoch in range(args.epochs):
             print(f"\n--- Epoch {epoch+1}/{args.epochs} ---")
             epoch_loss = 0.0
             
+            # Diagnostic accumulators
+            diag = {
+                'pi_ratio': [], 'ref_ratio': [], 'logits': [], 'log_margin': [],
+                'correct': 0, 'total': 0, 'grad_norms': [],
+            }
+
             pbar = tqdm(dpo_data, desc="DPO Training")
             for step, pair in enumerate(pbar):
                 chosen_img_path = pair['chosen_image']
@@ -420,24 +443,62 @@ def train_dpo_lora(args):
                 logits = pi_ratio - ref_ratio
                 
                 # Apply margin based on GT
-                log_margin = torch.tensor(pair['margin'], device=device)
-                loss = -F.logsigmoid(args.beta * (logits - log_margin))
+                margin = torch.tensor(pair['margin'], device=device)
+                loss = -F.logsigmoid(args.beta * (logits - margin))
                 
                 #target_prob = torch.tensor(0.5 + (pair['margin'] / 2.0), dtype=logits.dtype, device=logits.device)
                 #target_prob_tensor = target_prob.expand_as(logits)
                 #loss = F.binary_cross_entropy_with_logits(logits, target_prob_tensor)
                 
+                # Track diagnostics
+                diag['pi_ratio'].append(pi_ratio.item())
+                diag['ref_ratio'].append(ref_ratio.item())
+                diag['logits'].append(logits.item())
+                diag['log_margin'].append(margin.item())
+                diag['total'] += 1
+                if logits.item() > margin.item():
+                    diag['correct'] += 1
+
                 loss.backward()
                 optimizer.step()
                 optimizer.zero_grad()
                 
                 epoch_loss += loss.item()
                 pbar.set_postfix({"loss": f"{loss.item():.4f}"})
-                
+
+            acc = diag['correct'] / diag['total'] * 100
             print(f"Epoch {epoch+1} Avg Loss: {epoch_loss / len(dpo_data):.4f}")
+            print(f"\n{'═'*60}")
+            print(f"EPOCH {epoch+1} DIAGNOSTICS:")
+            print(f"{'═'*60}")
+            print(f"  DPO Preference Accuracy (logits > margin): {diag['correct']}/{diag['total']} ({acc:.1f}%)")
+            print(f"  π(c)-π(r)  (pi_ratio): {np.mean(diag['pi_ratio']):.4f} ± {np.std(diag['pi_ratio']):.4f}")
+            print(f"  μ(c)-μ(r) (ref_ratio): {np.mean(diag['ref_ratio']):.4f} ± {np.std(diag['ref_ratio']):.4f}")
+            print(f"  DPO logits (pi-ref)  : {np.mean(diag['logits']):.4f} ± {np.std(diag['logits']):.4f}")
+            print(f"  GT margin (target)   : {np.mean(diag['log_margin']):.4f} ± {np.std(diag['log_margin']):.4f}")
+            print(f"{'═'*60}")
+
+            # --- Per-epoch train set evaluation ---
+            peft_model.eval()
+            with torch.no_grad():
+                df_lora_train = evaluate_model(
+                    peft_model.base_model, f"DPO-E{epoch+1}", train_set, manifest, h5_paths, 
+                    args, processor, yes_id, no_id, tvsum_user_scores
+                )
+            dpo_train_f = df_lora_train['f_score'].mean()
+            dpo_train_k = df_lora_train['kendall'].mean()
+            dpo_train_s = df_lora_train['spearman'].mean()
+            
+            print(f"\n{'─'*50}")
+            print(f"EPOCH {epoch+1} TRAIN SET COMPARISON:")
+            print(f"{'─'*50}")
+            print(f"  Base    — F={base_train_f:.4f} | τ={base_train_k:.4f} | ρ={base_train_s:.4f}")
+            print(f"  DPO E{epoch+1} — F={dpo_train_f:.4f} | τ={dpo_train_k:.4f} | ρ={dpo_train_s:.4f}")
+            print(f"  Δρ = {dpo_train_s - base_train_s:+.4f}")
+            print(f"{'─'*50}")
 
         print("\n" + "="*50)
-        print("EVALUATING FULL VIDEO METRICS (TRAIN SET)")
+        print("EVALUATING FULL VIDEO METRICS (TEST SET)")
         print("="*50)
 
         peft_model.eval()
