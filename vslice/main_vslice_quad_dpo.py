@@ -76,23 +76,12 @@ Average Spearman Rho: 0.2906
 FINAL GLOBAL BENCHMARK SUMMARY (5 SPLITS)                                       
 ════════════════════════════════════════════════════════════                    
       Metric  Base Model  Quad-DPO (LoRA)                                       
-     F-Score    0.437657         0.442469                                       
- Kendall Tau    0.105671         0.140379                                       
-Spearman Rho    0.117432         0.157086                                       
+     F-Score    0.437657         0.506319                                       
+ Kendall Tau    0.105671         0.180568                                       
+Spearman Rho    0.117432         0.201821                                       
 ────────────────────────────────────────────────────────────                    
-Global Spearman Improvement: +33.77%        
-
-════════════════════════════════════════════════════════════                    
-FINAL GLOBAL BENCHMARK SUMMARY (5 SPLITS)                                       
-════════════════════════════════════════════════════════════                    
-      Metric  Base Model  Quad-DPO (LoRA)                                       
-     F-Score    0.437657         0.466289                                       
- Kendall Tau    0.105671         0.157541                                       
-Spearman Rho    0.117432         0.175632                                       
-────────────────────────────────────────────────────────────                    
-Global Spearman Improvement: +49.56%                                            
-════════════════════════════════════════════════════════════
-
+Global Spearman Improvement: +71.86%                                            
+════════════════════════════════════════════════════════════  
 """
 
 # Fix Windows console encoding for non-ASCII characters
@@ -132,7 +121,7 @@ def create_dpo_splits(args):
             splits = json.load(f)
         print(f"Loaded {len(splits)} splits from {args.split_file}")
 
-    for split_idx, split in enumerate(splits[:1]):
+    for split_idx, split in enumerate(splits):
         print(f"\n==================== SPLIT {split_idx+1}/{len(splits)} ====================")
         train_set = split['train_keys']
         manifest_data = {}
@@ -219,7 +208,7 @@ def create_dpo_splits(args):
 
         # Build DPO Dataset for the Split
         dpo_entries = build_dpo_dataset(manifest_data)
-        dpo_json_path = os.path.join(split_out_dir, f"peaks_dpo_dataset_split_{split_idx}.json")
+        dpo_json_path = os.path.join(split_out_dir, f"dpo_dataset_split_{split_idx}.json")
         with open(dpo_json_path, 'w', encoding='utf-8') as f:
             json.dump(dpo_entries, f, ensure_ascii=False, indent=2)
             
@@ -364,7 +353,7 @@ def train_dpo_lora(args):
     all_base_split_metrics = []
     all_dpo_split_metrics = []
 
-    for split_idx, split in enumerate(splits[:1]):
+    for split_idx, split in enumerate(splits):
         print(f"Starting LoRA DPO Training on {args.dataset} split {split_idx+1}/{len(splits)}...")
         train_set = split['train_keys']
         test_set = split['test_keys']
