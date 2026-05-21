@@ -225,6 +225,7 @@ def qwen_inference(images, title, keywords, wrapper, yes_id, no_id, skills=None)
     probs_yes = []
     probs_no = []
     confs_all = []
+    hidden_states_all = []
     
     # 1. Build the In-Context Learning (ICL) Prefix
     icl_text = ""
@@ -267,8 +268,9 @@ def qwen_inference(images, title, keywords, wrapper, yes_id, no_id, skills=None)
         ).to(device)
         
         with torch.inference_mode():
-            outputs = wrapper.model(**inputs)
+            outputs = wrapper.model(**inputs, output_hidden_states=True)
             logits = outputs.logits[:, -1, :]
+            hidden_states = outputs.hidden_states[-2][:, -1, :]
 
             yes_logits, no_logits = logits[:, yes_id], logits[:, no_id]
             binary_probs = F.softmax(torch.stack([yes_logits, no_logits], dim=-1), dim=-1)
@@ -276,5 +278,6 @@ def qwen_inference(images, title, keywords, wrapper, yes_id, no_id, skills=None)
             probs_yes.append(binary_probs[:, 0])
             probs_no.append(binary_probs[:, 1])
             confs_all.append(F.relu(binary_probs[:, 0] - binary_probs[:, 1]).pow(2))
+            hidden_states_all.append(hidden_states)
     
-    return torch.cat(probs_yes), torch.cat(probs_no), yes_logits, no_logits, torch.cat(confs_all)
+    return torch.cat(probs_yes), torch.cat(probs_no), yes_logits, no_logits, torch.cat(hidden_states_all, dim=0)

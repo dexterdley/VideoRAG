@@ -40,7 +40,7 @@ device = "cuda" if torch.cuda.is_available() else "cpu"
 set_seed(42)
 
 """
-TBD: 
+TBD: DEBUG WHETHER NEW LORA IS CORRECT ON EACH SPLIT
 
 SUMME: TO BEAT 0.256 0.285, TVSUM: 0.195 0.255
 ============================================================
@@ -121,7 +121,7 @@ def create_dpo_splits(args):
             splits = json.load(f)
         print(f"Loaded {len(splits)} splits from {args.split_file}")
 
-    for split_idx, split in enumerate(splits):
+    for split_idx, split in enumerate(splits[2:3], start=2):
         print(f"\n==================== SPLIT {split_idx+1}/{len(splits)} ====================")
         train_set = split['train_keys']
         manifest_data = {}
@@ -353,7 +353,7 @@ def train_dpo_lora(args):
     all_base_split_metrics = []
     all_dpo_split_metrics = []
 
-    for split_idx, split in enumerate(splits):
+    for split_idx, split in enumerate(splits[:1]):
         print(f"Starting LoRA DPO Training on {args.dataset} split {split_idx+1}/{len(splits)}...")
         train_set = split['train_keys']
         test_set = split['test_keys']
@@ -383,7 +383,7 @@ def train_dpo_lora(args):
         os.makedirs(args.lora_output_dir, exist_ok=True)
 
         # Evaluate base model on train set once before training
-        '''
+
         actual_model.eval()
         print("\n--- Evaluating Base Model on Train Set (Before DPO) ---")
         with torch.no_grad():
@@ -398,6 +398,7 @@ def train_dpo_lora(args):
         base_train_f = 0.4311
         base_train_k = 0.1237
         base_train_s = 0.1376
+        '''
         print(f"Base Train — F={base_train_f:.4f} | τ={base_train_k:.4f} | ρ={base_train_s:.4f}")
         for epoch in range(args.epochs):
             print(f"\n--- Epoch {epoch+1}/{args.epochs} ---")
@@ -527,7 +528,7 @@ def train_dpo_lora(args):
         all_dpo_split_metrics.append(dpo_summary)
 
         print("\n" + "="*50)
-        print("COMPARISON RESULTS (TRAIN SET):")
+        print("COMPARISON RESULTS (TEST SET):")
         print("="*50)
         print(f"Base F-Score: {df_base['f_score'].mean():.4f}  | Quad-DPO (LoRA) F-Score: {df_lora['f_score'].mean():.4f}")
         print(f"Base Kendall: {df_base['kendall'].mean():.4f}  | Quad-DPO (LoRA) Kendall: {df_lora['kendall'].mean():.4f}")
