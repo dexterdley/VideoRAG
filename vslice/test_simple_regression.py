@@ -41,24 +41,6 @@ if sys.platform == "win32":
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
     sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
 
-"""
-SUMME: TO BEAT 0.256 0.285, TVSUM: 0.195 0.255
-==================== SPLIT 1/5 ====================
-[Split 1] Test | F-Score: 0.4464 | Tau: 0.1548 | Rho: 0.1723
-==================== SPLIT 2/5 ====================
-[Split 2] Test | F-Score: 0.5475 | Tau: 0.2793 | Rho: 0.3109
-==================== SPLIT 3/5 ====================
-[Split 3] Test | F-Score: 0.5193 | Tau: 0.2429 | Rho: 0.2687
-==================== SPLIT 4/5 ====================
-[Split 4] Test | F-Score: 0.5311 | Tau: 0.2160 | Rho: 0.2430
-==================== SPLIT 5/5 ====================
-[Split 5] Test | F-Score: 0.5052 | Tau: 0.2333 | Rho: 0.2591
-════════════════════════════════════════════════════════════
-FINAL GLOBAL BENCHMARK SUMMARY (5 SPLITS)
-════════════════════════════════════════════════════════════
-Global Avg | F1: 0.5099 | Kendall: 0.2253 | Spearman: 0.2508
-"""
-
 class VLMRegressionHead(nn.Module):
     def __init__(self, hidden_dim):
         super().__init__()
@@ -95,12 +77,11 @@ def evaluate_regression(model, reg_head, val_loader, dataset_name, h5_paths, tvs
             with torch.no_grad():
                 outputs = model(batch_data, attention_mask=batch_data.get("attention_mask"), output_hidden_states=True)
                 hidden_states = outputs.hidden_states[-2][:, -1, :] # Second-to-last layer embeddings
-                #logits = outputs.logits[:, -1, :]
-                #yes_logits, no_logits = logits[:, yes_id], logits[:, no_id]
-                #binary_probs = F.softmax(torch.stack([yes_logits, no_logits], dim=-1), dim=-1)
-                #preds = binary_probs[:, 0]
+                logits = outputs.logits[:, -1, :]  # Last token logits
+                yes_logits, no_logits = logits[:, yes_id], logits[:, no_id]
+                binary_probs = F.softmax(torch.stack([yes_logits, no_logits], dim=-1), dim=-1)
+                preds = binary_probs[:, 0]
                 
-            preds = reg_head(hidden_states.to(torch.float32))
             final_scores = preds.detach().cpu().float().numpy()
             
             res = compute_video_metrics(
@@ -137,49 +118,21 @@ def train_regression(args):
 
     # Run for the splits requested (for debug, usually all splits)
     for split_idx, split in enumerate(splits):
-        print(f"\n==================== SPLIT {split_idx+1}/{len(splits)} ====================")
-        train_set = split['train_keys']
-        test_set = split['test_keys']
-        
+        print(f"\n==================== SPLIT {split_idx+1}/{len(splits)} ====================")        
+
         # Reset regression head for each split so they are independent
         reg_head = VLMRegressionHead(model.config.hidden_size).to(device)
-        optimizer = optim.AdamW(reg_head.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.num_epochs, eta_min=1e-6)
-        
+        wrapper_model = None
+
         # --- Datasets and Dataloaders ---
         if args.dataset == 'summe':
-            train_dataset = SumMeLLaMA_VideoDataset(mode='train', split_idx=split_idx, clip_length=args.clip_length, processor=processor, load_test=False)
-            val_dataset = SumMeLLaMA_VideoDataset(mode='test', split_idx=split_idx, clip_length=args.clip_length * args.batch_size, processor=processor, load_test=False)
             test_dataset = SumMeLLaMA_VideoDataset(mode='test', split_idx=split_idx, clip_length=args.clip_length * args.batch_size, processor=processor, load_test=True)
-
         elif args.dataset == 'tvsum':
-            train_dataset = TVSumLLaMA_VideoDataset(mode='train', split_idx=split_idx, clip_length=args.clip_length, processor=processor, load_test=False)
-            val_dataset = TVSumLLaMA_VideoDataset(mode='test', split_idx=split_idx, clip_length=args.clip_length * args.batch_size, processor=processor, load_test=False)
             test_dataset = TVSumLLaMA_VideoDataset(mode='test', split_idx=split_idx, clip_length=args.clip_length * args.batch_size, processor=processor, load_test=True)
-
         else:
-            raise NotImplementedError(f"Dataset {args.dataset} not implemented.")
+            raise NotImplementedError(f"Dataset {config.dataset} not implemented.")
 
-        train_collator = TrainBatchCollator(processor=processor)
         val_collator = ValBatchCollator(processor=processor)
-
-        train_loader = DataLoader(
-            train_dataset,
-            batch_size=args.batch_size, # Number of videos per batch
-            shuffle=True,
-            collate_fn=train_collator,
-            num_workers=0,
-            pin_memory=True
-        )
-
-        val_loader = DataLoader(
-            val_dataset,
-            batch_size=1, 
-            shuffle=False,
-            collate_fn=val_collator, 
-            num_workers=0,
-            pin_memory=True
-        )
 
         test_loader = DataLoader(
             test_dataset,
@@ -191,87 +144,12 @@ def train_regression(args):
         )
 
         writer = SummaryWriter(f"runs/{args.output_dir}")
-        writer.add_text(
-            "hyperparameters",
-            "|param|value|\n|-|-|\n%s" % ("\n".join([f"|{key}|{value}|" for key, value in vars(args).items()])),
-        )
-
-        best_corr = -float('inf')
-
-        for epoch in tqdm(range(args.num_epochs), desc="Training.."):
-            epoch_loss = 0.0
-            num_batches = 0
-            reg_head.train()
-
-            for step, batch_data in enumerate(train_loader):
-                
-                gtscore = batch_data.pop("gtscore").to(device)
-                features = batch_data.pop("features").to(device)
-                titles = batch_data.pop("title")
-                video_names = batch_data.pop("video_name")
-
-                batch_data = batch_data.to(device)
-
-                with torch.no_grad():
-                    outputs = model(batch_data, attention_mask=batch_data.get("attention_mask"), output_hidden_states=True)
-                    logits = outputs.logits[:, -1, :]
-                    hidden_states = outputs.hidden_states[-2][:, -1, :]
-                
-                # yes_logits, no_logits = logits[:, yes_id], logits[:, no_id]
-                # binary_probs = F.softmax(torch.stack([yes_logits, no_logits], dim=-1), dim=-1)
-                # yes_probs = binary_probs[:, 0]
-                preds = reg_head(hidden_states.to(torch.float32))
-                loss = F.mse_loss(preds, gtscore.reshape(preds.shape))
-
-                loss.backward()
-                optimizer.step()
-                optimizer.zero_grad()
-                
-                epoch_loss += loss.item()
-                num_batches += 1
-
-            # Log average training loss for the epoch
-            avg_epoch_loss = epoch_loss / num_batches
-            writer.add_scalar("Train/loss", avg_epoch_loss, epoch)
-            writer.add_scalar("Train/learning_rate", scheduler.get_last_lr()[0], epoch)
-            scheduler.step()
-            
-            # ================= VALIDATION BLOCK =================
-            # Evaluate every 5 epochs, or on the final epoch
-            if (epoch + 1) % 5 == 0 or epoch == args.num_epochs - 1:
-                print("--> Running Validation...")
-                val_df = evaluate_regression(
-                    model=model, 
-                    reg_head=reg_head, 
-                    val_loader=val_loader, 
-                    dataset_name=args.dataset, 
-                    h5_paths=h5_paths
-                )
-                
-                if not val_df.empty:
-                    avg_f1 = val_df['f_score'].mean()
-                    avg_tau = val_df['kendall'].mean()
-                    avg_rho = val_df['spearman'].mean()
-                    print(f"\n[Split {split_idx+1}] Val Epoch {epoch+1} | F-Score: {avg_f1:.4f} | Tau: {avg_tau:.4f} | Rho: {avg_rho:.4f}")
-                    
-                    writer.add_scalar("Val/F-Score", avg_f1, epoch)
-                    writer.add_scalar("Val/Kendall_Tau", avg_tau, epoch)
-                    writer.add_scalar("Val/Spearman_Rho", avg_rho, epoch)
-
-                    current_corr = avg_tau + avg_rho
-                    if current_corr > best_corr:
-                        best_corr = current_corr
-                        save_path = os.path.join(args.output_dir, f"best_reg_head_split{split_idx}.pth")
-                        os.makedirs(args.output_dir, exist_ok=True)
-                        torch.save(reg_head.state_dict(), save_path)
-                        print(f"*** Saved regression head to {save_path}")
-
-        print(f"Finished Split {split_idx+1}. Best Correlation: {best_corr:.4f}\n")
 
         # ================= FINAL TEST BLOCK =================
         print(f"--> Running Final Test for Split {split_idx+1}...")
-
+        
         # Load the best saved model for testing
+        save_path = os.path.join(args.output_dir, f"best_reg_head_split{split_idx}.pth")
         if os.path.exists(save_path):
             reg_head.load_state_dict(torch.load(save_path))
             print(f"Loaded best checkpoint from {save_path}")
@@ -328,8 +206,6 @@ if __name__ == "__main__":
     parser.add_argument("--split_file", type=str, default="./dataset/summe_splits.json")
     parser.add_argument("--output_dir", type=str, default="./checkpoints")
     parser.add_argument("--num_epochs", type=int, default=50)
-    parser.add_argument("--learning_rate", type=float, default=3e-4)
-    parser.add_argument("--weight_decay", type=float, default=1e-5)
 
     parser.add_argument('--batch_size', type=int, default=2, help='Batch size (number of videos per batch)')
     parser.add_argument('--clip_length', type=int, default=4)

@@ -13,13 +13,14 @@ from tqdm import tqdm
 from torch.utils.data import DataLoader
 import h5py
 from torch.utils.tensorboard import SummaryWriter
+from peft import LoraConfig, get_peft_model, PeftModel
 
 from vslice_utils.models import load_vlm, minicpm_extract_title_and_keywords, qwen_extract_title_and_keywords, minicpm_inference, qwen_inference
 from vslice_utils.dataloader import build_summe_manifest, build_tvsum_manifest, VideoSegmentDataset
 from vslice_utils.helpers import set_seed, compute_video_metrics
 
-from vslice_utils.llava_summe_video_dataset import SumMeLLaMA_VideoDataset, TrainBatchCollator, ValBatchCollator
-from vslice_utils.llava_tvsum_video_dataset import TVSumLLaMA_VideoDataset, TrainBatchCollator, ValBatchCollator
+from vslice_utils.llava_summe_video_dataset import SumMeLLaMA_VideoDataset, SumMeLLaMA_DPODataset, DPOTrainBatchCollator, ValBatchCollator
+from vslice_utils.llava_tvsum_video_dataset import TVSumLLaMA_VideoDataset, TVSumLLaMA_DPODataset, DPOTrainBatchCollator, ValBatchCollator
 
 # Evaluation dependencies
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'csta'))
@@ -59,20 +60,11 @@ FINAL GLOBAL BENCHMARK SUMMARY (5 SPLITS)
 Global Avg | F1: 0.5099 | Kendall: 0.2253 | Spearman: 0.2508
 """
 
-class VLMRegressionHead(nn.Module):
-    def __init__(self, hidden_dim):
-        super().__init__()
-        self.linear = nn.Linear(hidden_dim, 1)
-        
-    def forward(self, x):
-        return torch.sigmoid(self.linear(x)).squeeze(-1)
-
-def evaluate_regression(model, reg_head, val_loader, dataset_name, h5_paths, tvsum_user_scores=None, yes_id=9454, no_id=2753):
+def evaluate(model, val_loader, dataset_name, h5_paths, tvsum_user_scores=None, yes_id=9454, no_id=2753):
     """
     Evaluates the model using the ValBatchCollator and val_loader.
     """
     split_results = []
-    reg_head.eval()
     
     h5_path = h5_paths.get(dataset_name.lower())
 
@@ -93,14 +85,13 @@ def evaluate_regression(model, reg_head, val_loader, dataset_name, h5_paths, tvs
             batch_data = batch_data.to(device)
 
             with torch.no_grad():
-                outputs = model(batch_data, attention_mask=batch_data.get("attention_mask"), output_hidden_states=True)
+                outputs = model.base_model(batch_data, attention_mask=batch_data.get("attention_mask"), output_hidden_states=True)
                 hidden_states = outputs.hidden_states[-2][:, -1, :] # Second-to-last layer embeddings
-                #logits = outputs.logits[:, -1, :]
-                #yes_logits, no_logits = logits[:, yes_id], logits[:, no_id]
-                #binary_probs = F.softmax(torch.stack([yes_logits, no_logits], dim=-1), dim=-1)
-                #preds = binary_probs[:, 0]
+                logits = outputs.logits[:, -1, :]
+                yes_logits, no_logits = logits[:, yes_id], logits[:, no_id]
+                binary_probs = F.softmax(torch.stack([yes_logits, no_logits], dim=-1), dim=-1)
+                preds = binary_probs[:, 0]
                 
-            preds = reg_head(hidden_states.to(torch.float32))
             final_scores = preds.detach().cpu().float().numpy()
             
             res = compute_video_metrics(
@@ -112,7 +103,7 @@ def evaluate_regression(model, reg_head, val_loader, dataset_name, h5_paths, tvs
     return pd.DataFrame(split_results)
 
 
-def train_regression(args):
+def train_dpo(args):
     # Load VLM
     vlm_vars = load_vlm(args.model_path, args.model_type, device)
     wrapper_or_model, tokenizer, processor, yes_id, no_id = vlm_vars
@@ -127,6 +118,15 @@ def train_regression(args):
     for param in model.parameters():
         param.requires_grad = False
 
+    lora_config = LoraConfig(
+            r=8,
+            lora_alpha=16,
+            target_modules=["q_proj", "v_proj", "k_proj", "o_proj"],
+            lora_dropout=0.05,
+            bias="none",
+            task_type="CAUSAL_LM"
+        )
+
     splits = []
     if args.split_file and os.path.exists(args.split_file):
         with open(args.split_file, 'r') as f:
@@ -138,29 +138,29 @@ def train_regression(args):
     # Run for the splits requested (for debug, usually all splits)
     for split_idx, split in enumerate(splits):
         print(f"\n==================== SPLIT {split_idx+1}/{len(splits)} ====================")
-        train_set = split['train_keys']
-        test_set = split['test_keys']
         
-        # Reset regression head for each split so they are independent
-        reg_head = VLMRegressionHead(model.config.hidden_size).to(device)
-        optimizer = optim.AdamW(reg_head.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
+        peft_model = get_peft_model(model, lora_config)
+        peft_model.print_trainable_parameters()
+        
+        # Reset LORA for each split so they are independent
+        optimizer = optim.AdamW(peft_model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.num_epochs, eta_min=1e-6)
         
         # --- Datasets and Dataloaders ---
         if args.dataset == 'summe':
-            train_dataset = SumMeLLaMA_VideoDataset(mode='train', split_idx=split_idx, clip_length=args.clip_length, processor=processor, load_test=False)
+            train_dataset = SumMeLLaMA_DPODataset(split_idx=split_idx, clip_length=args.clip_length, processor=processor, load_test=False)
             val_dataset = SumMeLLaMA_VideoDataset(mode='test', split_idx=split_idx, clip_length=args.clip_length * args.batch_size, processor=processor, load_test=False)
             test_dataset = SumMeLLaMA_VideoDataset(mode='test', split_idx=split_idx, clip_length=args.clip_length * args.batch_size, processor=processor, load_test=True)
 
         elif args.dataset == 'tvsum':
-            train_dataset = TVSumLLaMA_VideoDataset(mode='train', split_idx=split_idx, clip_length=args.clip_length, processor=processor, load_test=False)
+            train_dataset = TVSumLLaMA_DPODataset(split_idx=split_idx, clip_length=args.clip_length, processor=processor, load_test=False)
             val_dataset = TVSumLLaMA_VideoDataset(mode='test', split_idx=split_idx, clip_length=args.clip_length * args.batch_size, processor=processor, load_test=False)
             test_dataset = TVSumLLaMA_VideoDataset(mode='test', split_idx=split_idx, clip_length=args.clip_length * args.batch_size, processor=processor, load_test=True)
 
         else:
             raise NotImplementedError(f"Dataset {args.dataset} not implemented.")
 
-        train_collator = TrainBatchCollator(processor=processor)
+        train_collator = DPOTrainBatchCollator(processor=processor)
         val_collator = ValBatchCollator(processor=processor)
 
         train_loader = DataLoader(
@@ -190,6 +190,7 @@ def train_regression(args):
             pin_memory=True
         )
 
+       
         writer = SummaryWriter(f"runs/{args.output_dir}")
         writer.add_text(
             "hyperparameters",
@@ -197,36 +198,52 @@ def train_regression(args):
         )
 
         best_corr = -float('inf')
+        save_path = None
 
-        for epoch in tqdm(range(args.num_epochs), desc="Training.."):
+        for epoch in tqdm(range(args.num_epochs), desc="DPO Training.."):
             epoch_loss = 0.0
             num_batches = 0
-            reg_head.train()
+            peft_model.train()
 
             for step, batch_data in enumerate(train_loader):
-                
-                gtscore = batch_data.pop("gtscore").to(device)
-                features = batch_data.pop("features").to(device)
+
                 titles = batch_data.pop("title")
                 video_names = batch_data.pop("video_name")
+                c_gtscore = batch_data.pop("chosen_gt").to(device)
+                r_gtscore = batch_data.pop("rejected_gt").to(device)
 
-                batch_data = batch_data.to(device)
+                margin = batch_data.pop("margin").to(device)
+                log_margin = batch_data.pop("log_margin").to(device)
 
-                with torch.no_grad():
-                    outputs = model(batch_data, attention_mask=batch_data.get("attention_mask"), output_hidden_states=True)
-                    logits = outputs.logits[:, -1, :]
-                    hidden_states = outputs.hidden_states[-2][:, -1, :]
-                
-                # yes_logits, no_logits = logits[:, yes_id], logits[:, no_id]
-                # binary_probs = F.softmax(torch.stack([yes_logits, no_logits], dim=-1), dim=-1)
-                # yes_probs = binary_probs[:, 0]
-                preds = reg_head(hidden_states.to(torch.float32))
-                loss = F.mse_loss(preds, gtscore.reshape(preds.shape))
+                c_batch_data = batch_data.pop("chosen_inputs").to(device)
+                r_batch_data = batch_data.pop("rejected_inputs").to(device)
+
+                # Policy Logps (LoRA Enabled)
+                c_outputs = peft_model.base_model(c_batch_data, attention_mask=c_batch_data.get("attention_mask"))
+                r_outputs = peft_model.base_model(r_batch_data, attention_mask=r_batch_data.get("attention_mask"))
+
+                pi_logp_c = F.log_softmax(c_outputs.logits[:, -1, :], dim=-1)[:, yes_id]
+                pi_logp_r = F.log_softmax(r_outputs.logits[:, -1, :], dim=-1)[:, yes_id]
+
+                # Reference Logps (LoRA Disabled)
+                with peft_model.disable_adapter():
+                    with torch.no_grad():
+                        ref_c_outputs = peft_model.base_model(c_batch_data, attention_mask=c_batch_data.get("attention_mask"))
+                        ref_r_outputs = peft_model.base_model(r_batch_data, attention_mask=r_batch_data.get("attention_mask"))
+                        
+                        ref_logp_c = F.log_softmax(ref_c_outputs.logits[:, -1, :], dim=-1)[:, yes_id]
+                        ref_logp_r = F.log_softmax(ref_r_outputs.logits[:, -1, :], dim=-1)[:, yes_id]
+
+                pi_ratio = pi_logp_c - pi_logp_r
+                ref_ratio = ref_logp_c - ref_logp_r
+                logits = pi_ratio - ref_ratio
+
+                loss = -F.logsigmoid(args.beta * (logits - margin.reshape(logits.shape))).mean()
 
                 loss.backward()
                 optimizer.step()
                 optimizer.zero_grad()
-                
+
                 epoch_loss += loss.item()
                 num_batches += 1
 
@@ -240,12 +257,14 @@ def train_regression(args):
             # Evaluate every 5 epochs, or on the final epoch
             if (epoch + 1) % 5 == 0 or epoch == args.num_epochs - 1:
                 print("--> Running Validation...")
-                val_df = evaluate_regression(
-                    model=model, 
-                    reg_head=reg_head, 
+                peft_model.eval()
+                val_df = evaluate(
+                    model=peft_model, 
                     val_loader=val_loader, 
                     dataset_name=args.dataset, 
-                    h5_paths=h5_paths
+                    h5_paths=h5_paths,
+                    yes_id=yes_id,
+                    no_id=no_id
                 )
                 
                 if not val_df.empty:
@@ -261,10 +280,10 @@ def train_regression(args):
                     current_corr = avg_tau + avg_rho
                     if current_corr > best_corr:
                         best_corr = current_corr
-                        save_path = os.path.join(args.output_dir, f"best_reg_head_split{split_idx}.pth")
+                        save_path = os.path.join(args.output_dir, f"best_dpo_split{split_idx}.pth")
                         os.makedirs(args.output_dir, exist_ok=True)
-                        torch.save(reg_head.state_dict(), save_path)
-                        print(f"*** Saved regression head to {save_path}")
+                        peft_model.save_pretrained(save_path)
+                        print(f"Saved LoRA weights to {save_path}")
 
         print(f"Finished Split {split_idx+1}. Best Correlation: {best_corr:.4f}\n")
 
@@ -272,16 +291,19 @@ def train_regression(args):
         print(f"--> Running Final Test for Split {split_idx+1}...")
 
         # Load the best saved model for testing
-        if os.path.exists(save_path):
-            reg_head.load_state_dict(torch.load(save_path))
-            print(f"Loaded best checkpoint from {save_path}")
+        if save_path and os.path.exists(save_path):
+            peft_model = PeftModel.from_pretrained(model, save_path)
+            peft_model.to(device)
+            print(f"Loaded best LORA checkpoint from {save_path}")
 
-        test_df = evaluate_regression(
-            model=model, 
-            reg_head=reg_head, 
-            val_loader=test_loader, 
-            dataset_name=args.dataset, 
-            h5_paths=h5_paths
+        peft_model.eval()
+        test_df = evaluate(
+            model=peft_model,
+            val_loader=test_loader,
+            dataset_name=args.dataset,
+            h5_paths=h5_paths,
+            yes_id=yes_id,
+            no_id=no_id
         )
 
         if not test_df.empty:
@@ -328,14 +350,16 @@ if __name__ == "__main__":
     parser.add_argument("--split_file", type=str, default="./dataset/summe_splits.json")
     parser.add_argument("--output_dir", type=str, default="./checkpoints")
     parser.add_argument("--num_epochs", type=int, default=50)
-    parser.add_argument("--learning_rate", type=float, default=3e-4)
+    parser.add_argument("--learning_rate", type=float, default=1e-5)
     parser.add_argument("--weight_decay", type=float, default=1e-5)
 
     parser.add_argument('--batch_size', type=int, default=2, help='Batch size (number of videos per batch)')
     parser.add_argument('--clip_length', type=int, default=4)
+    parser.add_argument("--accumulation_steps", type=int, default=8)
+    parser.add_argument("--beta", type=float, default=1)
     args = parser.parse_args()
     
     if args.model_path is None:
         args.model_path = resolve_model_path(args.model_type)
     
-    train_regression(args)
+    train_dpo(args)
