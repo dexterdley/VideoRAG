@@ -13,7 +13,7 @@ from tqdm import tqdm
 from torch.utils.data import DataLoader
 import h5py
 from torch.utils.tensorboard import SummaryWriter
-from peft import LoraConfig, get_peft_model, PeftModel
+from peft import LoraConfig, get_peft_model, PeftModel, prepare_model_for_kbit_training
 
 from vslice_utils.models import load_vlm, minicpm_extract_title_and_keywords, qwen_extract_title_and_keywords, minicpm_inference, qwen_inference
 from vslice_utils.dataloader import build_summe_manifest, build_tvsum_manifest, VideoSegmentDataset
@@ -43,9 +43,11 @@ if sys.platform == "win32":
     sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
 
 """
+TBD SHOULD BE LORA WRAPPING ISSUE
 SUMME: TO BEAT 0.256 0.285, TVSUM: 0.195 0.255
 ==================== SPLIT 1/5 ====================
 [Split 1] Test | F-Score: 0.4464 | Tau: 0.1548 | Rho: 0.1723
+[Split 1] Test | F-Score: 0.4237 | Tau: 0.2025 | Rho: 0.2261
 ==================== SPLIT 2/5 ====================
 [Split 2] Test | F-Score: 0.5475 | Tau: 0.2793 | Rho: 0.3109
 ==================== SPLIT 3/5 ====================
@@ -57,7 +59,9 @@ SUMME: TO BEAT 0.256 0.285, TVSUM: 0.195 0.255
 ════════════════════════════════════════════════════════════
 FINAL GLOBAL BENCHMARK SUMMARY (5 SPLITS)
 ════════════════════════════════════════════════════════════
-Global Avg | F1: 0.5099 | Kendall: 0.2253 | Spearman: 0.2508
+Global Avg | F1: 0.5099 | Kendall: 0.2253 | Spearman: 0.2508 # Base
+Global Avg | F1: 0.5070 | Kendall: 0.2241 | Spearman: 0.2494 # w DPO
+
 """
 
 def evaluate(model, val_loader, dataset_name, h5_paths, tvsum_user_scores=None, yes_id=9454, no_id=2753):
@@ -65,8 +69,12 @@ def evaluate(model, val_loader, dataset_name, h5_paths, tvsum_user_scores=None, 
     Evaluates the model using the ValBatchCollator and val_loader.
     """
     split_results = []
-    
     h5_path = h5_paths.get(dataset_name.lower())
+    model.eval()
+
+    # --- DIAGNOSTIC ACCUMULATORS ---
+    all_preds = []
+    logit_diffs = []
 
     with torch.no_grad():
         for step, batch_data in enumerate(tqdm(val_loader, desc=f"Evaluating {dataset_name}", leave=False)):
@@ -84,22 +92,30 @@ def evaluate(model, val_loader, dataset_name, h5_paths, tvsum_user_scores=None, 
 
             batch_data = batch_data.to(device)
 
-            with torch.no_grad():
-                outputs = model.base_model(batch_data, attention_mask=batch_data.get("attention_mask"), output_hidden_states=True)
-                hidden_states = outputs.hidden_states[-2][:, -1, :] # Second-to-last layer embeddings
-                logits = outputs.logits[:, -1, :]
-                yes_logits, no_logits = logits[:, yes_id], logits[:, no_id]
-                binary_probs = F.softmax(torch.stack([yes_logits, no_logits], dim=-1), dim=-1)
-                preds = binary_probs[:, 0]
+            outputs = model.base_model(batch_data)
                 
-            final_scores = preds.detach().cpu().float().numpy()
+            logits = outputs.logits[:, -1, :]
+            yes_logits, no_logits = logits[:, yes_id], logits[:, no_id]
+            binary_probs = F.softmax(torch.stack([yes_logits, no_logits], dim=-1), dim=-1)
+            preds = binary_probs[:, 0]
             
+            # Diagnostic: Track the raw gap between Yes and No
+            diff = (yes_logits - no_logits).detach().cpu().float().numpy()
+            logit_diffs.extend(diff)
+
+            final_scores = preds.detach().cpu().float().numpy()
+            all_preds.extend(final_scores)
+
             res = compute_video_metrics(
                 final_scores, 1.0 - final_scores,
                 h5_path, video_name, video_name, dataset_name, tvsum_user_scores, use_advanced_scoring=False
             )
             split_results.append(res)
-            
+
+    all_preds = np.array(all_preds)
+    logit_diffs = np.array(logit_diffs)
+    unique_preds = len(np.unique(all_preds))
+    
     return pd.DataFrame(split_results)
 
 
@@ -114,19 +130,6 @@ def train_dpo(args):
         "tvsum": os.path.join(args.root_dir, "TVSum", "eccv16_dataset_tvsum_google_pool5.h5")
     }
 
-    # We want VLM to be completely frozen
-    for param in model.parameters():
-        param.requires_grad = False
-
-    lora_config = LoraConfig(
-            r=8,
-            lora_alpha=16,
-            target_modules=["q_proj", "v_proj", "k_proj", "o_proj"],
-            lora_dropout=0.05,
-            bias="none",
-            task_type="CAUSAL_LM"
-        )
-
     splits = []
     if args.split_file and os.path.exists(args.split_file):
         with open(args.split_file, 'r') as f:
@@ -134,6 +137,22 @@ def train_dpo(args):
         print(f"Loaded {len(splits)} splits from {args.split_file}")
 
     eval_split_metrics = {}
+
+
+    print("Currently using LoRA for fine-tuning the MiniCPM-V model.")
+    model.vpm.requires_grad_(False)
+    model.llm.requires_grad_(False)
+    for name, param in model.llm.named_parameters():
+        param.requires_grad = False
+
+    lora_config = LoraConfig(
+            r=8,
+            lora_alpha=16,
+            target_modules=["q_proj", "v_proj", "k_proj", "o_proj"],
+            lora_dropout=0.00,
+            bias="none",
+            task_type="CAUSAL_LM"
+    )
 
     # Run for the splits requested (for debug, usually all splits)
     for split_idx, split in enumerate(splits):
@@ -143,7 +162,7 @@ def train_dpo(args):
         peft_model.print_trainable_parameters()
         
         # Reset LORA for each split so they are independent
-        optimizer = optim.AdamW(peft_model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
+        optimizer = optim.Adam(peft_model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.num_epochs, eta_min=1e-6)
         
         # --- Datasets and Dataloaders ---
@@ -205,7 +224,14 @@ def train_dpo(args):
             num_batches = 0
             peft_model.train()
 
+            # Diagnostic accumulators
+            diag = {
+                'pi_ratio': [], 'ref_ratio': [], 'logits': [], 'margin': [],
+                'correct': 0, 'total': 0, 'mse': [], 'loss': [],
+            }
+
             for step, batch_data in enumerate(train_loader):
+                peft_model.train()
 
                 titles = batch_data.pop("title")
                 video_names = batch_data.pop("video_name")
@@ -219,26 +245,51 @@ def train_dpo(args):
                 r_batch_data = batch_data.pop("rejected_inputs").to(device)
 
                 # Policy Logps (LoRA Enabled)
-                c_outputs = peft_model.base_model(c_batch_data, attention_mask=c_batch_data.get("attention_mask"))
-                r_outputs = peft_model.base_model(r_batch_data, attention_mask=r_batch_data.get("attention_mask"))
+                c_outputs = peft_model.base_model(c_batch_data)
+                r_outputs = peft_model.base_model(r_batch_data)
 
-                pi_logp_c = F.log_softmax(c_outputs.logits[:, -1, :], dim=-1)[:, yes_id]
-                pi_logp_r = F.log_softmax(r_outputs.logits[:, -1, :], dim=-1)[:, yes_id]
+                c_logits_step = c_outputs.logits[:, -1, :]
+                r_logits_step = r_outputs.logits[:, -1, :]
+
+                # Stack yes/no logits and compute binary log-softmax
+                pi_logp_c = F.log_softmax(torch.stack([c_logits_step[:, yes_id], c_logits_step[:, no_id]], dim=-1),dim=-1)[:, 0]
+                pi_logp_r = F.log_softmax(torch.stack([r_logits_step[:, yes_id], r_logits_step[:, no_id]], dim=-1),dim=-1)[:, 0]
 
                 # Reference Logps (LoRA Disabled)
+                peft_model.eval()
                 with peft_model.disable_adapter():
                     with torch.no_grad():
-                        ref_c_outputs = peft_model.base_model(c_batch_data, attention_mask=c_batch_data.get("attention_mask"))
-                        ref_r_outputs = peft_model.base_model(r_batch_data, attention_mask=r_batch_data.get("attention_mask"))
+                        ref_c_outputs = peft_model.base_model(c_batch_data)
+                        ref_r_outputs = peft_model.base_model(r_batch_data)
                         
-                        ref_logp_c = F.log_softmax(ref_c_outputs.logits[:, -1, :], dim=-1)[:, yes_id]
-                        ref_logp_r = F.log_softmax(ref_r_outputs.logits[:, -1, :], dim=-1)[:, yes_id]
+                        ref_c_logits_step = ref_c_outputs.logits[:, -1, :]
+                        ref_r_logits_step = ref_r_outputs.logits[:, -1, :]
+                        
+                        ref_logp_c = F.log_softmax(
+                            torch.stack([ref_c_logits_step[:, yes_id], ref_c_logits_step[:, no_id]], dim=-1),dim=-1)[:, 0]
+                        
+                        ref_logp_r = F.log_softmax(
+                            torch.stack([ref_r_logits_step[:, yes_id], ref_r_logits_step[:, no_id]], dim=-1),dim=-1)[:, 0]
 
                 pi_ratio = pi_logp_c - pi_logp_r
                 ref_ratio = ref_logp_c - ref_logp_r
                 logits = pi_ratio - ref_ratio
 
-                loss = -F.logsigmoid(args.beta * (logits - margin.reshape(logits.shape))).mean()
+                loss = -F.logsigmoid(args.beta * (logits - log_margin.reshape(logits.shape))).mean()
+
+                #binary_probs = F.softmax(torch.stack([c_outputs.logits[:, -1, :][:, yes_id], c_outputs.logits[:, -1, :][:, no_id]], dim=-1), dim=-1)
+                #preds = binary_probs[:, 0]
+                # mse_loss = F.mse_loss(preds, c_gtscore.reshape(preds.shape))
+
+                # Track diagnostics
+                diag['loss'].append(loss.item())
+                diag['pi_ratio'].append(pi_ratio.mean().item())
+                diag['ref_ratio'].append(ref_ratio.mean().item())
+                diag['logits'].append(logits.mean().item())
+                diag['margin'].append(log_margin.mean().item())                
+                diag['correct'] += (logits > log_margin.reshape(logits.shape)).sum().item()
+                diag['mse'].append(F.mse_loss(preds, c_gtscore.reshape(preds.shape)).item())
+                diag['total'] += logits.size(0)
 
                 loss.backward()
                 optimizer.step()
@@ -247,6 +298,19 @@ def train_dpo(args):
                 epoch_loss += loss.item()
                 num_batches += 1
 
+            acc = diag['correct'] / diag['total'] * 100
+            print(f"\n{'═'*70}")
+            print(f"EPOCH {epoch+1} DIAGNOSTICS:")
+            print(f"{'═'*70}")
+            print(f"  Total Loss: {sum(diag['loss'])/len(diag['loss'])}")
+            print(f"  DPO Preference Accuracy (logits > margin): {diag['correct']}/{diag['total']} ({acc:.1f}%)")
+            print(f"  π(c)-π(r)  (pi_ratio): {np.mean(diag['pi_ratio']):.4f} ± {np.std(diag['pi_ratio']):.4f}")
+            print(f"  μ(c)-μ(r) (ref_ratio): {np.mean(diag['ref_ratio']):.4f} ± {np.std(diag['ref_ratio']):.4f}")
+            print(f"  DPO logits (pi-ref)  : {np.mean(diag['logits']):.4f} ± {np.std(diag['logits']):.4f}")
+            print(f"  GT margin (target)   : {np.mean(diag['margin']):.4f} ± {np.std(diag['margin']):.4f}")
+            print(f"  MSE   : {np.mean(diag['mse']):.4f} ± {np.std(diag['mse']):.4f}")
+            print(f"{'═'*70}")
+
             # Log average training loss for the epoch
             avg_epoch_loss = epoch_loss / num_batches
             writer.add_scalar("Train/loss", avg_epoch_loss, epoch)
@@ -254,13 +318,13 @@ def train_dpo(args):
             scheduler.step()
             
             # ================= VALIDATION BLOCK =================
-            # Evaluate every 5 epochs, or on the final epoch
-            if (epoch + 1) % 5 == 0 or epoch == args.num_epochs - 1:
+            # Evaluate every epochs, or on the final epoch
+            if (epoch + 1) % 1 == 0 or epoch == args.num_epochs - 1:
                 print("--> Running Validation...")
-                peft_model.eval()
+
                 val_df = evaluate(
                     model=peft_model, 
-                    val_loader=val_loader, 
+                    val_loader=test_loader, 
                     dataset_name=args.dataset, 
                     h5_paths=h5_paths,
                     yes_id=yes_id,
@@ -296,7 +360,6 @@ def train_dpo(args):
             peft_model.to(device)
             print(f"Loaded best LORA checkpoint from {save_path}")
 
-        peft_model.eval()
         test_df = evaluate(
             model=peft_model,
             val_loader=test_loader,
@@ -356,7 +419,7 @@ if __name__ == "__main__":
     parser.add_argument('--batch_size', type=int, default=2, help='Batch size (number of videos per batch)')
     parser.add_argument('--clip_length', type=int, default=4)
     parser.add_argument("--accumulation_steps", type=int, default=8)
-    parser.add_argument("--beta", type=float, default=1)
+    parser.add_argument("--beta", type=float, default=0.1)
     args = parser.parse_args()
     
     if args.model_path is None:

@@ -382,15 +382,16 @@ class SumMeLLaMA_DPODataset(Dataset):
         clip1_indices = self._sample_frame_indices(total_frames)
         clip2_indices = self._sample_frame_indices(total_frames)
 
-        # 2. Calculate the average ground truth score for each clip
-        score1 = full_gtscore[clip1_indices].mean().item()
-        score2 = full_gtscore[clip2_indices].mean().item()
-        
-        # 3. Assign higher-scoring clip to be 'chosen' and the lower to be 'rejected'
-        if score1 >= score2:
-            chosen_idx, rejected_idx = clip1_indices, clip2_indices
-        else:
-            chosen_idx, rejected_idx = clip2_indices, clip1_indices
+        chosen_idx = []
+        rejected_idx = []
+
+        for idx1, idx2 in zip(clip1_indices, clip2_indices):
+            if full_gtscore[idx1] >= full_gtscore[idx2]:
+                chosen_idx.append(idx1)
+                rejected_idx.append(idx2)
+            else:
+                chosen_idx.append(idx2)
+                rejected_idx.append(idx1)
 
         chosen_frames = [video_frames[i] for i in chosen_idx]
         rejected_frames = [video_frames[i] for i in rejected_idx]
