@@ -44,7 +44,7 @@ if sys.platform == "win32":
     sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
 
 """
-TBD SHOULD BE LORA WRAPPING ISSUE
+TBD FIX TVSUM EVALUATION BUG
 SUMME: TO BEAT 0.256 0.285, TVSUM: 0.195 0.255
 ==================== SPLIT 1/5 ====================
 [Split 1] Test | F-Score: 0.4464 | Tau: 0.1548 | Rho: 0.1723
@@ -61,7 +61,7 @@ SUMME: TO BEAT 0.256 0.285, TVSUM: 0.195 0.255
 FINAL GLOBAL BENCHMARK SUMMARY (5 SPLITS)
 ════════════════════════════════════════════════════════════
 Global Avg | F1: 0.5099 | Kendall: 0.2253 | Spearman: 0.2508 # Base
-Global Avg | F1: 0.5070 | Kendall: 0.2241 | Spearman: 0.2494 # w DPO
+Global Avg | F1: 0.4867 | Kendall: 0.2124 | Spearman: 0.2364 # w DPO
 
 """
 
@@ -208,7 +208,7 @@ def train_dpo(args):
         )
 
        
-        writer = SummaryWriter(f"runs/{args.dataset}_{timestamp}")
+        writer = SummaryWriter(f"runs/{args.dataset}_{split_idx}_{timestamp}")
         writer.add_text(
             "hyperparameters",
             "|param|value|\n|-|-|\n%s" % ("\n".join([f"|{key}|{value}|" for key, value in vars(args).items()])),
