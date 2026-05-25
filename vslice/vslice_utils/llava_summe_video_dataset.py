@@ -400,7 +400,6 @@ class SumMeLLaMA_DPODataset(Dataset):
         rejected_inputs = self._process_clip(rejected_frames, formatted_prompt)
         
         chosen_score, rejected_score = full_gtscore[chosen_idx], full_gtscore[rejected_idx]
-        margin = chosen_score - rejected_score
         log_margin = torch.log(chosen_score + self.epsilon) - torch.log(rejected_score + self.epsilon)
 
         return {
@@ -410,7 +409,6 @@ class SumMeLLaMA_DPODataset(Dataset):
             'rejected_inputs': rejected_inputs,
             'chosen_gt': chosen_score,
             'rejected_gt': rejected_score,
-            'margin': margin,
             'log_margin': log_margin
         }
 
@@ -450,7 +448,6 @@ class DPOTrainBatchCollator:
     def __call__(self, batch):
         video_names = [data['video_name'] for data in batch]
         titles = [data['title'] for data in batch]
-        margins = torch.stack([data['margin'] for data in batch])
         log_margins = torch.stack([data['log_margin'] for data in batch])
         chosen_gt = torch.stack([data['chosen_gt'] for data in batch])
         rejected_gt = torch.stack([data['rejected_gt'] for data in batch])
@@ -466,6 +463,5 @@ class DPOTrainBatchCollator:
             'rejected_inputs': rejected_inputs,
             'chosen_gt': chosen_gt,
             'rejected_gt': rejected_gt,
-            'margin': margins,
             'log_margin': log_margins
         }

@@ -14,6 +14,7 @@ from torch.utils.data import DataLoader
 import h5py
 from torch.utils.tensorboard import SummaryWriter
 from peft import LoraConfig, get_peft_model, PeftModel, prepare_model_for_kbit_training
+from datetime import datetime
 
 from vslice_utils.models import load_vlm, minicpm_extract_title_and_keywords, qwen_extract_title_and_keywords, minicpm_inference, qwen_inference
 from vslice_utils.dataloader import build_summe_manifest, build_tvsum_manifest, VideoSegmentDataset
@@ -47,7 +48,7 @@ TBD SHOULD BE LORA WRAPPING ISSUE
 SUMME: TO BEAT 0.256 0.285, TVSUM: 0.195 0.255
 ==================== SPLIT 1/5 ====================
 [Split 1] Test | F-Score: 0.4464 | Tau: 0.1548 | Rho: 0.1723
-[Split 1] Test | F-Score: 0.4237 | Tau: 0.2025 | Rho: 0.2261
+[Split 1] Test | F-Score: 0.4357 | Tau: 0.2116 | Rho: 0.2361
 ==================== SPLIT 2/5 ====================
 [Split 2] Test | F-Score: 0.5475 | Tau: 0.2793 | Rho: 0.3109
 ==================== SPLIT 3/5 ====================
@@ -125,6 +126,8 @@ def train_dpo(args):
     wrapper_or_model, tokenizer, processor, yes_id, no_id = vlm_vars
     model = wrapper_or_model.model if args.model_type == "qwen" else wrapper_or_model
     
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
     h5_paths = {
         "summe": os.path.join(args.root_dir, "SumMe", "eccv16_dataset_summe_google_pool5.h5"),
         "tvsum": os.path.join(args.root_dir, "TVSum", "eccv16_dataset_tvsum_google_pool5.h5")
@@ -139,30 +142,25 @@ def train_dpo(args):
     eval_split_metrics = {}
 
 
-    print("Currently using LoRA for fine-tuning the MiniCPM-V model.")
-    model.vpm.requires_grad_(False)
-    model.llm.requires_grad_(False)
-    for name, param in model.llm.named_parameters():
-        param.requires_grad = False
+    print("Freezing base model & use LoRA for fine-tuning ...")
+    model.requires_grad_(False)
 
     lora_config = LoraConfig(
             r=8,
             lora_alpha=16,
             target_modules=["q_proj", "v_proj", "k_proj", "o_proj"],
-            lora_dropout=0.00,
+            lora_dropout=0.05,
             bias="none",
             task_type="CAUSAL_LM"
     )
 
-    # Run for the splits requested (for debug, usually all splits)
     for split_idx, split in enumerate(splits):
         print(f"\n==================== SPLIT {split_idx+1}/{len(splits)} ====================")
         
         peft_model = get_peft_model(model, lora_config)
         peft_model.print_trainable_parameters()
         
-        # Reset LORA for each split so they are independent
-        optimizer = optim.Adam(peft_model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
+        optimizer = optim.AdamW(peft_model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.num_epochs, eta_min=1e-6)
         
         # --- Datasets and Dataloaders ---
@@ -210,7 +208,7 @@ def train_dpo(args):
         )
 
        
-        writer = SummaryWriter(f"runs/{args.output_dir}")
+        writer = SummaryWriter(f"runs/{args.dataset}_{timestamp}")
         writer.add_text(
             "hyperparameters",
             "|param|value|\n|-|-|\n%s" % ("\n".join([f"|{key}|{value}|" for key, value in vars(args).items()])),
@@ -237,12 +235,11 @@ def train_dpo(args):
                 video_names = batch_data.pop("video_name")
                 c_gtscore = batch_data.pop("chosen_gt").to(device)
                 r_gtscore = batch_data.pop("rejected_gt").to(device)
-
-                margin = batch_data.pop("margin").to(device)
-                log_margin = batch_data.pop("log_margin").to(device)
-
+        
                 c_batch_data = batch_data.pop("chosen_inputs").to(device)
                 r_batch_data = batch_data.pop("rejected_inputs").to(device)
+
+                log_margin = batch_data.pop("log_margin").to(device)
 
                 # Policy Logps (LoRA Enabled)
                 c_outputs = peft_model.base_model(c_batch_data)
@@ -277,9 +274,9 @@ def train_dpo(args):
 
                 loss = -F.logsigmoid(args.beta * (logits - log_margin.reshape(logits.shape))).mean()
 
-                #binary_probs = F.softmax(torch.stack([c_outputs.logits[:, -1, :][:, yes_id], c_outputs.logits[:, -1, :][:, no_id]], dim=-1), dim=-1)
-                #preds = binary_probs[:, 0]
-                # mse_loss = F.mse_loss(preds, c_gtscore.reshape(preds.shape))
+                binary_probs = F.softmax(torch.stack([c_outputs.logits[:, -1, :][:, yes_id], c_outputs.logits[:, -1, :][:, no_id]], dim=-1), dim=-1)
+                preds = binary_probs[:, 0]
+                mse_loss = F.mse_loss(preds, c_gtscore.reshape(preds.shape))
 
                 # Track diagnostics
                 diag['loss'].append(loss.item())
@@ -288,7 +285,7 @@ def train_dpo(args):
                 diag['logits'].append(logits.mean().item())
                 diag['margin'].append(log_margin.mean().item())                
                 diag['correct'] += (logits > log_margin.reshape(logits.shape)).sum().item()
-                diag['mse'].append(F.mse_loss(preds, c_gtscore.reshape(preds.shape)).item())
+                diag['mse'].append(mse_loss.item())
                 diag['total'] += logits.size(0)
 
                 loss.backward()
@@ -316,6 +313,12 @@ def train_dpo(args):
             writer.add_scalar("Train/loss", avg_epoch_loss, epoch)
             writer.add_scalar("Train/learning_rate", scheduler.get_last_lr()[0], epoch)
             scheduler.step()
+
+            # --- MEMORY CLEANUP ---
+            del c_batch_data, r_batch_data
+            del c_outputs, r_outputs, ref_c_outputs, ref_r_outputs
+            del pi_logp_c, pi_logp_r, ref_logp_c, ref_logp_r, loss
+            torch.cuda.empty_cache()
             
             # ================= VALIDATION BLOCK =================
             # Evaluate every epochs, or on the final epoch
@@ -344,7 +347,7 @@ def train_dpo(args):
                     current_corr = avg_tau + avg_rho
                     if current_corr > best_corr:
                         best_corr = current_corr
-                        save_path = os.path.join(args.output_dir, f"best_dpo_split{split_idx}.pth")
+                        save_path = os.path.join(args.output_dir, f"{args.dataset}_{timestamp}_best_dpo_split{split_idx}.pth")
                         os.makedirs(args.output_dir, exist_ok=True)
                         peft_model.save_pretrained(save_path)
                         print(f"Saved LoRA weights to {save_path}")
@@ -412,7 +415,7 @@ if __name__ == "__main__":
     parser.add_argument("--model_path", type=str, default=None)
     parser.add_argument("--split_file", type=str, default="./dataset/summe_splits.json")
     parser.add_argument("--output_dir", type=str, default="./checkpoints")
-    parser.add_argument("--num_epochs", type=int, default=50)
+    parser.add_argument("--num_epochs", type=int, default=5)
     parser.add_argument("--learning_rate", type=float, default=1e-5)
     parser.add_argument("--weight_decay", type=float, default=1e-5)
 
