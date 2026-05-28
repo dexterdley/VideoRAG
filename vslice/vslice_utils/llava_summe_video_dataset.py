@@ -8,6 +8,8 @@ import torch.nn.functional as F
 from PIL import Image
 from torch.utils.data import Dataset
 from decord import VideoReader, cpu
+from scipy.ndimage import gaussian_filter1d
+
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
 def load_video_from_picks(video_path, picks, width=896, height=672):
@@ -359,7 +361,12 @@ class SumMeLLaMA_DPODataset(Dataset):
 
     def __getitem__(self, index):
         video_name = self.train_keys[index]
-        full_gtscore = torch.as_tensor(self.video_data[video_name + '/gtscore'])
+        gtscore = np.array(self.video_data[video_name + '/gtscore'])
+
+        # Apply the Gaussian filter to smooth the scores
+        gtscore = gaussian_filter1d(gtscore, sigma=2.0)
+        full_gtscore = torch.as_tensor(gtscore, dtype=torch.float32)
+
         picks = self.video_data[video_name + '/picks']
 
         # Parse filename safely

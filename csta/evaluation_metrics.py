@@ -10,7 +10,7 @@ def get_corr_coeff(pred_imp_scores, videos, dataset, user_scores=None):
             rho_coeff.append(spearmanr(pred_imp_score,true)[0])
             tau_coeff.append(kendalltau(pred_imp_score,true)[0])
     elif dataset=='TVSum':
-        for pred_imp_score,video in zip(pred_imp_scores,videos):
+        for pred_imp_score, video in zip(pred_imp_scores, videos):
             pred_imp_score = np.squeeze(pred_imp_score).tolist()
             user = int(video.split("_")[-1])
 

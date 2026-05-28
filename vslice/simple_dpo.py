@@ -48,7 +48,7 @@ TBD FIX TVSUM EVALUATION BUG
 SUMME: TO BEAT 0.256 0.285, TVSUM: 0.195 0.255
 ==================== SPLIT 1/5 ====================
 [Split 1] Test | F-Score: 0.4464 | Tau: 0.1548 | Rho: 0.1723
-[Split 1] Test | F-Score: 0.4357 | Tau: 0.2116 | Rho: 0.2361
+[Split 1] Test | F-Score: 0.4600 | Tau: 0.2379 | Rho: 0.2652
 ==================== SPLIT 2/5 ====================
 [Split 2] Test | F-Score: 0.5475 | Tau: 0.2793 | Rho: 0.3109
 ==================== SPLIT 3/5 ====================
@@ -61,7 +61,7 @@ SUMME: TO BEAT 0.256 0.285, TVSUM: 0.195 0.255
 FINAL GLOBAL BENCHMARK SUMMARY (5 SPLITS)
 ════════════════════════════════════════════════════════════
 Global Avg | F1: 0.5099 | Kendall: 0.2253 | Spearman: 0.2508 # Base
-Global Avg | F1: 0.4867 | Kendall: 0.2124 | Spearman: 0.2364 # w DPO
+Global Avg | F1: 0.5198 | Kendall: 0.2470 | Spearman: 0.2750 # w DPO
 
 """
 
@@ -75,7 +75,6 @@ def evaluate(model, val_loader, dataset_name, h5_paths, tvsum_user_scores=None, 
 
     # --- DIAGNOSTIC ACCUMULATORS ---
     all_preds = []
-    logit_diffs = []
 
     with torch.no_grad():
         for step, batch_data in enumerate(tqdm(val_loader, desc=f"Evaluating {dataset_name}", leave=False)):
@@ -100,23 +99,24 @@ def evaluate(model, val_loader, dataset_name, h5_paths, tvsum_user_scores=None, 
             binary_probs = F.softmax(torch.stack([yes_logits, no_logits], dim=-1), dim=-1)
             preds = binary_probs[:, 0]
             
-            # Diagnostic: Track the raw gap between Yes and No
-            diff = (yes_logits - no_logits).detach().cpu().float().numpy()
-            logit_diffs.extend(diff)
-
-            final_scores = preds.detach().cpu().float().numpy()
-            all_preds.extend(final_scores)
+            yes_scores = preds.detach().cpu().float().numpy()
+            all_preds.extend(yes_scores)
 
             res = compute_video_metrics(
-                final_scores, 1.0 - final_scores,
-                h5_path, video_name, video_name, dataset_name, tvsum_user_scores, use_advanced_scoring=False
+                yes_scores=yes_scores, 
+                no_scores=1-yes_scores, 
+                h5_path=h5_path, 
+                h5_key=video_name, 
+                video_name=video_name,
+                dataset_name=dataset_name,
+                user_scores=tvsum_user_scores,
+                use_advanced_scoring=False
             )
+
             split_results.append(res)
 
     all_preds = np.array(all_preds)
-    logit_diffs = np.array(logit_diffs)
     unique_preds = len(np.unique(all_preds))
-    
     return pd.DataFrame(split_results)
 
 
@@ -141,6 +141,11 @@ def train_dpo(args):
 
     eval_split_metrics = {}
 
+    if args.dataset == 'tvsum':
+        tvsum_user_scores = get_gt('TVSum')
+        print("TVSum GT Loaded")
+    else:
+        tvsum_user_scores = None
 
     print("Freezing base model & use LoRA for fine-tuning ...")
     model.requires_grad_(False)
@@ -208,7 +213,7 @@ def train_dpo(args):
         )
 
        
-        writer = SummaryWriter(f"runs/{args.dataset}_{split_idx}_{timestamp}")
+        writer = SummaryWriter(f"runs/smooth_{args.dataset}_{split_idx}_{timestamp}")
         writer.add_text(
             "hyperparameters",
             "|param|value|\n|-|-|\n%s" % ("\n".join([f"|{key}|{value}|" for key, value in vars(args).items()])),
@@ -273,13 +278,14 @@ def train_dpo(args):
                 logits = pi_ratio - ref_ratio
 
                 loss = -F.logsigmoid(args.beta * (logits - log_margin.reshape(logits.shape))).mean()
+                track_loss = -F.logsigmoid((logits - log_margin.reshape(logits.shape))).mean()
 
                 binary_probs = F.softmax(torch.stack([c_outputs.logits[:, -1, :][:, yes_id], c_outputs.logits[:, -1, :][:, no_id]], dim=-1), dim=-1)
                 preds = binary_probs[:, 0]
                 mse_loss = F.mse_loss(preds, c_gtscore.reshape(preds.shape))
 
                 # Track diagnostics
-                diag['loss'].append(loss.item())
+                diag['loss'].append(track_loss.item())
                 diag['pi_ratio'].append(pi_ratio.mean().item())
                 diag['ref_ratio'].append(ref_ratio.mean().item())
                 diag['logits'].append(logits.mean().item())
@@ -292,7 +298,7 @@ def train_dpo(args):
                 optimizer.step()
                 optimizer.zero_grad()
 
-                epoch_loss += loss.item()
+                epoch_loss += track_loss.item()
                 num_batches += 1
 
             acc = diag['correct'] / diag['total'] * 100
@@ -331,7 +337,8 @@ def train_dpo(args):
                     dataset_name=args.dataset, 
                     h5_paths=h5_paths,
                     yes_id=yes_id,
-                    no_id=no_id
+                    no_id=no_id,
+                    tvsum_user_scores=tvsum_user_scores
                 )
                 
                 if not val_df.empty:
@@ -369,7 +376,8 @@ def train_dpo(args):
             dataset_name=args.dataset,
             h5_paths=h5_paths,
             yes_id=yes_id,
-            no_id=no_id
+            no_id=no_id,
+            tvsum_user_scores=tvsum_user_scores
         )
 
         if not test_df.empty:

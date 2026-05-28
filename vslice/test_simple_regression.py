@@ -41,6 +41,9 @@ if sys.platform == "win32":
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
     sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
 
+# Example Usage
+# CUDA_VISIBLE_DEVICES=6 python vslice/test_simple_regression.py --dataset summe --split_file ./dataset/summe_splits.json --model_type minicpm --batch_size=4
+
 class VLMRegressionHead(nn.Module):
     def __init__(self, hidden_dim):
         super().__init__()
@@ -82,18 +85,25 @@ def evaluate_regression(model, reg_head, val_loader, dataset_name, h5_paths, tvs
                 binary_probs = F.softmax(torch.stack([yes_logits, no_logits], dim=-1), dim=-1)
                 preds = binary_probs[:, 0]
                 
-            final_scores = preds.detach().cpu().float().numpy()
+            yes_scores = preds.detach().cpu().float().numpy()
             
             res = compute_video_metrics(
-                final_scores, 1.0 - final_scores,
-                h5_path, video_name, video_name, dataset_name, tvsum_user_scores, use_advanced_scoring=False
+                yes_scores=yes_scores, 
+                no_scores=1-yes_scores, 
+                h5_path=h5_path, 
+                h5_key=video_name, 
+                video_name=video_name,
+                dataset_name=dataset_name,
+                user_scores=tvsum_user_scores,
+                use_advanced_scoring=False
             )
+
             split_results.append(res)
             
     return pd.DataFrame(split_results)
 
 
-def train_regression(args):
+def test_regression(args):
     # Load VLM
     vlm_vars = load_vlm(args.model_path, args.model_type, device)
     wrapper_or_model, tokenizer, processor, yes_id, no_id = vlm_vars
@@ -115,6 +125,12 @@ def train_regression(args):
         print(f"Loaded {len(splits)} splits from {args.split_file}")
 
     eval_split_metrics = {}
+
+    if args.dataset == 'tvsum':
+        tvsum_user_scores = get_gt('TVSum')
+        print("TVSum GT Loaded")
+    else:
+        tvsum_user_scores = None
 
     # Run for the splits requested (for debug, usually all splits)
     for split_idx, split in enumerate(splits):
@@ -159,7 +175,8 @@ def train_regression(args):
             reg_head=reg_head, 
             val_loader=test_loader, 
             dataset_name=args.dataset, 
-            h5_paths=h5_paths
+            h5_paths=h5_paths,
+            tvsum_user_scores=tvsum_user_scores
         )
 
         if not test_df.empty:
@@ -214,4 +231,4 @@ if __name__ == "__main__":
     if args.model_path is None:
         args.model_path = resolve_model_path(args.model_type)
     
-    train_regression(args)
+    test_regression(args)

@@ -83,7 +83,6 @@ def compute_video_metrics(yes_scores, no_scores, h5_path, h5_key, video_name, da
 
         final_scores = yes_scores * motion_weight
         scores = (final_scores - np.min(final_scores)) /(np.max(final_scores) - np.min(final_scores))
-        #import pdb; pdb.set_trace()
     else:
         scores = yes_scores
 
