@@ -363,8 +363,10 @@ class SumMeLLaMA_DPODataset(Dataset):
         video_name = self.train_keys[index]
         gtscore = np.array(self.video_data[video_name + '/gtscore'])
 
-        # Apply the Gaussian filter to smooth the scores
-        gtscore = gaussian_filter1d(gtscore, sigma=2.0)
+        gt_min = np.min(gtscore)
+        gt_max = np.max(gtscore)
+        gtscore = (gtscore - gt_min) / (gt_max - gt_min)
+
         full_gtscore = torch.as_tensor(gtscore, dtype=torch.float32)
 
         picks = self.video_data[video_name + '/picks']

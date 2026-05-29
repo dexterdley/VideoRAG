@@ -62,10 +62,11 @@ FINAL GLOBAL BENCHMARK SUMMARY (5 SPLITS)
 ════════════════════════════════════════════════════════════
 Global Avg | F1: 0.5099 | Kendall: 0.2253 | Spearman: 0.2508 # Base
 Global Avg | F1: 0.5198 | Kendall: 0.2470 | Spearman: 0.2750 # w DPO
-
+TVSum:
+Global Avg | F1: 0.4788 | Kendall: 0.2438 | Spearman: 0.3118
 """
 
-def evaluate(model, val_loader, dataset_name, h5_paths, tvsum_user_scores=None, yes_id=9454, no_id=2753):
+def evaluate(model, val_loader, dataset_name, h5_paths, tvsum_user_scores=None, use_advanced_scoring=False, yes_id=9454, no_id=2753):
     """
     Evaluates the model using the ValBatchCollator and val_loader.
     """
@@ -110,7 +111,7 @@ def evaluate(model, val_loader, dataset_name, h5_paths, tvsum_user_scores=None, 
                 video_name=video_name,
                 dataset_name=dataset_name,
                 user_scores=tvsum_user_scores,
-                use_advanced_scoring=False
+                use_advanced_scoring=use_advanced_scoring,
             )
 
             split_results.append(res)
@@ -213,7 +214,7 @@ def train_dpo(args):
         )
 
        
-        writer = SummaryWriter(f"runs/smooth_{args.dataset}_{split_idx}_{timestamp}")
+        writer = SummaryWriter(f"runs/tune_{args.dataset}_{split_idx}_{timestamp}")
         writer.add_text(
             "hyperparameters",
             "|param|value|\n|-|-|\n%s" % ("\n".join([f"|{key}|{value}|" for key, value in vars(args).items()])),
@@ -338,7 +339,8 @@ def train_dpo(args):
                     h5_paths=h5_paths,
                     yes_id=yes_id,
                     no_id=no_id,
-                    tvsum_user_scores=tvsum_user_scores
+                    tvsum_user_scores=tvsum_user_scores,
+                    use_advanced_scoring=args.use_advanced_scoring
                 )
                 
                 if not val_df.empty:
@@ -377,7 +379,8 @@ def train_dpo(args):
             h5_paths=h5_paths,
             yes_id=yes_id,
             no_id=no_id,
-            tvsum_user_scores=tvsum_user_scores
+            tvsum_user_scores=tvsum_user_scores,
+            use_advanced_scoring=args.use_advanced_scoring
         )
 
         if not test_df.empty:
@@ -431,6 +434,7 @@ if __name__ == "__main__":
     parser.add_argument('--clip_length', type=int, default=4)
     parser.add_argument("--accumulation_steps", type=int, default=8)
     parser.add_argument("--beta", type=float, default=0.1)
+    parser.add_argument("--use_advanced_scoring", action="store_true", help="Use action based ranking")
     args = parser.parse_args()
     
     if args.model_path is None:
