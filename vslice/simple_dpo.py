@@ -93,14 +93,38 @@ def evaluate(model, val_loader, dataset_name, h5_paths, tvsum_user_scores=None, 
 
             batch_data = batch_data.to(device)
 
-            outputs = model.base_model(batch_data)
-                
-            logits = outputs.logits[:, -1, :]
-            yes_logits, no_logits = logits[:, yes_id], logits[:, no_id]
-            binary_probs = F.softmax(torch.stack([yes_logits, no_logits], dim=-1), dim=-1)
-            preds = binary_probs[:, 0]
+            chunk_size = 8
+            num_frames = batch_data["input_ids"].size(0)
+            all_preds_chunk = []
             
-            yes_scores = preds.detach().cpu().float().numpy()
+            for start_idx in range(0, num_frames, chunk_size):
+                end_idx = min(start_idx + chunk_size, num_frames)
+                
+                # Create a mini-batch by slicing elements
+                mini_batch_dict = {}
+                for k, v in batch_data.items():
+                    if isinstance(v, torch.Tensor) and v.size(0) == num_frames:
+                        mini_batch_dict[k] = v[start_idx:end_idx]
+                    elif isinstance(v, list) and len(v) == num_frames:
+                        mini_batch_dict[k] = v[start_idx:end_idx]
+                    else:
+                        mini_batch_dict[k] = v
+                        
+                mini_batch = type(batch_data)(mini_batch_dict)
+                
+                chunk_outputs = model.base_model(mini_batch)
+                chunk_logits = chunk_outputs.logits[:, -1, :]
+                chunk_binary_probs = F.softmax(
+                    torch.stack([chunk_logits[:, yes_id], chunk_logits[:, no_id]], dim=-1), dim=-1
+                )
+                all_preds_chunk.append(chunk_binary_probs[:, 0].detach().cpu().float())
+                
+                del chunk_outputs, chunk_logits, mini_batch, mini_batch_dict
+                torch.cuda.empty_cache()
+                
+            preds = torch.cat(all_preds_chunk, dim=0)
+            
+            yes_scores = preds.numpy()
             all_preds.extend(yes_scores)
 
             res = compute_video_metrics(
@@ -226,7 +250,6 @@ def train_dpo(args):
         for epoch in tqdm(range(args.num_epochs), desc="DPO Training.."):
             epoch_loss = 0.0
             num_batches = 0
-            peft_model.train()
 
             # Diagnostic accumulators
             diag = {
@@ -235,8 +258,6 @@ def train_dpo(args):
             }
 
             for step, batch_data in enumerate(train_loader):
-                peft_model.train()
-
                 titles = batch_data.pop("title")
                 video_names = batch_data.pop("video_name")
                 c_gtscore = batch_data.pop("chosen_gt").to(device)
@@ -246,33 +267,35 @@ def train_dpo(args):
                 r_batch_data = batch_data.pop("rejected_inputs").to(device)
 
                 log_margin = batch_data.pop("log_margin").to(device)
-
-                # Policy Logps (LoRA Enabled)
-                c_outputs = peft_model.base_model(c_batch_data)
-                r_outputs = peft_model.base_model(r_batch_data)
-
-                c_logits_step = c_outputs.logits[:, -1, :]
-                r_logits_step = r_outputs.logits[:, -1, :]
-
-                # Stack yes/no logits and compute binary log-softmax
-                pi_logp_c = F.log_softmax(torch.stack([c_logits_step[:, yes_id], c_logits_step[:, no_id]], dim=-1),dim=-1)[:, 0]
-                pi_logp_r = F.log_softmax(torch.stack([r_logits_step[:, yes_id], r_logits_step[:, no_id]], dim=-1),dim=-1)[:, 0]
-
-                # Reference Logps (LoRA Disabled)
+                
+                 # ── 1. Reference Logps (LoRA Disabled) ──
                 peft_model.eval()
                 with peft_model.disable_adapter():
                     with torch.no_grad():
-                        ref_c_outputs = peft_model.base_model(c_batch_data)
-                        ref_r_outputs = peft_model.base_model(r_batch_data)
-                        
-                        ref_c_logits_step = ref_c_outputs.logits[:, -1, :]
-                        ref_r_logits_step = ref_r_outputs.logits[:, -1, :]
+                        ref_c_logits = peft_model.base_model(c_batch_data).logits[:, -1, :]
+                        ref_r_logits = peft_model.base_model(r_batch_data).logits[:, -1, :]
                         
                         ref_logp_c = F.log_softmax(
-                            torch.stack([ref_c_logits_step[:, yes_id], ref_c_logits_step[:, no_id]], dim=-1),dim=-1)[:, 0]
-                        
+                            torch.stack([ref_c_logits[:, yes_id], ref_c_logits[:, no_id]], dim=-1), dim=-1
+                        )[:, 0]
                         ref_logp_r = F.log_softmax(
-                            torch.stack([ref_r_logits_step[:, yes_id], ref_r_logits_step[:, no_id]], dim=-1),dim=-1)[:, 0]
+                            torch.stack([ref_r_logits[:, yes_id], ref_r_logits[:, no_id]], dim=-1), dim=-1
+                        )[:, 0]
+                
+                # Detach and free ref intermediates immediately
+                ref_logp_c = ref_logp_c.detach()
+                ref_logp_r = ref_logp_r.detach()
+                del ref_c_logits, ref_r_logits
+                torch.cuda.empty_cache()
+
+                # Policy Logps (LoRA Enabled)
+                peft_model.train()
+                c_logits = peft_model.base_model(c_batch_data).logits[:, -1, :]
+                r_logits = peft_model.base_model(r_batch_data).logits[:, -1, :]
+
+                # Stack yes/no logits and compute binary log-softmax
+                pi_logp_c = F.log_softmax(torch.stack([c_logits[:, yes_id], c_logits[:, no_id]], dim=-1),dim=-1)[:, 0]
+                pi_logp_r = F.log_softmax(torch.stack([r_logits[:, yes_id], r_logits[:, no_id]], dim=-1),dim=-1)[:, 0]
 
                 pi_ratio = pi_logp_c - pi_logp_r
                 ref_ratio = ref_logp_c - ref_logp_r
@@ -281,7 +304,7 @@ def train_dpo(args):
                 loss = -F.logsigmoid(args.beta * (logits - log_margin.reshape(logits.shape))).mean()
                 track_loss = -F.logsigmoid((logits - log_margin.reshape(logits.shape))).mean()
 
-                binary_probs = F.softmax(torch.stack([c_outputs.logits[:, -1, :][:, yes_id], c_outputs.logits[:, -1, :][:, no_id]], dim=-1), dim=-1)
+                binary_probs = F.softmax(torch.stack([c_logits[:, yes_id], c_logits[:, no_id]], dim=-1), dim=-1)
                 preds = binary_probs[:, 0]
                 mse_loss = F.mse_loss(preds, c_gtscore.reshape(preds.shape))
 
@@ -323,7 +346,7 @@ def train_dpo(args):
 
             # --- MEMORY CLEANUP ---
             del c_batch_data, r_batch_data
-            del c_outputs, r_outputs, ref_c_outputs, ref_r_outputs
+            del c_logits, r_logits
             del pi_logp_c, pi_logp_r, ref_logp_c, ref_logp_r, loss
             torch.cuda.empty_cache()
             
