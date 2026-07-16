@@ -18,11 +18,12 @@ from datetime import datetime
 from torch.nn.utils.rnn import pad_sequence
 from PIL import Image
 from decord import VideoReader, cpu
+import pickle
 
-from vslice_utils.models import load_vlm, minicpm_extract_title_and_keywords, qwen_extract_title_and_keywords, minicpm_inference, qwen_inference
-from vslice_utils.dataloader import build_summe_manifest, build_tvsum_manifest, VideoSegmentDataset
+from vslice_utils.models import load_vlm, minicpm_inference, qwen_inference
 from vslice_utils.helpers import set_seed, compute_video_metrics
-from vslice_utils.llava_summe_video_dataset import load_video_from_picks, ValBatchCollator, TrainBatchCollator
+from vslice_utils.llava_summe_video_dataset import load_video_from_picks, ValBatchCollator, SumMeLLaMA_VideoDataset
+from vslice_utils.llava_tvsum_video_dataset import load_video_from_picks, ValBatchCollator, TVSumLLaMA_VideoDataset
 
 # Evaluation dependencies
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'csta'))
@@ -188,7 +189,8 @@ class GraphDPODataset(Dataset):
         rejected_inputs = self._process_clip(rejected_frames, formatted_prompt)
 
         chosen_score, rejected_score = full_gtscore[chosen_idx], full_gtscore[rejected_idx]
-        log_margin = torch.log(chosen_score + self.epsilon) - torch.log(rejected_score + self.epsilon)
+        # log_margin = torch.log(chosen_score + self.epsilon) - torch.log(rejected_score + self.epsilon)
+        log_margin = chosen_score - rejected_score
 
         return {
             'video_name': video_name,
@@ -320,15 +322,16 @@ def precache_reference_scores(peft_model, dataset, yes_id, no_id, device):
                     inputs = dataset._process_clip(chunk_frames, formatted_prompt)
                     inputs = inputs.to(device)
                     
-                    outputs = peft_model.base_model(inputs)
-                    logits = outputs.logits[:, -1, :]
+                    with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                        outputs = peft_model.base_model(inputs)
+                        logits = outputs.logits[:, -1, :]
+                        
                     binary_probs = F.softmax(
                         torch.stack([logits[:, yes_id], logits[:, no_id]], dim=-1), dim=-1
                     )
                     all_preds.append(binary_probs[:, 0].detach().cpu().float().numpy())
                     
                     del outputs, logits, inputs
-                    torch.cuda.empty_cache()
                     
                 reference_cache[video_name] = np.concatenate(all_preds)
                 
@@ -341,6 +344,8 @@ def build_adjacency_matrix_pytorch(features, picks, window_size=15, device="cuda
     """
     Constructs the base visual-temporal weight matrix and backbone mask.
     """
+    if features.dim() == 3:
+        features = features.squeeze(1)
     num_picks = features.size(0)
     
     # 1. Cosine similarity
@@ -358,14 +363,30 @@ def build_adjacency_matrix_pytorch(features, picks, window_size=15, device="cuda
     backbone_mask = (torch.abs(torch.arange(num_picks, device=device).unsqueeze(1) - 
                               torch.arange(num_picks, device=device).unsqueeze(0)) == 1)
     
-    W_base = torch.zeros((num_picks, num_picks), device=device)
+    W_base = torch.zeros((num_picks, num_picks), dtype=features.dtype, device=device)
     W_base[temporal_mask] = sim_matrix[temporal_mask]
     
     return W_base, backbone_mask
 
+def compute_normalized_adjacency_matrix(probs, W_base, backbone_mask, sigma_s=0.15, device="cuda"):
+    """
+    Computes the query-conditioned and normalized adjacency matrix W_norm.
+    """
+    num_picks = probs.size(0)
+    # Compute score similarity matrix (RBF)
+    diff = probs.unsqueeze(1) - probs.unsqueeze(0)
+    s_score = torch.exp(- (diff ** 2) / (2 * (sigma_s ** 2)))
+    
+    W = W_base * s_score
+    W = torch.where(backbone_mask, torch.ones_like(W), W)
+    W = W + torch.eye(num_picks, dtype=W.dtype, device=device)
+    
+    A_norm = W / (W.sum(dim=1, keepdim=True) + 1e-8)
+    return A_norm
+
 def propagate_graph_pytorch(probs, adj_matrix, alpha=0.6, iterations=10):
     """
-    Differentiable label propagation power iteration.
+    Label propagation power iteration.
     """
     p_curr = probs
     p_0 = probs
@@ -381,7 +402,7 @@ def evaluate(model, val_loader, dataset_name, h5_paths, tvsum_user_scores=None, 
     model.eval()
 
     all_preds = []
-    with torch.no_grad():
+    with torch.inference_mode():
         for step, batch_data in enumerate(tqdm(val_loader, desc=f"Evaluating {dataset_name}", leave=False)):
             video_name = batch_data.pop("video_name")[0]
             titles = batch_data.pop("title")
@@ -411,20 +432,30 @@ def evaluate(model, val_loader, dataset_name, h5_paths, tvsum_user_scores=None, 
                         mini_batch_dict[k] = v[start_idx:end_idx]
                     else:
                         mini_batch_dict[k] = v
-                        
+
                 mini_batch = type(batch_data)(mini_batch_dict)
-                chunk_outputs = model.base_model(mini_batch)
-                chunk_logits = chunk_outputs.logits[:, -1, :]
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                    chunk_outputs = model.base_model(mini_batch)
+                    chunk_logits = chunk_outputs.logits[:, -1, :]
+                    
                 chunk_binary_probs = F.softmax(
                     torch.stack([chunk_logits[:, yes_id], chunk_logits[:, no_id]], dim=-1), dim=-1
                 )
                 all_preds_chunk.append(chunk_binary_probs[:, 0].detach().cpu().float())
                 
                 del chunk_outputs, chunk_logits, mini_batch, mini_batch_dict
-                torch.cuda.empty_cache()
                 
             preds = torch.cat(all_preds_chunk, dim=0)
-            yes_scores = preds.numpy()
+
+            # --- Test-Time Graph Propagation ---
+            v_features = features[0].to(device)
+            v_picks = picks.to(device)
+
+            W_base, backbone_mask = build_adjacency_matrix_pytorch(v_features, v_picks, window_size=15, device=device)
+            A_norm = compute_normalized_adjacency_matrix(preds.to(device), W_base, backbone_mask, sigma_s=0.15, device=device)
+            
+            propagated_scores = propagate_graph_pytorch(preds.to(device), A_norm, alpha=0.8, iterations=10)
+            yes_scores = propagated_scores.detach().cpu().float().numpy()
             all_preds.extend(yes_scores)
 
             res = compute_video_metrics(
@@ -438,7 +469,7 @@ def evaluate(model, val_loader, dataset_name, h5_paths, tvsum_user_scores=None, 
                 use_advanced_scoring=use_advanced_scoring,
             )
             split_results.append(res)
-
+            
     all_preds = np.array(all_preds)
     return pd.DataFrame(split_results)
 
@@ -472,8 +503,8 @@ def train_graph_dpo(args):
     model.requires_grad_(False)
 
     lora_config = LoraConfig(
-        r=8,
-        lora_alpha=16,
+        r=16,
+        lora_alpha=32,
         target_modules=["q_proj", "v_proj", "k_proj", "o_proj"],
         lora_dropout=0.05,
         bias="none",
@@ -492,8 +523,20 @@ def train_graph_dpo(args):
         # Datasets & Collators
         train_dataset = GraphDPODataset(dataset_name=args.dataset, split_idx=split_idx, processor=processor, root_dir=args.root_dir, clip_length=args.clip_length)
         
-        # Reference Caching: Precompute reference logits once at start of split
-        ref_scores_cache = precache_reference_scores(peft_model, train_dataset, yes_id, no_id, device)
+        # Reference Caching: Load from disk if exists, otherwise compute and save
+        cache_dir = os.path.join(args.root_dir, "dpo_data")
+        os.makedirs(cache_dir, exist_ok=True)
+        cache_path = os.path.join(cache_dir, f"ref_scores_{args.dataset}_split_{split_idx}.pkl")
+        
+        if os.path.exists(cache_path):
+            print(f"Loading cached reference scores from {cache_path}...")
+            with open(cache_path, 'rb') as f:
+                ref_scores_cache = pickle.load(f)
+        else:
+            ref_scores_cache = precache_reference_scores(peft_model, train_dataset, yes_id, no_id, device)
+            with open(cache_path, 'wb') as f:
+                pickle.dump(ref_scores_cache, f)
+            print(f"Saved reference scores cache to {cache_path}.")
         
         # Validation Datasets
         if args.dataset == 'summe':
@@ -564,8 +607,9 @@ def train_graph_dpo(args):
 
                 # ── 1. Policy Forward pass on pairs (LoRA Enabled) ──
                 peft_model.train()
-                c_logits = peft_model.base_model(c_batch_data).logits[:, -1, :]
-                r_logits = peft_model.base_model(r_batch_data).logits[:, -1, :]
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                    c_logits = peft_model.base_model(c_batch_data).logits[:, -1, :]
+                    r_logits = peft_model.base_model(r_batch_data).logits[:, -1, :]
                 
                 # Yes probability
                 pi_p_c = F.softmax(torch.stack([c_logits[:, yes_id], c_logits[:, no_id]], dim=-1), dim=-1)[:, 0]
@@ -582,16 +626,15 @@ def train_graph_dpo(args):
                     v_chosen_idx = chosen_idx[b].to(device)
                     v_rejected_idx = rejected_idx[b].to(device)
                     
-                    v_features = features[b].to(device)
+                    v_features = features[b].to(device=device, dtype=pi_p_c.dtype)
                     v_picks = picks[b].to(device)
                     
                     # ── 2. Construct Query-Conditioned Adjacency Matrix ──
                     W_base, backbone_mask = build_adjacency_matrix_pytorch(v_features, v_picks, window_size=15, device=device)
                     num_picks = v_features.size(0)
                     
-                    # --- Policy Graph construction & propagation ---
-                    # Initialize full timeline scores with pre-cached reference predictions
-                    pi_probs_all = torch.tensor(ref_scores_cache[v_name], dtype=torch.float32, device=device)
+                    # --- A. Policy Graph construction & propagation ---
+                    pi_probs_all = torch.tensor(ref_scores_cache[v_name], dtype=pi_p_c.dtype, device=device)
                     
                     # Insert active policy predictions (with gradients) into chosen/rejected indices
                     # Slice slice elements for batch indexing
@@ -602,28 +645,14 @@ def train_graph_dpo(args):
                     pi_probs_all[v_chosen_idx] = v_pi_p_c
                     pi_probs_all[v_rejected_idx] = v_pi_p_r
                     
-                    # Compute score similarity matrix (RBF)
-                    diff_pi = pi_probs_all.unsqueeze(1) - pi_probs_all.unsqueeze(0)
-                    s_score_pi = torch.exp(- (diff_pi ** 2) / (2 * (0.15 ** 2)))
+                    # Compute query-conditioned adjacency matrix & propagate
+                    norm_pi_adjacency = compute_normalized_adjacency_matrix(pi_probs_all, W_base, backbone_mask, sigma_s=0.15, device=device)
+                    pi_propagated = propagate_graph_pytorch(pi_probs_all, norm_pi_adjacency, alpha=0.8, iterations=5)
                     
-                    W_pi = W_base * s_score_pi
-                    W_pi = torch.where(backbone_mask, torch.ones_like(W_pi), W_pi)
-                    W_pi = W_pi + torch.eye(num_picks, device=device)
-                    
-                    A_norm_pi = W_pi / (W_pi.sum(dim=1, keepdim=True) + 1e-8)
-                    pi_propagated = propagate_graph_pytorch(pi_probs_all, A_norm_pi, alpha=0.6, iterations=10)
-                    
-                    # --- Reference Graph construction & propagation ---
-                    ref_probs_all = torch.tensor(ref_scores_cache[v_name], dtype=torch.float32, device=device)
-                    diff_ref = ref_probs_all.unsqueeze(1) - ref_probs_all.unsqueeze(0)
-                    s_score_ref = torch.exp(- (diff_ref ** 2) / (2 * (0.15 ** 2)))
-                    
-                    W_ref = W_base * s_score_ref
-                    W_ref = torch.where(backbone_mask, torch.ones_like(W_ref), W_ref)
-                    W_ref = W_ref + torch.eye(num_picks, device=device)
-                    
-                    A_norm_ref = W_ref / (W_ref.sum(dim=1, keepdim=True) + 1e-8)
-                    ref_propagated = propagate_graph_pytorch(ref_probs_all, A_norm_ref, alpha=0.6, iterations=10)
+                    # --- B. Reference Graph construction & propagation ---
+                    ref_probs_all = torch.tensor(ref_scores_cache[v_name], dtype=pi_p_c.dtype, device=device)
+                    norm_ref_adjacency = compute_normalized_adjacency_matrix(ref_probs_all, W_base, backbone_mask, sigma_s=0.15, device=device)
+                    ref_propagated = propagate_graph_pytorch(ref_probs_all, norm_ref_adjacency, alpha=0.8, iterations=5)
                     
                     # ── 3. Extract log-probabilities of propagated scores ──
                     pi_logp_c = torch.log(pi_propagated[v_chosen_idx] + 1e-8)
@@ -631,7 +660,7 @@ def train_graph_dpo(args):
                     
                     ref_logp_c = torch.log(ref_propagated[v_chosen_idx] + 1e-8)
                     ref_logp_r = torch.log(ref_propagated[v_rejected_idx] + 1e-8)
-                    
+
                     # ── 4. Margin-DPO Loss computation ──
                     pi_ratio = pi_logp_c - pi_logp_r
                     ref_ratio = ref_logp_c - ref_logp_r
@@ -664,7 +693,6 @@ def train_graph_dpo(args):
                 
                 # Cleanup
                 del c_logits, r_logits, pi_p_c, pi_p_r
-                torch.cuda.empty_cache()
 
             acc = diag['correct'] / diag['total'] * 100
             print(f"\n{'═'*70}")
@@ -696,8 +724,8 @@ def train_graph_dpo(args):
                     no_id=no_id
                 )
                 mean_f = val_df['f_score'].mean()
-                mean_tau = val_df['kendalltau'].mean()
-                mean_rho = val_df['spearmanr'].mean()
+                mean_tau = val_df['kendall'].mean()
+                mean_rho = val_df['spearman'].mean()
                 print(f"[Epoch {epoch+1}] Val Results | F-Score: {mean_f:.4f} | Tau: {mean_tau:.4f} | Rho: {mean_rho:.4f}")
                 
                 # Save checkpoints
@@ -721,12 +749,12 @@ def main():
     parser.add_argument("--dataset", type=str, default="summe", choices=["summe", "tvsum"])
     parser.add_argument("--split_file", type=str, default="./dataset/summe_splits.json", help="Train/test splits file.")
     parser.add_argument("--root_dir", type=str, default=".", help="Root working directory.")
-    parser.add_argument("--learning_rate", type=float, default=1e-5, help="Learning rate.")
-    parser.add_argument("--weight_decay", type=float, default=1e-2, help="Optimizer weight decay.")
+    parser.add_argument("--learning_rate", type=float, default=5e-6, help="Learning rate.")
+    parser.add_argument("--weight_decay", type=float, default=1e-5, help="Optimizer weight decay.")
     parser.add_argument("--num_epochs", type=type(1), default=5, help="Number of epochs.")
     parser.add_argument("--batch_size", type=int, default=2, help="Number of videos per training batch.")
     parser.add_argument("--clip_length", type=int, default=4, help="Number of sampled frames per clip.")
-    parser.add_argument("--beta", type=float, default=0.1, help="Beta coefficient in DPO loss.")
+    parser.add_argument("--beta", type=float, default=0.5, help="Beta coefficient in DPO loss.")
     args = parser.parse_args()
     
     args.model_path = resolve_model_path(args.model_type)
