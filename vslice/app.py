@@ -1,7 +1,9 @@
 import gradio as gr
 import time
 import os
+import spaces
 
+@spaces.GPU
 def mock_summarize(video_file, prompt, progress=gr.Progress()):
     if not video_file:
         raise gr.Error("Please upload a video to test the demo. / 请上传视频进行演示。")
@@ -15,20 +17,44 @@ def mock_summarize(video_file, prompt, progress=gr.Progress()):
     progress(0.9, desc="Assembling Final Edit... / 组合最终剪辑...")
     time.sleep(0.5)
     
-    # In a real demo, this would return the newly edited video.
-    # For this reviewer demo, we simply return the uploaded video as a placeholder.
     return video_file
 
-# Paths to the motivation figures generated earlier
-# Assuming this script is run from the project root as `python vslice/gradio_demo.py`
 fig_reliability = "results/fig1_reliability_split.png"
 fig_posthoc = "results/fig4_posthoc_graph_failure.png"
+
+# Placeholders for example Videos
+video_example1 = "/home/dex/Downloads/safe_1771730634.mp4"
+video_example2 = "/home/dex/Downloads/safe_1771730634.mp4"
+video_example3 = "/home/dex/Downloads/safe_1771730634.mp4"
 
 def build_content(lang):
     if lang == "EN":
         gr.Markdown("# ✂️🎬 VSLICE: Binary Preference Alignment for Open-Ended Video Summarization with Large Vision-Language Models")
         gr.Markdown("Welcome to the interactive project showcase for VSLICE! Scroll down to understand the motivation, the algorithm, and see example outputs.")
         
+        # ---------------------------------------------------------
+        # SECTION 0: Example Outputs (Gallery)
+        # ---------------------------------------------------------
+        gr.Markdown("---")
+        gr.Markdown("## Demo Gallery (Summary Outputs)")
+        gr.Markdown("Example summaries of what VSLICE can generate. *(Play & Hover over videos to hear audio)*")
+        
+        with gr.Row():
+            if os.path.exists(video_example1):
+                gr.Video(value=video_example1, label="Sports Example", interactive=False, autoplay=True, elem_classes=["gallery-video"])
+            else:
+                gr.Markdown(f"*(Video placeholder 1: {video_example1})*")
+
+            if os.path.exists(video_example2):
+                gr.Video(value=video_example2, label="Politics Example", interactive=False, autoplay=True, elem_classes=["gallery-video"])
+            else:
+                gr.Markdown(f"*(Video placeholder 2: {video_example2})*")
+                
+            if os.path.exists(video_example3):
+                gr.Video(value=video_example3, label="Video Games Example", interactive=False, autoplay=True, elem_classes=["gallery-video"])
+            else:
+                gr.Markdown(f"*(Video placeholder 3: {video_example3})*")
+
         # ---------------------------------------------------------
         # SECTION 1: Motivation
         # ---------------------------------------------------------
@@ -65,11 +91,6 @@ def build_content(lang):
         gr.Markdown("""
         To solve the alignment issue and temporal fragmentation natively, we introduce **Graph-DPO**.
         By injecting a visual-temporal similarity graph directly into the DPO training loop, the policy learns to output aligned, temporally coherent scores without smearing false positives.
-        
-        **Key Components:**
-        1. **Preference Pairs**: Constructed from human annotations (Highlights vs Backgrounds).
-        2. **Graph Propagation Layer**: Message pass logits across similar frames *during* the forward pass (e.g. $Y = A X$).
-        3. **DPO Loss**: Aligns the graph-smoothed policy against the reference model, directly optimizing the reward boundary.
         """)
         
         # ---------------------------------------------------------
@@ -107,6 +128,29 @@ def build_content(lang):
         gr.Markdown("欢迎来到 VSLICE 的互动项目展示！请向下滚动以了解项目动机、算法，并查看示例输出。")
         
         # ---------------------------------------------------------
+        # SECTION 0: Example Outputs (Gallery)
+        # ---------------------------------------------------------
+        gr.Markdown("---")
+        gr.Markdown("## 示例图库")
+        gr.Markdown("将鼠标悬停在视频上即可收听音频。")
+        
+        with gr.Row():
+            if os.path.exists(video_example1):
+                gr.Video(value=video_example1, label="体育示例", interactive=False, autoplay=True, elem_classes=["gallery-video"])
+            else:
+                gr.Markdown(f"*(视频占位符 1: {video_example1})*")
+
+            if os.path.exists(video_example2):
+                gr.Video(value=video_example2, label="政治示例", interactive=False, autoplay=True, elem_classes=["gallery-video"])
+            else:
+                gr.Markdown(f"*(视频占位符 2: {video_example2})*")
+                
+            if os.path.exists(video_example3):
+                gr.Video(value=video_example3, label="游戏示例", interactive=False, autoplay=True, elem_classes=["gallery-video"])
+            else:
+                gr.Markdown(f"*(视频占位符 3: {video_example3})*")
+
+        # ---------------------------------------------------------
         # SECTION 1: Motivation
         # ---------------------------------------------------------
         gr.Markdown("---")
@@ -142,11 +186,6 @@ def build_content(lang):
         gr.Markdown("""
         为了从根本上解决对齐问题和时间碎片化，我们引入了 **Graph-DPO**。
         通过将视觉-时间相似度图直接注入到 DPO 训练循环中，策略学习输出对齐的、时间连贯的分数，而不会涂抹误报。
-        
-        **核心组件:**
-        1. **偏好对 (Preference Pairs)**: 由人类注释构建 (精彩片段 vs 背景)。
-        2. **图传播层 (Graph Propagation Layer)**: 在前向传播*期间*，在相似帧之间传递逻辑值消息 (例如 $Y = A X$)。
-        3. **DPO 损失**: 将图平滑策略与参考模型对齐，直接优化奖励边界。
         """)
         
         # ---------------------------------------------------------
@@ -182,7 +221,8 @@ def build_content(lang):
 theme = gr.themes.Glass(
     primary_hue="sky", 
     neutral_hue="slate",
-    radius_size="lg", 
+    radius_size="lg",
+    text_size=gr.themes.sizes.text_lg,
     font=[gr.themes.GoogleFont("Inconsolata"), "Arial", "sans-serif"]
 ).set(
     body_background_fill="#0f172a",
@@ -190,32 +230,47 @@ theme = gr.themes.Glass(
     block_background_fill="#1e293b",
     block_background_fill_dark="#1e293b",
     background_fill_primary="#0f172a",
-    background_fill_primary_dark="#0f172a",
-    background_fill_secondary="#1e293b",
-    background_fill_secondary_dark="#1e293b",
-    border_color_primary="#334155",
-    border_color_primary_dark="#334155",
-    block_label_background_fill="#1e293b",
-    block_label_background_fill_dark="#1e293b",
-    input_background_fill="#0f172a",
-    input_background_fill_dark="#0f172a",
-    button_primary_background_fill="#0284c7",
-    button_primary_background_fill_dark="#0284c7",
-    button_primary_text_color="#f1f5f9",
-    button_primary_text_color_dark="#f1f5f9",
-    button_secondary_background_fill="#1e293b",
-    button_secondary_background_fill_dark="#1e293b",
-    button_secondary_text_color="#f1f5f9",
-    button_secondary_text_color_dark="#f1f5f9",
-    body_text_color="#f1f5f9",
-    body_text_color_dark="#f1f5f9",
-    block_title_text_color="#f1f5f9",
-    block_title_text_color_dark="#f1f5f9",
-    block_label_text_color="#f1f5f9",
-    block_label_text_color_dark="#f1f5f9"
+    background_fill_primary_dark="#0f172a"
 )
 
-with gr.Blocks(theme=theme) as demo:
+# --- BULLETPROOF JAVASCRIPT FOR HOVER AUDIO & AUTOPLAY ---
+hover_js = """
+function() {
+    // We use setInterval so that even if Gradio renders the videos slowly, 
+    // or if the user switches languages (destroying and recreating the DOM elements), 
+    // the script will eventually find them and attach the behavior.
+    setInterval(function() {
+        const videoContainers = document.querySelectorAll('.gallery-video');
+        
+        videoContainers.forEach(container => {
+            const vid = container.querySelector('video');
+            if (vid && !vid.hasAttribute('data-hover-setup')) {
+                // 1. Force mute (Browser requires this for autoplay)
+                vid.muted = true;
+                vid.loop = true;
+                
+                // 2. Force autoplay via JS
+                vid.play().catch(e => console.log("Autoplay blocked by browser:", e));
+                
+                // 3. Attach hover listeners to unmute/mute
+                container.addEventListener('mouseenter', () => { 
+                    vid.muted = false; 
+                });
+                container.addEventListener('mouseleave', () => { 
+                    vid.muted = true; 
+                });
+                
+                // Mark it as setup so we don't attach listeners twice
+                vid.setAttribute('data-hover-setup', 'true');
+            }
+        });
+    }, 500); // Check every half a second
+}
+"""
+
+with gr.Blocks() as demo:
+    demo.load(None, None, None, js=hover_js)
+    
     # Top right language toggle
     with gr.Row():
         with gr.Column(scale=9):
@@ -248,4 +303,4 @@ with gr.Blocks(theme=theme) as demo:
     )
 
 if __name__ == "__main__":
-    demo.launch(server_name="0.0.0.0", server_port=7860, share=False)
+    demo.launch(theme=theme)
