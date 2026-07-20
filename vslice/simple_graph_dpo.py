@@ -751,7 +751,7 @@ def main():
     parser.add_argument("--root_dir", type=str, default=".", help="Root working directory.")
     parser.add_argument("--learning_rate", type=float, default=5e-6, help="Learning rate.")
     parser.add_argument("--weight_decay", type=float, default=1e-5, help="Optimizer weight decay.")
-    parser.add_argument("--num_epochs", type=type(1), default=5, help="Number of epochs.")
+    parser.add_argument("--num_epochs", type=int, default=5, help="Number of epochs.")
     parser.add_argument("--batch_size", type=int, default=2, help="Number of videos per training batch.")
     parser.add_argument("--clip_length", type=int, default=4, help="Number of sampled frames per clip.")
     parser.add_argument("--beta", type=float, default=0.5, help="Beta coefficient in DPO loss.")

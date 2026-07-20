@@ -6,6 +6,15 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from scipy.ndimage import gaussian_filter1d
 
+plt.rcParams.update({
+    'font.size': 14,          # Global font size
+    'axes.titlesize': 14,     # Title size
+    'axes.labelsize': 14,     # X/Y axis labels
+    'xtick.labelsize': 12,    # X tick labels
+    'ytick.labelsize': 12,    # Y tick labels
+    'legend.fontsize': 12     # Legend font size
+})
+
 def load_real_data():
     """Loads the cached LVLM logits and the ground truth from SumMe."""
     with open('dpo_data/ref_scores_summe_split_0.pkl', 'rb') as f:
@@ -85,28 +94,26 @@ def generate_misalignment(lvlm_scores, h5, output_dir):
     x = np.arange(len(categories))
     width = 0.35
     
-    fig, ax = plt.subplots(figsize=(8, 6))
-    
-    # Paper-ready modern colors
-    color_gt = 'cyan'  
-    color_lvlm = 'magenta'
-    
+    fig, ax = plt.subplots(figsize=(7.5, 6))
+
     rects1 = ax.bar(x - width/2, gt_means, width, yerr=gt_stds, capsize=6, 
-                    label='Ground Truth (Target)', color=color_gt, alpha=0.95, edgecolor='black', linewidth=1.2,
+                    label='Ground Truth', color='pink', alpha=1.0, edgecolor='black', linewidth=1.2,
                     error_kw=dict(lw=1.5, capthick=1.5, ecolor='black'))
                     
     rects2 = ax.bar(x + width/2, lvlm_means, width, yerr=lvlm_stds, capsize=6, 
-                    label='Zero-Shot LVLM', color=color_lvlm, alpha=0.95, edgecolor='black', linewidth=1.2,
+                    label='Zero-Shot LVLM', color='blue', alpha=0.5, edgecolor='black', linewidth=1.2,
                     error_kw=dict(lw=1.5, capthick=1.5, ecolor='black'))
     
     # Hide top and right spines for cleaner aesthetic
     ax.spines['top'].set_visible(False)
     ax.spines['right'].set_visible(False)
     
-    ax.set_ylabel('Frame Importance Score (Avg.)', fontweight='bold')
+    ax.set_ylabel('Pred Confidence vs. GT Importance', fontweight='bold')
     ax.set_xticks(x)
+    ax.tick_params(axis='x', labelsize=16)
+    ax.tick_params(axis='y', labelsize=16)
     ax.set_xticklabels(categories, fontweight='bold')
-    ax.set_ylim(0, 1.3) # Give space for annotation
+    ax.set_ylim(0, 1.05) # Give space for annotation
     ax.legend(loc='upper left', frameon=True, shadow=True)
     
     # Add exact value labels on top of bars
@@ -114,8 +121,13 @@ def generate_misalignment(lvlm_scores, h5, output_dir):
         for rect in rects:
             height = rect.get_height()
             if not np.isnan(height):
-                ax.annotate(f'{height:.2f}', xy=(rect.get_x() + rect.get_width() / 2, height),
-                            xytext=(0, 5), textcoords="offset points", ha='center', va='bottom', fontsize=12)
+                ax.annotate(f'{height:.2f}', 
+                            xy=(rect.get_x() + rect.get_width() / 2, height),
+                            xytext=(15, 5),
+                            textcoords="offset points", 
+                            ha='left', 
+                            va='bottom', 
+                            fontsize=16)
                             
     # ----------------------------------------------------
     # Explicitly Annotate the Gap on Backgrounds
@@ -127,14 +139,14 @@ def generate_misalignment(lvlm_scores, h5, output_dir):
     
     # Draw vertical double-headed arrow
     ax.annotate('', xy=(gap_x, bg_lvlm_val), xytext=(gap_x, bg_gt_val),
-                arrowprops=dict(arrowstyle='<->', color='#D62828', lw=2.5))
+                arrowprops=dict(arrowstyle='<->', color='#D62828', lw=1))
                 
     # Horizontal dotted lines connecting bars to the arrow
     ax.plot([x[0] - width/2, gap_x], [bg_gt_val, bg_gt_val], color='#D62828', linestyle=':', lw=1.5)
     ax.plot([x[0] + width/2, gap_x], [bg_lvlm_val, bg_lvlm_val], color='#D62828', linestyle=':', lw=1.5)
     
     # Gap text
-    gap_text = f'Misalignment Gap\n(+{bg_lvlm_val - bg_gt_val:.2f})'
+    gap_text = f'Alignment\nError\n(+{bg_lvlm_val - bg_gt_val:.2f})'
     ax.text(gap_x + 0.05, (bg_gt_val + bg_lvlm_val)/2, gap_text, 
             ha='left', va='center', color='#D62828', fontweight='bold', fontsize=12)
                         
@@ -205,7 +217,7 @@ def generate_reliability(lvlm_scores, h5, output_dir, n_bins=10):
     high_ece = compute_ece(high_means, high_confs, high_counts)
     non_ece = compute_ece(non_means, non_confs, non_counts)
     
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 6))
     bar_width = (1.0 / n_bins) * 0.85
     
     # Clean nan values to 0 for plotting bottoms
@@ -223,18 +235,20 @@ def generate_reliability(lvlm_scores, h5, output_dir, n_bins=10):
     # Blue bars: Observed Accuracy (overlaps red bars)
     ax1.bar(bin_starts, non_means_plot, bar_width, align='edge', color='blue', edgecolor='black', alpha=0.5, label='Outputs')
 
-    ax1.set_title('Backgrounds (GT < 0.5)', fontweight='bold', pad=15)
-    ax1.set_xlim(0.0, 0.5) 
-    ax1.set_ylim(-0.05, 0.55) 
+    ax1.set_title('Background (Non-Highlight)', fontweight='bold', pad=15)
+    ax1.set_xlim(0.0, 0.499) 
+    ax1.set_ylim(0.0, 1.0) 
     ax1.set_xlabel('Confidence', fontweight='bold')
     ax1.set_ylabel('Accuracy', fontweight='bold')
     ax1.spines['top'].set_visible(False)
     ax1.spines['right'].set_visible(False)
-    ax1.legend(loc='upper left', frameon=True, shadow=True)
-    ax1.text(0.03, 0.70, f'ECE: {non_ece:.4f}', fontsize=12, fontweight='bold',
+    ax1.legend(loc='upper right', frameon=True, shadow=True)
+    ax1.text(0.03, 0.80, f'ECE: {non_ece:.2f}', fontsize=12, fontweight='bold',
              transform=ax1.transAxes,
              bbox=dict(facecolor='white', alpha=0.8, edgecolor='black', boxstyle='round, pad=0.5'))
-    
+    ax1.tick_params(axis='x', labelsize=16)
+    ax1.tick_params(axis='y', labelsize=16)
+
     # ----- Plot Highlights -----
     ax2.plot([0, 1], [0, 1], 'k--', alpha=0.7, label='Ideal')
     
@@ -243,20 +257,21 @@ def generate_reliability(lvlm_scores, h5, output_dir, n_bins=10):
     # Blue bars: Observed Accuracy (overlaps red bars)
     ax2.bar(bin_starts, high_means_plot, bar_width, align='edge', color='blue', edgecolor='black', alpha=0.5, label='Outputs')
     
-    ax2.set_title('Highlights (GT >= 0.5)', fontweight='bold', pad=15)
+    ax2.set_title('Key Events (Highlight)', fontweight='bold', pad=15)
     ax2.set_xlim(0.5, 1.0)
-    ax2.set_ylim(0.45, 1.05) 
+    ax2.set_ylim(0.0, 1.0) 
     ax2.set_xlabel('Confidence', fontweight='bold')
     ax2.set_ylabel('Accuracy', fontweight='bold')
     ax2.spines['top'].set_visible(False)
     ax2.spines['right'].set_visible(False)
-    ax2.legend(loc='upper left', frameon=True, shadow=True)
-    ax2.text(0.03, 0.70, f'ECE: {high_ece:.4f}', fontsize=12, fontweight='bold',
+    ax2.text(0.03, 0.80, f'ECE: {high_ece:.2f}', fontsize=12, fontweight='bold',
              transform=ax2.transAxes,
-             bbox=dict(facecolor='white', alpha=0.8, edgecolor='black', boxstyle='round,pad=0.5'))
+             bbox=dict(facecolor='white', alpha=0.8, edgecolor='black', boxstyle='round, pad=0.5'))
 
     plt.tight_layout()
-    
+    ax2.tick_params(axis='x', labelsize=16)
+    ax2.tick_params(axis='y', labelsize=16)
+
     out_path = os.path.join(output_dir, "fig1_reliability_split.png")
     plt.savefig(out_path, bbox_inches='tight')
     plt.close()
