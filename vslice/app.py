@@ -20,10 +20,11 @@ def mock_summarize(video_file, prompt, progress=gr.Progress()):
     return video_file
 
 fig_reliability = "results/fig1_reliability_split.png"
+fig_misalignment = "results/fig1_misalignment_real.png"
 fig_posthoc = "results/fig4_posthoc_graph_failure.png"
 
 # Placeholders for example Videos
-video_example1 = "/home/dex/Downloads/safe_1771730634.mp4"
+video_example1 = "/mnt/c/Users/dexter.neo/Downloads/69118fe052fb155119d76733j1I4g7PP06.mp4"
 video_example2 = "/home/dex/Downloads/safe_1771730634.mp4"
 video_example3 = "/home/dex/Downloads/safe_1771730634.mp4"
 
@@ -37,7 +38,7 @@ def build_content(lang):
         # ---------------------------------------------------------
         gr.Markdown("---")
         gr.Markdown("## Demo Gallery (Summary Outputs)")
-        gr.Markdown("Example summaries of what VSLICE can generate. *(Play & Hover over videos to hear audio)*")
+        gr.Markdown("Example summaries of what VSLICE can generate.")
         
         with gr.Row():
             if os.path.exists(video_example1):
@@ -63,13 +64,21 @@ def build_content(lang):
         gr.Markdown("### The Problem: LVLM Misalignment & Overconfidence")
         gr.Markdown(
             "Although Large Vision-Language Models (LVLMs) possess strong semantic recognition ability, "
-            "their raw confidence scores are poorly calibrated for highlight localization. They suffer from massive overconfidence "
-            "on background frames, causing a massive **Human Misalignment Gap**."
+            "their raw confidence scores are poorly calibrated for highlight localization. Reliability diagrams reveal that they suffer from massive overconfidence "
+            "on non-highlight background frames, manifesting as a persistent **Human Misalignment Gap**."
         )
-        if os.path.exists(fig_reliability):
-            gr.Image(fig_reliability, label="Reliability Diagram (LVLM Overconfidence)", show_label=True)
-        else:
-            gr.Markdown(f"*(Image not found at {fig_reliability})*")
+        with gr.Row():
+            # Left Image
+            if os.path.exists(fig_misalignment):
+                gr.Image(fig_misalignment, label="Highlight Misalignment", show_label=False, height=350)
+            else:
+                gr.Markdown(f"*(Image not found at {fig_misalignment})*")
+                
+            # Right Image
+            if os.path.exists(fig_reliability):
+                gr.Image(fig_reliability, label="Reliability Diagram (LVLM Overconfidence)", show_label=False, height=350)
+            else:
+                gr.Markdown(f"*(Image not found at {fig_reliability})*")
         
         gr.Markdown("### The Post-Hoc Smoothing Trap")
         gr.Markdown(
@@ -78,7 +87,7 @@ def build_content(lang):
             "across adjacent frames, completely destroying precision."
         )
         if os.path.exists(fig_posthoc):
-            gr.Image(fig_posthoc, label="The Post-Hoc Graph Smoothing Failure", show_label=True)
+            gr.Image(fig_posthoc, label="The Post-Hoc Graph Smoothing Failure", show_label=False)
         else:
             gr.Markdown(f"*(Image not found at {fig_posthoc})*")
 
@@ -161,10 +170,18 @@ def build_content(lang):
             "但它们的原始置信度分数在精彩片段定位方面的校准效果很差。它们在背景帧上表现出极度的过度自信，"
             "导致了巨大的**人类偏好不对齐差距 (Misalignment Gap)**。"
         )
-        if os.path.exists(fig_reliability):
-            gr.Image(fig_reliability, label="可靠性图 (LVLM 过度自信)", show_label=True)
-        else:
-            gr.Markdown(f"*(未找到图片：{fig_reliability})*")
+        with gr.Row():
+            # Left Image
+            if os.path.exists(fig_misalignment):
+                gr.Image(fig_misalignment, label="高亮不对齐分析", show_label=False, height=350)
+            else:
+                gr.Markdown(f"*(未找到图片：{fig_misalignment})*")
+                
+            # Right Image
+            if os.path.exists(fig_reliability):
+                gr.Image(fig_reliability, label="可靠性图 (LVLM 过度自信)", show_label=False, height=350)
+            else:
+                gr.Markdown(f"*(未找到图片：{fig_reliability})*")
         
         gr.Markdown("### 事后平滑陷阱")
         gr.Markdown(
@@ -225,51 +242,70 @@ theme = gr.themes.Glass(
     text_size=gr.themes.sizes.text_lg,
     font=[gr.themes.GoogleFont("Inconsolata"), "Arial", "sans-serif"]
 ).set(
+    # Backgrounds
     body_background_fill="#0f172a",
     body_background_fill_dark="#0f172a",
     block_background_fill="#1e293b",
     block_background_fill_dark="#1e293b",
     background_fill_primary="#0f172a",
-    background_fill_primary_dark="#0f172a"
+    background_fill_primary_dark="#0f172a",
+
+    # Body text
+    body_text_color="#f1f5f9",
+    body_text_color_dark="#f1f5f9",
+
+    # Block / component labels (e.g. "Input Long Video", "Output")
+    block_label_background_fill="#334155",
+    block_label_background_fill_dark="#334155",
+    block_label_text_color="#f1f5f9",
+    block_label_text_color_dark="#f1f5f9",
+    block_title_text_color="#f1f5f9",
+    block_title_text_color_dark="#f1f5f9",
+
+    # Input / Textbox
+    input_background_fill="#0f172a",
+    input_background_fill_dark="#0f172a",
+    input_border_color="#334155",
+    input_border_color_dark="#334155",
+    input_placeholder_color="#64748b",
+
+    # Radio buttons (language toggle)
+    checkbox_label_background_fill="#1e293b",
+    checkbox_label_background_fill_dark="#1e293b",
+    checkbox_label_text_color="#f1f5f9",
+    checkbox_label_text_color_dark="#f1f5f9",
+    checkbox_label_border_color="#334155",
+    checkbox_label_border_color_dark="#334155",
+    checkbox_label_background_fill_selected="#0284c7",
+    checkbox_label_background_fill_selected_dark="#0284c7",
+    checkbox_label_text_color_selected="#ffffff",
+    checkbox_label_text_color_selected_dark="#ffffff",
+    checkbox_label_border_color_selected="#38bdf8",
+    checkbox_label_border_color_selected_dark="#38bdf8",
+
+    # Primary button (✨ Generate Summary)
+    button_primary_background_fill="#0284c7",
+    button_primary_background_fill_dark="#0284c7",
+    button_primary_background_fill_hover="#0369a1",
+    button_primary_background_fill_hover_dark="#0369a1",
+    button_primary_text_color="#ffffff",
+    button_primary_text_color_dark="#ffffff",
+    button_primary_border_color="#38bdf8",
+    button_primary_border_color_dark="#38bdf8",
+
+    # Secondary button (default)
+    button_secondary_background_fill="#1e293b",
+    button_secondary_background_fill_dark="#1e293b",
+    button_secondary_background_fill_hover="#334155",
+    button_secondary_background_fill_hover_dark="#334155",
+    button_secondary_text_color="#f1f5f9",
+    button_secondary_text_color_dark="#f1f5f9",
+    button_secondary_border_color="#334155",
+    button_secondary_border_color_dark="#334155",
 )
 
-# --- BULLETPROOF JAVASCRIPT FOR HOVER AUDIO & AUTOPLAY ---
-hover_js = """
-function() {
-    // We use setInterval so that even if Gradio renders the videos slowly, 
-    // or if the user switches languages (destroying and recreating the DOM elements), 
-    // the script will eventually find them and attach the behavior.
-    setInterval(function() {
-        const videoContainers = document.querySelectorAll('.gallery-video');
-        
-        videoContainers.forEach(container => {
-            const vid = container.querySelector('video');
-            if (vid && !vid.hasAttribute('data-hover-setup')) {
-                // 1. Force mute (Browser requires this for autoplay)
-                vid.muted = true;
-                vid.loop = true;
-                
-                // 2. Force autoplay via JS
-                vid.play().catch(e => console.log("Autoplay blocked by browser:", e));
-                
-                // 3. Attach hover listeners to unmute/mute
-                container.addEventListener('mouseenter', () => { 
-                    vid.muted = false; 
-                });
-                container.addEventListener('mouseleave', () => { 
-                    vid.muted = true; 
-                });
-                
-                // Mark it as setup so we don't attach listeners twice
-                vid.setAttribute('data-hover-setup', 'true');
-            }
-        });
-    }, 500); // Check every half a second
-}
-"""
-
 with gr.Blocks() as demo:
-    demo.load(None, None, None, js=hover_js)
+    demo.load(None, None, None)
     
     # Top right language toggle
     with gr.Row():

@@ -152,6 +152,7 @@ def generate_misalignment(lvlm_scores, h5, output_dir):
                         
     plt.tight_layout()
     out_path = os.path.join(output_dir, "fig1_misalignment_real.png")
+    plt.grid(axis='x', linestyle='--', alpha=0.5)
     plt.savefig(out_path, bbox_inches='tight')
     plt.close()
     print(f"Saved: {out_path}")
@@ -236,7 +237,7 @@ def generate_reliability(lvlm_scores, h5, output_dir, n_bins=10):
     ax1.bar(bin_starts, non_means_plot, bar_width, align='edge', color='blue', edgecolor='black', alpha=0.5, label='Outputs')
 
     ax1.set_title('Background (Non-Highlight)', fontweight='bold', pad=15)
-    ax1.set_xlim(0.0, 0.499) 
+    ax1.set_xlim(0.0, 0.5) 
     ax1.set_ylim(0.0, 1.0) 
     ax1.set_xlabel('Confidence', fontweight='bold')
     ax1.set_ylabel('Accuracy', fontweight='bold')
@@ -248,6 +249,7 @@ def generate_reliability(lvlm_scores, h5, output_dir, n_bins=10):
              bbox=dict(facecolor='white', alpha=0.8, edgecolor='black', boxstyle='round, pad=0.5'))
     ax1.tick_params(axis='x', labelsize=16)
     ax1.tick_params(axis='y', labelsize=16)
+    ax1.grid(axis='x', linestyle='--', alpha=0.5)
 
     # ----- Plot Highlights -----
     ax2.plot([0, 1], [0, 1], 'k--', alpha=0.7, label='Ideal')
@@ -271,7 +273,7 @@ def generate_reliability(lvlm_scores, h5, output_dir, n_bins=10):
     plt.tight_layout()
     ax2.tick_params(axis='x', labelsize=16)
     ax2.tick_params(axis='y', labelsize=16)
-
+    ax2.grid(axis='x', linestyle='--', alpha=0.5)
     out_path = os.path.join(output_dir, "fig1_reliability_split.png")
     plt.savefig(out_path, bbox_inches='tight')
     plt.close()
