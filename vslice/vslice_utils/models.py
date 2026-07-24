@@ -4,6 +4,7 @@ from PIL import Image
 from transformers import AutoModel, AutoTokenizer, AutoProcessor, AutoModelForImageTextToText
 from qwen_vl_utils import process_vision_info
 from peft import PeftModel
+from transformers import BitsAndBytesConfig
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -14,19 +15,38 @@ class QwenVLWrapper:
         self.model = model
         self.processor = processor
 
-def load_vlm(model_path, model_type, device):
+def load_vlm(model_path, model_type, device, load_in_4bit=False):
     """Load specified VLM and return (model, tokenizer, processor, yes_id, no_id)."""
     dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
     print(f"[{device}] Loading {model_type} from {model_path}...")
 
+    # Configure 4-bit quantization config if requested
+    bnb_config = None
+    if load_in_4bit:
+        bnb_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_use_double_quant=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_compute_dtype=torch.bfloat16
+        )
+
     if model_type == "minicpm":
-        model = AutoModel.from_pretrained(
-            model_path,
-            trust_remote_code=True,
-            dtype=dtype,
-            device_map=device,
-            attn_implementation="eager",
-        ).eval()
+        kwargs = {
+            "trust_remote_code": True,
+            "device_map": device,
+            "attn_implementation": "sdpa" if load_in_4bit else "eager",
+        }
+        if load_in_4bit:
+            kwargs["quantization_config"] = bnb_config
+            # When using bitsandbytes, device_map should be "auto" or device index
+            kwargs["device_map"] = "auto"
+        else:
+            kwargs["dtype"] = dtype
+            
+        model = AutoModel.from_pretrained(model_path, **kwargs)
+        if not load_in_4bit:
+            model = model.eval()
+            
         tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
         processor = AutoProcessor.from_pretrained(model_path, trust_remote_code=True)
         
@@ -36,13 +56,20 @@ def load_vlm(model_path, model_type, device):
         return model, tokenizer, processor, yes_id, no_id
 
     elif model_type == "qwen":
-        model = AutoModelForImageTextToText.from_pretrained(
-            model_path, 
-            device_map="auto", 
-            dtype=dtype,
-            _attn_implementation="flash_attention_2",
-            trust_remote_code=True
-        ).eval()
+        kwargs = {
+            "trust_remote_code": True,
+            "device_map": "auto",
+            "_attn_implementation": "flash_attention_2" if torch.cuda.is_available() else "eager"
+        }
+        if load_in_4bit:
+            kwargs["quantization_config"] = bnb_config
+        else:
+            kwargs["dtype"] = dtype
+            
+        model = AutoModelForImageTextToText.from_pretrained(model_path, **kwargs)
+        if not load_in_4bit:
+            model = model.eval()
+            
         processor = AutoProcessor.from_pretrained(model_path, pad_token='<|endoftext|>')
         
         # In Qwen, 'Yes' and 'No' IDs
@@ -53,6 +80,7 @@ def load_vlm(model_path, model_type, device):
         print(f"[{device}] [OK] Qwen3.5 Loaded (Yes={yes_id}, No={no_id})")
         # Reuse same structure for convenience
         return QwenVLWrapper(model, processor), processor.tokenizer, processor, yes_id, no_id
+
 
 
 # ─────────────────────── VLM INFERENCE ───────────────────────

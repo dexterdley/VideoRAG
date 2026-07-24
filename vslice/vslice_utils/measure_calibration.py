@@ -11,7 +11,10 @@ import h5py
 from tqdm import tqdm
 import torch
 from scipy.interpolate import interp1d
-from extract_features import build_summe_manifest, build_tvsum_manifest
+try:
+    from extract_features import build_summe_manifest, build_tvsum_manifest
+except ImportError:
+    build_summe_manifest = build_tvsum_manifest = None
 
 import matplotlib.pyplot as plt
 # Some keys used for the following dictionaries

@@ -476,7 +476,7 @@ def evaluate(model, val_loader, dataset_name, h5_paths, tvsum_user_scores=None, 
 # ================= TRAINING LOOP =================
 
 def train_graph_dpo(args):
-    vlm_vars = load_vlm(args.model_path, args.model_type, device)
+    vlm_vars = load_vlm(args.model_path, args.model_type, device, load_in_4bit=args.load_in_4bit)
     wrapper_or_model, tokenizer, processor, yes_id, no_id = vlm_vars
     model = wrapper_or_model.model if args.model_type == "qwen" else wrapper_or_model
     
@@ -503,8 +503,8 @@ def train_graph_dpo(args):
     model.requires_grad_(False)
 
     lora_config = LoraConfig(
-        r=16,
-        lora_alpha=32,
+        r=8,
+        lora_alpha=16,
         target_modules=["q_proj", "v_proj", "k_proj", "o_proj"],
         lora_dropout=0.05,
         bias="none",
@@ -755,6 +755,7 @@ def main():
     parser.add_argument("--batch_size", type=int, default=2, help="Number of videos per training batch.")
     parser.add_argument("--clip_length", type=int, default=4, help="Number of sampled frames per clip.")
     parser.add_argument("--beta", type=float, default=0.5, help="Beta coefficient in DPO loss.")
+    parser.add_argument("--load_in_4bit", action="store_true", help="Load model in 4-bit for low-VRAM GPUs.")
     args = parser.parse_args()
     
     args.model_path = resolve_model_path(args.model_type)

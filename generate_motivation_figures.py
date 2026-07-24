@@ -7,12 +7,12 @@ import seaborn as sns
 from scipy.ndimage import gaussian_filter1d
 
 plt.rcParams.update({
-    'font.size': 14,          # Global font size
-    'axes.titlesize': 14,     # Title size
-    'axes.labelsize': 14,     # X/Y axis labels
-    'xtick.labelsize': 12,    # X tick labels
-    'ytick.labelsize': 12,    # Y tick labels
-    'legend.fontsize': 12     # Legend font size
+    'font.size': 16,          # Global font size
+    'axes.titlesize': 16,     # Title size
+    'axes.labelsize': 16,     # X/Y axis labels
+    'xtick.labelsize': 14,    # X tick labels
+    'ytick.labelsize': 14,    # Y tick labels
+    'legend.fontsize': 14     # Legend font size
 })
 
 def load_real_data():
@@ -54,11 +54,7 @@ def generate_misalignment(lvlm_scores, h5, output_dir):
     for vid_key in lvlm_scores.keys():
         ref = np.array(lvlm_scores[vid_key])
         gt = np.array(h5[vid_key + '/gtscore'])
-        
-        # Normalize GT
-        if gt.max() > gt.min():
-            gt = (gt - gt.min()) / (gt.max() - gt.min())
-            
+
         highlight_mask = gt > gt_threshold
         non_highlight_mask = gt <= gt_threshold
         
@@ -171,13 +167,9 @@ def generate_reliability(lvlm_scores, h5, output_dir, n_bins=10):
         ref = np.array(lvlm_scores[vid_key])
         gt = np.array(h5[vid_key + '/gtscore'])
         
-        # Normalize GT
-        if gt.max() > gt.min():
-            gt = (gt - gt.min()) / (gt.max() - gt.min())
-            
         all_lvlm.extend(ref)
         all_gt.extend(gt)
-        
+    
     all_lvlm = np.array(all_lvlm)
     all_gt = np.array(all_gt)
     
@@ -218,8 +210,8 @@ def generate_reliability(lvlm_scores, h5, output_dir, n_bins=10):
     high_ece = compute_ece(high_means, high_confs, high_counts)
     non_ece = compute_ece(non_means, non_confs, non_counts)
     
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 6))
-    bar_width = (1.0 / n_bins) * 0.85
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(11, 5.5))
+    bar_width = (1.0 / n_bins) * 0.4
     
     # Clean nan values to 0 for plotting bottoms
     high_means_plot = [m if not np.isnan(m) else 0 for m in high_means]
@@ -274,7 +266,156 @@ def generate_reliability(lvlm_scores, h5, output_dir, n_bins=10):
     ax2.tick_params(axis='x', labelsize=16)
     ax2.tick_params(axis='y', labelsize=16)
     ax2.grid(axis='x', linestyle='--', alpha=0.5)
-    out_path = os.path.join(output_dir, "fig1_reliability_split.png")
+    out_path = os.path.join(output_dir, "fig1_reliability_split.pdf")
+    plt.savefig(out_path, bbox_inches='tight')
+    plt.close()
+    print(f"Saved: {out_path}")
+
+COUNT = 'count'
+CONF = 'confidence'
+ACC = 'accuracy'
+
+def _populate_bins(confs, preds, labels, num_bins=15):
+    """
+    Populates confidence bins with accuracy, confidence, and count information.
+    """
+    bin_dict = {}
+    bins = np.linspace(0, 1, num_bins + 1)
+    for i in range(num_bins):
+        bin_dict[i] = {
+            ACC: 0.0,
+            CONF: 0.0,
+            COUNT: 0
+        }
+    
+    indices = np.digitize(confs, bins) - 1
+    for idx, (conf, pred, label) in enumerate(zip(confs, preds, labels)):
+        bin_idx = indices[idx]
+        if bin_idx >= num_bins:
+            bin_idx = num_bins - 1
+        elif bin_idx < 0:
+            bin_idx = 0
+        bin_dict[bin_idx][COUNT] += 1
+    return bin_dict
+
+def bin_strength_plot(confs, preds, labels, title, num_bins=10):
+    '''
+    Method to draw a plot for the number of samples in each confidence bin.
+    '''
+    bin_dict = _populate_bins(confs, preds, labels, num_bins)
+    bns = [(i / float(num_bins)) for i in range(num_bins)]
+    num_samples = len(labels)
+    y = []
+    for i in range(num_bins):
+        n = (bin_dict[i][COUNT] / float(num_samples))
+        y.append(n)
+    return y
+
+def generate_bin_strength(lvlm_scores, h5, output_dir, n_bins=10):
+    """
+    Figure 2: Guo et al. Style Bin Strength diagram split for Highlights and Non-Highlights.
+    """
+    all_lvlm = []
+    all_gt = []
+    
+    for vid_key in lvlm_scores.keys():
+        ref = np.array(lvlm_scores[vid_key])
+        gt = np.array(h5[vid_key + '/gtscore'])
+        
+        # Normalize GT
+        if gt.max() > gt.min():
+            gt = (gt - gt.min()) / (gt.max() - gt.min())
+            
+        all_lvlm.extend(ref)
+        all_gt.extend(gt)
+        
+    all_lvlm = np.array(all_lvlm)
+    all_gt = np.array(all_gt)
+    
+    highlight_mask = all_gt >= 0.5
+    non_highlight_mask = all_gt < 0.5
+    
+    bins = np.linspace(0, 1, n_bins + 1)
+    bin_starts = bins[:-1]
+    bar_width = 1.0 / n_bins
+    
+    def get_bin_percentages(mask):
+        masked_lvlm = all_lvlm[mask]
+        masked_gt = all_gt[mask]
+        
+        preds_lvlm = (masked_lvlm > 0.5).astype(int)
+        preds_gt = (masked_gt > 0.5).astype(int)
+        labels_binary = (masked_gt > 0.5).astype(int)
+        
+        y_lvlm = bin_strength_plot(masked_lvlm, preds_lvlm, labels_binary, "", num_bins=n_bins)
+        y_gt = bin_strength_plot(masked_gt, preds_gt, labels_binary, "", num_bins=n_bins)
+        return y_lvlm, y_gt
+
+    non_lvlm, non_gt = get_bin_percentages(non_highlight_mask)
+    high_lvlm, high_gt = get_bin_percentages(highlight_mask)
+    
+    # Calculate exact means
+    mean_non_lvlm = all_lvlm[non_highlight_mask].mean()
+    mean_non_gt = all_gt[non_highlight_mask].mean()
+    mean_high_lvlm = all_lvlm[highlight_mask].mean()
+    mean_high_gt = all_gt[highlight_mask].mean()
+    
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(11, 5.5))
+    
+    # Place two bars side-by-side within each bin
+    bar_width = 1.0 / n_bins
+    width = bar_width * 0.5
+    
+    # ----- Plot Non-Highlights -----
+    ax1.bar(bin_starts + width, non_gt, width, align='edge', color='pink', edgecolor='black', linewidth=1.5, alpha=0.8, label='Ground Truth')
+    ax1.bar(bin_starts, non_lvlm, width, align='edge', color='lightcyan', edgecolor='black', linewidth=1.5, alpha=0.8, label='Zero-Shot LVLM')
+    
+    # Draw vertical mean lines
+    ax1.axvline(mean_non_gt, color='#D62728', linestyle='--', linewidth=2)
+    ax1.axvline(mean_non_lvlm, color='#1F77B4', linestyle='--', linewidth=2)
+    
+    # Annotate mean values using axis transform for robust vertical positioning (y from 0 to 1)
+    ax1.text(mean_non_gt + 0.02, 0.85, f'GT Mean: {mean_non_gt:.2f}', color='#D62728', fontweight='bold', transform=ax1.get_xaxis_transform(), fontsize=12)
+    ax1.text(mean_non_lvlm - 0.02, 0.75, f'VLM Mean: {mean_non_lvlm:.2f}', color='#1F77B4', fontweight='bold', transform=ax1.get_xaxis_transform(), fontsize=12, ha='right')
+    
+    ax1.set_title('Background (Non-Highlight)', fontweight='bold', pad=15)
+    ax1.set_xlim(0.0, 1.0) # Extended to 1.0 to fit VLM mean (0.66)
+    ax1.set_ylim(0.0, 1.0)
+    ax1.set_xlabel('Confidence', fontweight='bold')
+    ax1.set_ylabel('Percentage of samples', fontweight='bold')
+    ax1.spines['top'].set_visible(False)
+    ax1.spines['right'].set_visible(False)
+    ax1.legend(loc='upper right', frameon=True, shadow=True)
+    ax1.tick_params(axis='x', labelsize=16)
+    ax1.tick_params(axis='y', labelsize=16)
+    ax1.grid(axis='x', linestyle='--', alpha=0.5)
+    
+    # ----- Plot Highlights -----
+    ax2.bar(bin_starts + width, high_gt, width, align='edge', color='pink', edgecolor='black', linewidth=1.5, alpha=0.8, label='Ground Truth')
+    ax2.bar(bin_starts, high_lvlm, width, align='edge', color='lightcyan', edgecolor='black', linewidth=1.5, alpha=0.8, label='Zero-Shot LVLM')
+    
+    # Draw vertical mean lines
+    ax2.axvline(mean_high_gt, color='#D62728', linestyle='--', linewidth=2)
+    ax2.axvline(mean_high_lvlm, color='#1F77B4', linestyle='--', linewidth=2)
+    
+    # Annotate mean values
+    ax2.text(mean_high_gt - 0.01, 0.85, f'GT Mean: {mean_high_gt:.2f}', color='#D62728', fontweight='bold', transform=ax2.get_xaxis_transform(), fontsize=12, ha='right')
+    ax2.text(mean_high_lvlm + 0.01, 0.75, f'VLM Mean: {mean_high_lvlm:.2f}', color='#1F77B4', fontweight='bold', transform=ax2.get_xaxis_transform(), fontsize=12)
+    
+    ax2.set_title('Key Events (Highlight)', fontweight='bold', pad=15)
+    ax2.set_xlim(0.5, 1.0)
+    ax2.set_ylim(0.0, 1.0)
+    ax2.set_xlabel('Confidence', fontweight='bold')
+    ax2.set_ylabel('Percentage of samples', fontweight='bold')
+    ax2.spines['top'].set_visible(False)
+    ax2.spines['right'].set_visible(False)
+    ax2.legend(loc='upper right', frameon=True, shadow=True)
+    ax2.tick_params(axis='x', labelsize=16)
+    ax2.tick_params(axis='y', labelsize=16)
+    ax2.grid(axis='x', linestyle='--', alpha=0.5)
+    
+    plt.tight_layout()
+    out_path = os.path.join(output_dir, "fig2_bin_strength.pdf")
     plt.savefig(out_path, bbox_inches='tight')
     plt.close()
     print(f"Saved: {out_path}")
@@ -288,23 +429,29 @@ def generate_logits_importance(lvlm_scores, h5, output_dir, target_video='video_
     gt = np.array(h5[target_video + '/gtscore'])
     
     # Normalize GT
-    if gt.max() > gt.min():
-        gt = (gt - gt.min()) / (gt.max() - gt.min())
-        
     frames = np.arange(len(ref))
     
+    # Resolve the video title dynamically from the H5 file
+    video_title = target_video
+    if 'video_name' in h5[target_video]:
+        raw_name = h5[target_video + '/video_name'][()]
+        vname = raw_name.decode('utf-8') if isinstance(raw_name, bytes) else str(raw_name)
+        video_title = vname.replace('_', ' ').strip().title()
+        
     fig, ax = plt.subplots(figsize=(12, 5))
     
     # Plot Ground Truth as a filled background
-    ax.fill_between(frames, 0, gt, color='green', alpha=0.3, label='Ground Truth Highlights')
+    ax.fill_between(frames, 0, gt, color='pink', edgecolor='red', linewidth=1.0, alpha=0.8, label='Ground Truth')
     
-    # Plot RAW LVLM without smoothing to show extreme fragmentation
-    ax.plot(frames, ref, label='Raw LVLM Frame-Level Logits', color='#D55E00', linewidth=1.5, alpha=0.9)
+    # Plot RAW LVLM as a filled background to show extreme fragmentation
+    ax.fill_between(frames, 0, ref, color='blue', edgecolor='cyan', linewidth=1.0, alpha=0.5, label='Zero-Shot LVLM')
+
     
-    ax.set_xlabel('Video Frame Index')
-    ax.set_ylabel('Confidence Score')
-    ax.set_title(f'Temporal Fragmentation of Raw LVLM Logits (Sets up Graph DPO)')
+    ax.set_xlabel('Video frames index')
+    ax.set_ylabel('Importance Score')
+    ax.set_title(f'Zero-Shot LVLM vs. Ground Truth (Video title: {video_title})', fontweight='bold', pad=15)
     ax.set_xlim(0, len(frames))
+
     ax.set_ylim(0, 1.05)
     ax.legend(loc='upper right')
     
@@ -406,7 +553,8 @@ if __name__ == "__main__":
     
     generate_misalignment(lvlm_scores, h5, output_dir)
     generate_reliability(lvlm_scores, h5, output_dir)
-    generate_logits_importance(lvlm_scores, h5, output_dir, target_video='video_11')
-    generate_posthoc_graph_failure(lvlm_scores, h5, output_dir, target_video='video_11')
+    generate_bin_strength(lvlm_scores, h5, output_dir)
+    generate_logits_importance(lvlm_scores, h5, output_dir, target_video='video_23')
+    generate_posthoc_graph_failure(lvlm_scores, h5, output_dir, target_video='video_23')
     
     print("\nReal data figures generated successfully.")
