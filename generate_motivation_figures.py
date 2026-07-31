@@ -268,6 +268,8 @@ def generate_reliability(lvlm_scores, h5, output_dir, n_bins=10):
     ax2.grid(axis='x', linestyle='--', alpha=0.5)
     out_path = os.path.join(output_dir, "fig1_reliability_split.pdf")
     plt.savefig(out_path, bbox_inches='tight')
+    out_path = os.path.join(output_dir, "fig1_reliability_split.png")
+    plt.savefig(out_path, bbox_inches='tight')
     plt.close()
     print(f"Saved: {out_path}")
 
@@ -416,6 +418,8 @@ def generate_bin_strength(lvlm_scores, h5, output_dir, n_bins=10):
     
     plt.tight_layout()
     out_path = os.path.join(output_dir, "fig2_bin_strength.pdf")
+    plt.savefig(out_path, bbox_inches='tight')
+    out_path = os.path.join(output_dir, "fig2_bin_strength.png")
     plt.savefig(out_path, bbox_inches='tight')
     plt.close()
     print(f"Saved: {out_path}")

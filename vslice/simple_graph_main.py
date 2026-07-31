@@ -10,9 +10,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 import matplotlib.pyplot as plt
 
-# Bypassing Intel OpenMP Duplicate Initialization on Windows
-os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
-
 # ================= ADJACENCY MATRIX BUILDING =================
 
 def build_adjacency_matrix_pytorch(features, picks, window_size=15, device="cpu"):

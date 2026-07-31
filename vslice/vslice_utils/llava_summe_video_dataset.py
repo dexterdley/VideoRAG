@@ -30,9 +30,12 @@ class SumMeLLaMA_VideoDataset(Dataset):
                  clip_length=16, 
                  frame_stride=1,
                  load_test=False,
-                 random_sampling=True):
+                 random_sampling=True,
+                 override_keys=None):
         """
-        SumMe Video Dataset
+        SumMe Video Dataset.
+        override_keys: if provided, use this list of H5 keys instead of the split-based key list.
+                       Useful for extracting features for ALL videos (train + test) in one pass.
         """
         self.mode = mode
         self.clip_length = clip_length
@@ -49,11 +52,14 @@ class SumMeLLaMA_VideoDataset(Dataset):
         with open(self.split_file, 'r') as f:
             self.data = json.loads(f.read())
             self.data = self.data[split_idx]
+
+        # If override_keys is given, use it instead of the split-derived key list
+        self._keys = override_keys if override_keys is not None else self.data[self.mode + '_keys']
         
         self.system_prompt = "You are an expert video editor. Strictly answer only Yes or No."
 
     def __len__(self):
-        return len(self.data[self.mode + '_keys'])
+        return len(self._keys)
 
     def _sample_frame_indices(self, total_frames):
         """Sample frame indices for a clip"""
@@ -100,7 +106,7 @@ class SumMeLLaMA_VideoDataset(Dataset):
         return inputs
 
     def __getitem__(self, index):
-        video_name = self.data[self.mode + '_keys'][index]
+        video_name = self._keys[index]
         full_features = torch.as_tensor(self.video_data[video_name + '/features'])
         full_gtscore = torch.as_tensor(self.video_data[video_name + '/gtscore'])
         picks = self.video_data[video_name + '/picks']
@@ -120,8 +126,7 @@ class SumMeLLaMA_VideoDataset(Dataset):
         # Load all picked frames as PIL Images
         video_frames = load_video_from_picks(video_path, picks)
         total_frames = len(video_frames)
-        title = video_filename
-        
+        title = video_filename.replace("_", " ").strip()
         formatted_prompt = f"Does this image show a key highlight from the video titled '{title}'?"
 
         if not self.load_test:
@@ -143,7 +148,7 @@ class SumMeLLaMA_VideoDataset(Dataset):
             'features': features,
             'gtscore': gtscore,
             'inputs': inputs,
-            'title': title
+            'title': video_filename
         }
 
         # Add test-specific keys

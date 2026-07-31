@@ -19,8 +19,9 @@ def mock_summarize(video_file, prompt, progress=gr.Progress()):
     
     return video_file
 
-fig_reliability = "results/fig1_reliability_split.png"
 fig_misalignment = "results/fig1_misalignment_real.png"
+fig_reliability = "results/fig1_reliability_split.png"
+fig_bin_strength = "results/fig2_bin_strength.png"
 fig_posthoc = "results/fig4_posthoc_graph_failure.png"
 
 # Placeholders for example Videos
@@ -38,7 +39,7 @@ def build_content(lang):
         # ---------------------------------------------------------
         gr.Markdown("---")
         gr.Markdown("## Demo Gallery (Summary Outputs)")
-        gr.Markdown("Example summaries of what VSLICE can generate.")
+        gr.Markdown("Examples of video summaries that VSLICE can create.")
         
         with gr.Row():
             if os.path.exists(video_example1):
@@ -73,12 +74,18 @@ def build_content(lang):
                 gr.Image(fig_misalignment, label="Highlight Misalignment", show_label=False, height=350)
             else:
                 gr.Markdown(f"*(Image not found at {fig_misalignment})*")
-                
-            # Right Image
+            
+            # Center Image
             if os.path.exists(fig_reliability):
                 gr.Image(fig_reliability, label="Reliability Diagram (LVLM Overconfidence)", show_label=False, height=350)
             else:
                 gr.Markdown(f"*(Image not found at {fig_reliability})*")
+
+            # Right Image
+            if os.path.exists(fig_bin_strength):
+                gr.Image(fig_bin_strength, label="Bin-Strength Plot", show_label=False, height=350)
+            else:
+                gr.Markdown(f"*(Image not found at {fig_bin_strength})*")
         
         gr.Markdown("### The Post-Hoc Smoothing Trap")
         gr.Markdown(

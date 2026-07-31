@@ -17,7 +17,6 @@ class VideoSegmentDataset(Dataset):
 
         vr = VideoReader(self.video_path, ctx=cpu(0))
         self.fps = vr.get_avg_fps()
-        self.duration = len(vr) / self.fps
         num_frames = len(vr)
         del vr
 
@@ -40,12 +39,7 @@ class VideoSegmentDataset(Dataset):
         batch_npy = vr.get_batch(indices).asnumpy()
         frames = [Image.fromarray(f, mode='RGB') for f in batch_npy]
         
-        # Calculate start and end seconds based on picks for logging
-        start_sec = chunk[0] / self.fps
-        end_sec = chunk[-1] / self.fps
-        
-        return frames, start_sec, end_sec
-
+        return frames
 # ──────────────────────── DATASET BUILDERS ────────────────────────
 
 def build_summe_manifest(root_dir):

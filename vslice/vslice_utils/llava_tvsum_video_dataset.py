@@ -30,9 +30,12 @@ class TVSumLLaMA_VideoDataset(Dataset):
                 clip_length=16, 
                 frame_stride=1,
                 load_test=False,
-                random_sampling=True):
+                random_sampling=True,
+                override_keys=None):
         """
-        TVSum Video Dataset
+        TVSum Video Dataset.
+        override_keys: if provided, use this list of H5 keys instead of the split-based key list.
+                       Useful for extracting features for ALL videos (train + test) in one pass.
         """
 
         self.mode = mode
@@ -53,11 +56,14 @@ class TVSumLLaMA_VideoDataset(Dataset):
             self.data = json.loads(f.read())
             self.data = self.data[split_idx]
 
+        # If override_keys is given, use it instead of the split-derived key list
+        self._keys = override_keys if override_keys is not None else self.data[self.mode + '_keys']
+
         self.system_prompt = "You are an expert video editor. Strictly answer only Yes or No."
 
     def __len__(self):
         """ Function for the 'len' operator of dataset """
-        return len(self.data[self.mode + '_keys'])
+        return len(self._keys)
 
     def _sample_frame_indices(self, total_frames):
         """Sample frame indices for a clip"""
@@ -71,7 +77,7 @@ class TVSumLLaMA_VideoDataset(Dataset):
         return frame_indices.tolist()
 
     def __getitem__(self, index):
-        video_name = self.data[self.mode + '_keys'][index]
+        video_name = self._keys[index]
         full_features = torch.as_tensor(self.video_data[video_name + '/features'])
         full_gtscore = torch.as_tensor(self.video_data[video_name + '/gtscore'])
         picks = self.video_data[video_name + '/picks']

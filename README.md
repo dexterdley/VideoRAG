@@ -61,7 +61,7 @@ git clone https://huggingface.co/openbmb/MiniCPM-V-2_6-int4
 3.  Open the browser link (usually `http://127.0.0.1:7860/?__theme=dark`).
 
 4.  **Upload a Video**: Drag and drop your mp4 gameplay.
-5.  **Click "Find Highlights"**: The model will scan the video.
+5.  Click **"Find Highlights" or "Generate Summary"**: The model will scan the video and produce a highlight summary based on the user's prompt.
     -   Progress is shown in the log.
     -   Detected clips will appear in the "Newest Hit" player.
     -   A compiled summary video will be generated at the end.
