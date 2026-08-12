@@ -33,6 +33,7 @@ except ImportError:
 import warnings
 warnings.filterwarnings("ignore")
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 
@@ -96,67 +97,20 @@ def evaluate(model, val_loader, dataset_name, h5_paths, tvsum_user_scores=None, 
             gtscore = gtscores.squeeze().numpy() if hasattr(gtscores, 'numpy') else np.array(gtscores)
 
             batch_data = batch_data.to(device)
+            outputs = model.base_model(batch_data)
 
-            chunk_size = 8
-            num_frames = batch_data["input_ids"].size(0)
-            
-            all_preds_tensor = torch.zeros(num_frames, dtype=torch.float32)
-            all_logits_yes = torch.zeros(num_frames, dtype=torch.float32)
-            all_logits_no = torch.zeros(num_frames, dtype=torch.float32)
+            logits = outputs.logits[:, -1, :]
+            yes_logits, no_logits = logits[:, yes_id], logits[:, no_id]
+            binary_probs = F.softmax(torch.stack([yes_logits, no_logits], dim=-1), dim=-1)
+            all_preds_tensor = binary_probs[:, 0].detach().cpu().float()
 
-            for start_idx in range(0, num_frames, chunk_size):
-                end_idx = min(start_idx + chunk_size, num_frames)
-                
-                # Create a mini-batch by slicing elements
-                mini_batch_dict = {}
-                for k, v in batch_data.items():
-                    if isinstance(v, torch.Tensor) and v.size(0) == num_frames:
-                        mini_batch_dict[k] = v[start_idx:end_idx]
-                    elif isinstance(v, list) and len(v) == num_frames:
-                        mini_batch_dict[k] = v[start_idx:end_idx]
-                    else:
-                        mini_batch_dict[k] = v
-                        
-                mini_batch = type(batch_data)(mini_batch_dict)
-                
-                chunk_outputs = model.base_model(mini_batch)
-                chunk_logits = chunk_outputs.logits[:, -1, :]
-                yes_logits = chunk_logits[:, yes_id].detach().cpu().float()
-                no_logits  = chunk_logits[:, no_id].detach().cpu().float()
-                p_yes = torch.sigmoid(yes_logits - no_logits)
-
-                all_preds_tensor[start_idx:end_idx] = p_yes
-                all_logits_yes[start_idx:end_idx] = yes_logits
-                all_logits_no[start_idx:end_idx] = no_logits
-
-                del chunk_outputs, chunk_logits, mini_batch, mini_batch_dict
-                torch.cuda.empty_cache()
-                
-            raw_p_yes = all_preds_tensor.numpy()
-            raw_p_no = (1 - all_preds_tensor).numpy()
-            raw_logits_yes = all_logits_yes.numpy()
-            raw_logits_no  = all_logits_no.numpy()
+            raw_p_yes      = all_preds_tensor.numpy()
+            raw_p_no       = (1 - all_preds_tensor).numpy()
+            raw_logits_yes = yes_logits.detach().cpu().float()
+            raw_logits_no  = no_logits.detach().cpu().float()
 
             yes_scores = raw_p_yes
             all_preds.extend(yes_scores)
-
-            # ── Save features to disk ──
-            if output_dir is not None:
-                out_name = f"{model_type}/{dataset_name}_features_v2_{title}.npz"
-                out_path = os.path.join(output_dir, out_name)
-                os.makedirs(os.path.dirname(out_path), exist_ok=True)
-                np.savez_compressed(
-                    out_path,
-                    p_yes=raw_p_yes,
-                    p_no=raw_p_no,
-                    logits_yes=raw_logits_yes,
-                    logits_no=raw_logits_no,
-                    gtscore=gtscore,
-                    picks=picks.numpy() if hasattr(picks, 'numpy') else np.array(picks),
-                    n_frames=np.array(n_frames),
-                    title=np.array([title]),
-                    video_name=np.array([video_name])
-            )
 
             res = compute_video_metrics(
                 yes_scores=yes_scores, 
@@ -174,7 +128,6 @@ def evaluate(model, val_loader, dataset_name, h5_paths, tvsum_user_scores=None, 
     all_preds = np.array(all_preds)
     unique_preds = len(np.unique(all_preds))
     return pd.DataFrame(split_results)
-
 
 def extract_all_features(args, model, processor, yes_id, no_id):
     """
@@ -236,46 +189,24 @@ def extract_all_features(args, model, processor, yes_id, no_id):
             picks_np = picks.numpy() if hasattr(picks, 'numpy') else np.array(picks)
 
             # Check if already extracted — skip if .npz exists
-            out_name = f"{args.model_type}/{args.dataset}_features_v2_{title}.npz"
+            out_name = f"{args.model_type}/{args.dataset}_features_{title}.npz"
             out_path = os.path.join(args.output_dir, out_name)
             if os.path.exists(out_path):
                 print(f"  [SKIP] {title} — already extracted")
                 continue
 
             batch_data = batch_data.to(device)
-            chunk_size = 8
-            num_frames = batch_data["input_ids"].size(0)
-
-            all_preds_tensor = torch.zeros(num_frames, dtype=torch.float32)
-            all_logits_yes   = torch.zeros(num_frames, dtype=torch.float32)
-            all_logits_no    = torch.zeros(num_frames, dtype=torch.float32)
-
-            for start_idx in range(0, num_frames, chunk_size):
-                end_idx = min(start_idx + chunk_size, num_frames)
-                mini_batch_dict = {
-                    k: (v[start_idx:end_idx] if isinstance(v, torch.Tensor) and v.size(0) == num_frames
-                        else v[start_idx:end_idx] if isinstance(v, list) and len(v) == num_frames
-                        else v)
-                    for k, v in batch_data.items()
-                }
-                mini_batch = type(batch_data)(mini_batch_dict)
-
-                chunk_out    = model.base_model(mini_batch)
-                chunk_logits = chunk_out.logits[:, -1, :]
-                yes_l = chunk_logits[:, yes_id].detach().cpu().float()
-                no_l  = chunk_logits[:, no_id].detach().cpu().float()
-                p_yes = torch.sigmoid(yes_l - no_l)
-
-                all_preds_tensor[start_idx:end_idx] = p_yes
-                all_logits_yes[start_idx:end_idx]   = yes_l
-                all_logits_no[start_idx:end_idx]    = no_l
-                del chunk_out, chunk_logits, mini_batch, mini_batch_dict
-                torch.cuda.empty_cache()
+            outputs = model.base_model(batch_data)
+                
+            logits = outputs.logits[:, -1, :]
+            yes_logits, no_logits = logits[:, yes_id], logits[:, no_id]
+            binary_probs = F.softmax(torch.stack([yes_logits, no_logits], dim=-1), dim=-1)
+            all_preds_tensor = binary_probs[:, 0].detach().cpu().float()
 
             raw_p_yes      = all_preds_tensor.numpy()
             raw_p_no       = (1 - all_preds_tensor).numpy()
-            raw_logits_yes = all_logits_yes.numpy()
-            raw_logits_no  = all_logits_no.numpy()
+            raw_logits_yes = yes_logits.detach().cpu().float()
+            raw_logits_no  = no_logits.detach().cpu().float()
 
             os.makedirs(os.path.dirname(out_path), exist_ok=True)
             np.savez_compressed(
@@ -325,34 +256,22 @@ def train_dpo(args):
         tvsum_user_scores = None
 
     # ── Extract features for ALL videos (train + test) before split evaluation ──
-    extract_all_features(args, model, processor, yes_id, no_id)
+    # extract_all_features(args, model, processor, yes_id, no_id)
 
     for split_idx, split in enumerate(splits):
         print(f"\n==================== SPLIT {split_idx+1}/{len(splits)} ====================")
         
         # --- Datasets and Dataloaders ---
         if args.dataset == 'summe':
-            train_dataset = SumMeLLaMA_VideoDataset(mode='train', split_idx=split_idx, clip_length=args.clip_length, processor=processor, load_test=False)
             test_dataset = SumMeLLaMA_VideoDataset(mode='test', split_idx=split_idx, clip_length=args.clip_length * args.batch_size, processor=processor, load_test=True)
 
         elif args.dataset == 'tvsum':
-            train_dataset = TVSumLLaMA_VideoDataset(mode='train', split_idx=split_idx, clip_length=args.clip_length, processor=processor, load_test=False)
             test_dataset = TVSumLLaMA_VideoDataset(mode='test', split_idx=split_idx, clip_length=args.clip_length * args.batch_size, processor=processor, load_test=True)
 
         else:
             raise NotImplementedError(f"Dataset {args.dataset} not implemented.")
 
-        train_collator = TrainBatchCollator(processor=processor)
         val_collator = ValBatchCollator(processor=processor)
-
-        train_loader = DataLoader(
-            train_dataset,
-            batch_size=1,
-            shuffle=True,
-            collate_fn=train_collator,
-            num_workers=0,
-            pin_memory=True
-        )
 
         test_loader = DataLoader(
             test_dataset,
@@ -378,7 +297,7 @@ def train_dpo(args):
             no_id=no_id,
             tvsum_user_scores=tvsum_user_scores,
             output_dir=args.output_dir,
-            model_type=args.model_type,
+            model_type=args.model_type
         )
 
         if not test_df.empty:
@@ -418,14 +337,9 @@ if __name__ == "__main__":
     parser.add_argument("--root_dir", type=str, default=".")
     parser.add_argument("--model_path", type=str, default=None)
     parser.add_argument("--output_dir", type=str, default="./vslice_features")
-    parser.add_argument("--num_epochs", type=int, default=5)
-    parser.add_argument("--learning_rate", type=float, default=1e-5)
-    parser.add_argument("--weight_decay", type=float, default=1e-5)
 
-    parser.add_argument('--batch_size', type=int, default=2, help='Batch size (number of videos per batch)')
+    parser.add_argument('--batch_size', type=int, default=1, help='Batch size (number of videos per batch)')
     parser.add_argument('--clip_length', type=int, default=4)
-    parser.add_argument("--accumulation_steps", type=int, default=8)
-    parser.add_argument("--beta", type=float, default=0.1)
     parser.add_argument("--use_advanced_scoring", action="store_true", help="Use action based ranking")
     args = parser.parse_args()
     

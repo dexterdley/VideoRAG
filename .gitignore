@@ -17,4 +17,6 @@ vslice_features/
 SumMe/
 TVSum/
 csta/weights
-dpo_data/
+dpo_data/__pycache__/
+*.pyc
+dpo_data

@@ -33,6 +33,7 @@ except ImportError:
 import warnings
 warnings.filterwarnings("ignore")
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 
@@ -64,6 +65,16 @@ Global Avg | F1: 0.5099 | Kendall: 0.2253 | Spearman: 0.2508 # Base
 Global Avg | F1: 0.5198 | Kendall: 0.2470 | Spearman: 0.2750 # w DPO
 TVSum:
 Global Avg | F1: 0.4788 | Kendall: 0.2438 | Spearman: 0.3118
+
+### CSTA
+# Summe
+Average F-score across 5 splits: 0.5515
+Average Kendall Tau across splits: 0.2532
+Average Spearman Rho across splits: 0.2819
+# TVSum
+Average F-score across 5 splits: 0.5437
+Average Kendall Tau across splits: 0.1925
+Average Spearman Rho across splits: 0.2532
 """
 
 def evaluate(model, val_loader, dataset_name, h5_paths, tvsum_user_scores=None, use_advanced_scoring=False, yes_id=9454, no_id=2753):
@@ -188,6 +199,7 @@ def train_dpo(args):
         print(f"\n==================== SPLIT {split_idx+1}/{len(splits)} ====================")
         
         peft_model = get_peft_model(model, lora_config)
+        peft_model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
         peft_model.print_trainable_parameters()
         
         optimizer = optim.AdamW(peft_model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
@@ -344,12 +356,6 @@ def train_dpo(args):
             writer.add_scalar("Train/learning_rate", scheduler.get_last_lr()[0], epoch)
             scheduler.step()
 
-            # --- MEMORY CLEANUP ---
-            del c_batch_data, r_batch_data
-            del c_logits, r_logits
-            del pi_logp_c, pi_logp_r, ref_logp_c, ref_logp_r, loss
-            torch.cuda.empty_cache()
-            
             # ================= VALIDATION BLOCK =================
             # Evaluate every epochs, or on the final epoch
             if (epoch + 1) % 1 == 0 or epoch == args.num_epochs - 1:
