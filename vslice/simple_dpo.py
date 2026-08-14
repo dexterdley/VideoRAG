@@ -77,7 +77,8 @@ Average Kendall Tau across splits: 0.1925
 Average Spearman Rho across splits: 0.2532
 """
 
-def evaluate(model, val_loader, dataset_name, h5_paths, tvsum_user_scores=None, use_advanced_scoring=False, yes_id=9454, no_id=2753):
+def evaluate(model, val_loader, dataset_name, h5_paths, tvsum_user_scores=None, yes_id=9454, no_id=2753,
+             output_dir=None, model_type="minicpm"):
     """
     Evaluates the model using the ValBatchCollator and val_loader.
     """
@@ -88,7 +89,7 @@ def evaluate(model, val_loader, dataset_name, h5_paths, tvsum_user_scores=None, 
     # --- DIAGNOSTIC ACCUMULATORS ---
     all_preds = []
 
-    with torch.no_grad():
+    with torch.inference_mode():
         for step, batch_data in enumerate(tqdm(val_loader, desc=f"Evaluating {dataset_name}", leave=False)):
             
             video_name = batch_data.pop("video_name")[0]
@@ -102,40 +103,23 @@ def evaluate(model, val_loader, dataset_name, h5_paths, tvsum_user_scores=None, 
             change_points = batch_data.pop("change_points")[0]
             gt_summary = batch_data.pop("gt_summary")[0]
 
-            batch_data = batch_data.to(device)
+            title = titles[0] if isinstance(titles, (list, tuple)) else titles
+            gtscore = gtscores.squeeze().numpy() if hasattr(gtscores, 'numpy') else np.array(gtscores)
 
-            chunk_size = 8
-            num_frames = batch_data["input_ids"].size(0)
-            all_preds_chunk = []
-            
-            for start_idx in range(0, num_frames, chunk_size):
-                end_idx = min(start_idx + chunk_size, num_frames)
-                
-                # Create a mini-batch by slicing elements
-                mini_batch_dict = {}
-                for k, v in batch_data.items():
-                    if isinstance(v, torch.Tensor) and v.size(0) == num_frames:
-                        mini_batch_dict[k] = v[start_idx:end_idx]
-                    elif isinstance(v, list) and len(v) == num_frames:
-                        mini_batch_dict[k] = v[start_idx:end_idx]
-                    else:
-                        mini_batch_dict[k] = v
-                        
-                mini_batch = type(batch_data)(mini_batch_dict)
-                
-                chunk_outputs = model.base_model(mini_batch)
-                chunk_logits = chunk_outputs.logits[:, -1, :]
-                chunk_binary_probs = F.softmax(
-                    torch.stack([chunk_logits[:, yes_id], chunk_logits[:, no_id]], dim=-1), dim=-1
-                )
-                all_preds_chunk.append(chunk_binary_probs[:, 0].detach().cpu().float())
-                
-                del chunk_outputs, chunk_logits, mini_batch, mini_batch_dict
-                torch.cuda.empty_cache()
-                
-            preds = torch.cat(all_preds_chunk, dim=0)
-            
-            yes_scores = preds.numpy()
+            batch_data = batch_data.to(device)
+            outputs = model.base_model(batch_data)
+
+            logits = outputs.logits[:, -1, :]
+            yes_logits, no_logits = logits[:, yes_id], logits[:, no_id]
+            binary_probs = F.softmax(torch.stack([yes_logits, no_logits], dim=-1), dim=-1)
+            all_preds_tensor = binary_probs[:, 0].detach().cpu().float()
+
+            raw_p_yes      = all_preds_tensor.numpy()
+            raw_p_no       = (1 - all_preds_tensor).numpy()
+            raw_logits_yes = yes_logits.detach().cpu().float()
+            raw_logits_no  = no_logits.detach().cpu().float()
+
+            yes_scores = raw_p_yes
             all_preds.extend(yes_scores)
 
             res = compute_video_metrics(
@@ -146,7 +130,7 @@ def evaluate(model, val_loader, dataset_name, h5_paths, tvsum_user_scores=None, 
                 video_name=video_name,
                 dataset_name=dataset_name,
                 user_scores=tvsum_user_scores,
-                use_advanced_scoring=use_advanced_scoring,
+                use_advanced_scoring=False,
             )
 
             split_results.append(res)
@@ -154,7 +138,6 @@ def evaluate(model, val_loader, dataset_name, h5_paths, tvsum_user_scores=None, 
     all_preds = np.array(all_preds)
     unique_preds = len(np.unique(all_preds))
     return pd.DataFrame(split_results)
-
 
 def train_dpo(args):
     # Load VLM
@@ -248,7 +231,6 @@ def train_dpo(args):
             num_workers=0,
             pin_memory=True
         )
-
        
         writer = SummaryWriter(f"runs/tune_{args.dataset}_{split_idx}_{timestamp}")
         writer.add_text(
@@ -295,10 +277,10 @@ def train_dpo(args):
                         )[:, 0]
                 
                 # Detach and free ref intermediates immediately
-                ref_logp_c = ref_logp_c.detach()
-                ref_logp_r = ref_logp_r.detach()
-                del ref_c_logits, ref_r_logits
-                torch.cuda.empty_cache()
+                #ref_logp_c = ref_logp_c.detach()
+                #ref_logp_r = ref_logp_r.detach()
+                #del ref_c_logits, ref_r_logits
+                #torch.cuda.empty_cache()
 
                 # Policy Logps (LoRA Enabled)
                 peft_model.train()
@@ -368,8 +350,7 @@ def train_dpo(args):
                     h5_paths=h5_paths,
                     yes_id=yes_id,
                     no_id=no_id,
-                    tvsum_user_scores=tvsum_user_scores,
-                    use_advanced_scoring=args.use_advanced_scoring
+                    tvsum_user_scores=tvsum_user_scores
                 )
                 
                 if not val_df.empty:
@@ -408,8 +389,7 @@ def train_dpo(args):
             h5_paths=h5_paths,
             yes_id=yes_id,
             no_id=no_id,
-            tvsum_user_scores=tvsum_user_scores,
-            use_advanced_scoring=args.use_advanced_scoring
+            tvsum_user_scores=tvsum_user_scores
         )
 
         if not test_df.empty:

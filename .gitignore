@@ -20,3 +20,4 @@ csta/weights
 dpo_data/__pycache__/
 *.pyc
 dpo_data
+*.txt
