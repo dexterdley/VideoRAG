@@ -715,6 +715,56 @@ def train_graph_dpo(args):
                     peft_model.save_pretrained(checkpoint_dir)
                     print(f"[CHECKPOINT] Saved best adapter to {checkpoint_dir} (F-Score: {best_corr:.4f})")
 
+        print(f"Finished Split {split_idx+1}. Best Correlation: {best_corr:.4f}\n")
+
+        # ================= FINAL TEST BLOCK =================
+        print(f"--> Running Final Test for Split {split_idx+1}...")
+
+        # Load the best saved model for testing
+        if os.path.exists(checkpoint_dir):
+            peft_model = PeftModel.from_pretrained(model, checkpoint_dir)
+            peft_model.to(device)
+            print(f"Loaded best LORA checkpoint from {checkpoint_dir}")
+
+        test_df = evaluate(
+            model=peft_model,
+            val_loader=test_loader,
+            dataset_name=args.dataset,
+            h5_paths=h5_paths,
+            yes_id=yes_id,
+            no_id=no_id,
+            tvsum_user_scores=tvsum_user_scores
+        )
+
+        if not test_df.empty:
+            test_f1 = test_df['f_score'].mean()
+            test_tau = test_df['kendall'].mean()
+            test_rho = test_df['spearman'].mean()
+            print(f"\n[Split {split_idx+1}] Test | F-Score: {test_f1:.4f} | Tau: {test_tau:.4f} | Rho: {test_rho:.4f}\n")
+            
+            # Log test scores to tensorboard (logged at step = split_idx so you can see across splits)
+            writer.add_scalar("Test/F-Score", test_f1, split_idx)
+            writer.add_scalar("Test/Kendall_Tau", test_tau, split_idx)
+            writer.add_scalar("Test/Spearman_Rho", test_rho, split_idx)
+
+            eval_split_metrics[split_idx] = {}
+            eval_split_metrics[split_idx]['f_score'] = test_f1
+            eval_split_metrics[split_idx]['kendall'] = test_tau
+            eval_split_metrics[split_idx]['spearman'] = test_rho
+
+    if eval_split_metrics:
+        print("\n" + "═"*60)
+        print(f"FINAL GLOBAL BENCHMARK SUMMARY ({len(splits)} SPLITS)")
+        print("═"*60)
+
+        # Calculate averages across all processed splits
+        avg_overall_f1 = np.mean([m['f_score'] for m in eval_split_metrics.values()])
+        avg_overall_tau = np.mean([m['kendall'] for m in eval_split_metrics.values()])
+        avg_overall_rho = np.mean([m['spearman'] for m in eval_split_metrics.values()])
+        print(f"Global Avg | F1: {avg_overall_f1:.4f} | Kendall: {avg_overall_tau:.4f} | Spearman: {avg_overall_rho:.4f}")
+
+    writer.close()
+
 def resolve_model_path(mtype):
     if mtype == "qwen": return "Qwen/Qwen3.5-9B"
     candidates = ["./MiniCPM-V-2_6-int4", "/home/dexter/VideoRAG/.checkpoints/MiniCPM-V-2_6-int4"]

@@ -407,7 +407,7 @@ def train_dpo(args):
             eval_split_metrics[split_idx]['f_score'] = test_f1
             eval_split_metrics[split_idx]['kendall'] = test_tau
             eval_split_metrics[split_idx]['spearman'] = test_rho
-
+    
     if eval_split_metrics:
         print("\n" + "═"*60)
         print(f"FINAL GLOBAL BENCHMARK SUMMARY ({len(splits)} SPLITS)")
@@ -417,8 +417,9 @@ def train_dpo(args):
         avg_overall_f1 = np.mean([m['f_score'] for m in eval_split_metrics.values()])
         avg_overall_tau = np.mean([m['kendall'] for m in eval_split_metrics.values()])
         avg_overall_rho = np.mean([m['spearman'] for m in eval_split_metrics.values()])
-        
         print(f"Global Avg | F1: {avg_overall_f1:.4f} | Kendall: {avg_overall_tau:.4f} | Spearman: {avg_overall_rho:.4f}")
+
+    writer.close()
 
 def resolve_model_path(mtype):
     if mtype == "qwen": return "Qwen/Qwen3.5-9B"
