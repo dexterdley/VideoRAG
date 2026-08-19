@@ -35,7 +35,7 @@ except ImportError:
 import warnings
 warnings.filterwarnings("ignore")
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 
@@ -46,6 +46,7 @@ if sys.platform == "win32":
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
     sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
 
+# CUDA_VISIBLE_DEVICES=2 python vslice/graph_dpo.py --dataset summe --split_file ./dataset/summe_splits.json --model_type minicpm --batch_size=8 --clip_length=16 --num_epochs=5
 # ================= CUSTOM DATASET FOR GRAPH DPO =================
 
 class GraphDPODataset(Dataset):
@@ -75,13 +76,25 @@ class GraphDPODataset(Dataset):
             with open(self.split_file, 'r') as f:
                 data = json.loads(f.read())
                 self.train_keys = data[split_idx]['train_keys']
-        else:
-            raise ValueError(f"Unknown dataset: {self.dataset_name}")
-            
+        # Build sub-clips per video
+        video_clips = {}
+        for video_name in self.train_keys:
+            gtscore = np.array(self.video_data[video_name + '/gtscore'])
+            half = len(gtscore) // 2
+            video_clips[video_name] = [(video_name, start_idx) for start_idx in range(0, half, self.clip_length)]
+
+        # Interleave sub-clips across different videos (round-robin across videos)
+        self.clip_samples = []
+        max_clips = max(len(clips) for clips in video_clips.values()) if video_clips else 0
+        for clip_idx in range(max_clips):
+            for video_name in self.train_keys:
+                if clip_idx < len(video_clips[video_name]):
+                    self.clip_samples.append(video_clips[video_name][clip_idx])
+
         self.system_prompt = "You are an expert video editor. Strictly answer only Yes or No."
 
     def __len__(self):
-        return len(self.train_keys)
+        return len(self.clip_samples)
 
     def _sample_frame_indices(self, total_frames):
         if self.random_sampling:
@@ -123,7 +136,7 @@ class GraphDPODataset(Dataset):
         return inputs
 
     def __getitem__(self, index):
-        video_name = self.train_keys[index]
+        video_name, start_idx = self.clip_samples[index]
         
         # Load and normalize ground truth score
         gtscore = np.array(self.video_data[video_name + '/gtscore'])
@@ -137,6 +150,21 @@ class GraphDPODataset(Dataset):
         full_features = torch.as_tensor(self.video_data[video_name + '/features'], dtype=torch.float32)
         picks = np.array(self.video_data[video_name + '/picks'])
         n_frames = int(np.array(self.video_data[video_name + '/n_frames']))
+
+        # 1. Rank-sort ALL pick indices in the video by GT score
+        sorted_idx = np.argsort(gtscore)               # Ascending: lowest -> highest score
+        half = len(sorted_idx) // 2
+        all_rejected_idx = sorted_idx[:half]          # N//2 lowest-scoring pick indices (valleys)
+        all_chosen_idx   = sorted_idx[-half:]         # N//2 highest-scoring pick indices (peaks)
+
+        # 2. Sort temporally so nearby continuous frames are grouped together into sub-clips
+        all_chosen_idx   = np.sort(all_chosen_idx)    # Chronological temporal order of peaks
+        all_rejected_idx = np.sort(all_rejected_idx)  # Chronological temporal order of valleys
+
+        # 3. Extract sub-clip chunk of size clip_length from the SAME video
+        end_idx = min(start_idx + self.clip_length, half)
+        chosen_idx   = all_chosen_idx[start_idx:end_idx].tolist()
+        rejected_idx = all_rejected_idx[start_idx:end_idx].tolist()
 
         # Resolve video path and title
         if self.dataset_name == 'summe':
@@ -160,53 +188,30 @@ class GraphDPODataset(Dataset):
         total_frames = len(video_frames)
         formatted_prompt = f"Does this image show a key highlight from the video titled '{title}'?"
 
-        # 1. Sample indices
-        clip1_indices = self._sample_frame_indices(total_frames)
-        clip2_indices = self._sample_frame_indices(total_frames)
-
-        # 2. Chosen/Rejected logic
-        if self.dataset_name == 'summe':
-            chosen_idx = []
-            rejected_idx = []
-            for idx1, idx2 in zip(clip1_indices, clip2_indices):
-                if full_gtscore[idx1] >= full_gtscore[idx2]:
-                    chosen_idx.append(idx1)
-                    rejected_idx.append(idx2)
-                else:
-                    chosen_idx.append(idx2)
-                    rejected_idx.append(idx1)
-        else: # tvsum
-            score1 = full_gtscore[clip1_indices].mean().item()
-            score2 = full_gtscore[clip2_indices].mean().item()
-            if score1 >= score2:
-                chosen_idx, rejected_idx = clip1_indices, clip2_indices
-            else:
-                chosen_idx, rejected_idx = clip2_indices, clip1_indices
-
-        chosen_frames = [video_frames[i] for i in chosen_idx]
+        chosen_frames   = [video_frames[i] for i in chosen_idx]
         rejected_frames = [video_frames[i] for i in rejected_idx]
 
-        chosen_inputs = self._process_clip(chosen_frames, formatted_prompt)
+        chosen_inputs   = self._process_clip(chosen_frames, formatted_prompt)
         rejected_inputs = self._process_clip(rejected_frames, formatted_prompt)
 
-        chosen_score, rejected_score = full_gtscore[chosen_idx], full_gtscore[rejected_idx]
-        # log_margin = torch.log(chosen_score + self.epsilon) - torch.log(rejected_score + self.epsilon)
-        log_margin = chosen_score - rejected_score
+        chosen_score   = full_gtscore[chosen_idx]
+        rejected_score = full_gtscore[rejected_idx]
+        log_margin     = torch.log(chosen_score + self.epsilon) - torch.log(rejected_score + self.epsilon)
 
         return {
-            'video_name': video_name,
-            'title': title,
-            'chosen_inputs': chosen_inputs,
+            'video_name':      video_name,
+            'title':           title,
+            'chosen_inputs':   chosen_inputs,
             'rejected_inputs': rejected_inputs,
-            'chosen_gt': chosen_score,
-            'rejected_gt': rejected_score,
-            'log_margin': log_margin,
-            'chosen_idx': torch.tensor(chosen_idx, dtype=torch.long),
-            'rejected_idx': torch.tensor(rejected_idx, dtype=torch.long),
-            'features': full_features,
-            'picks': torch.tensor(picks, dtype=torch.long),
-            'n_frames': n_frames,
-            'gtscore': full_gtscore
+            'chosen_gt':       chosen_score,
+            'rejected_gt':     rejected_score,
+            'log_margin':      log_margin,
+            'chosen_idx':      torch.tensor(chosen_idx,   dtype=torch.long),
+            'rejected_idx':    torch.tensor(rejected_idx, dtype=torch.long),
+            'features':        full_features,
+            'picks':           torch.tensor(picks,        dtype=torch.long),
+            'n_frames':        n_frames,
+            'gtscore':         full_gtscore
         }
 
 class GraphDPOTrainBatchCollator:
@@ -243,9 +248,9 @@ class GraphDPOTrainBatchCollator:
     def __call__(self, batch):
         video_names = [data['video_name'] for data in batch]
         titles = [data['title'] for data in batch]
-        log_margins = torch.stack([data['log_margin'] for data in batch])
-        chosen_gt = torch.stack([data['chosen_gt'] for data in batch])
-        rejected_gt = torch.stack([data['rejected_gt'] for data in batch])
+        log_margins = [data['log_margin'] for data in batch]
+        chosen_gt = [data['chosen_gt'] for data in batch]
+        rejected_gt = [data['rejected_gt'] for data in batch]
 
         chosen_inputs = self._collate_hf_inputs([data['chosen_inputs'] for data in batch])
         rejected_inputs = self._collate_hf_inputs([data['rejected_inputs'] for data in batch])
@@ -313,34 +318,25 @@ def precache_reference_scores(peft_model, dataset, yes_id, no_id, device):
                 video_frames = load_video_from_picks(video_path, picks)
                 formatted_prompt = f"Does this image show a key highlight from the video titled '{title}'?"
                 
-                # Process in chunks of 8 to avoid OOM
-                chunk_size = 8
-                all_preds = []
-                for start_idx in range(0, len(video_frames), chunk_size):
-                    end_idx = min(start_idx + chunk_size, len(video_frames))
-                    chunk_frames = video_frames[start_idx:end_idx]
+                inputs = dataset._process_clip(video_frames, formatted_prompt)
+                inputs = inputs.to(device)
                     
-                    inputs = dataset._process_clip(chunk_frames, formatted_prompt)
-                    inputs = inputs.to(device)
-                    
-                    with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                        outputs = peft_model.base_model(inputs)
-                        logits = outputs.logits[:, -1, :]
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                    outputs = peft_model.base_model(inputs)
+                    logits = outputs.logits[:, -1, :]
                         
-                    binary_probs = F.softmax(
-                        torch.stack([logits[:, yes_id], logits[:, no_id]], dim=-1), dim=-1
-                    )
-                    all_preds.append(binary_probs[:, 0].detach().cpu().float().numpy())
-                    
-                    del outputs, logits, inputs
-                    
-                reference_cache[video_name] = np.concatenate(all_preds)
+                binary_probs = F.softmax(
+                    torch.stack([logits[:, yes_id], logits[:, no_id]], dim=-1), dim=-1
+                )
+                
+                all_preds = binary_probs[:, 0].detach().cpu().float().numpy()
+                                        
+                reference_cache[video_name] = all_preds
                 
     print(f"Pre-caching completed for {len(reference_cache)} videos.")
     return reference_cache
 
 # ================= GRAPH PYTORCH DIFF PROPAGATION =================
-
 def build_adjacency_matrix_pytorch(features, picks, window_size=15, device="cuda"):
     """
     Constructs the base visual-temporal weight matrix and backbone mask.
@@ -385,7 +381,7 @@ def compute_normalized_adjacency_matrix(probs, W_base, backbone_mask, sigma_s=0.
     A_norm = W / (W.sum(dim=1, keepdim=True) + 1e-8)
     return A_norm
 
-def propagate_graph_pytorch(probs, adj_matrix, alpha=0.6, iterations=10):
+def propagate_graph_pytorch(probs, adj_matrix, alpha=0.6, iterations=5):
     """
     Label propagation power iteration.
     """
@@ -432,7 +428,7 @@ def evaluate(model, val_loader, dataset_name, h5_paths, tvsum_user_scores=None, 
             W_base, backbone_mask = build_adjacency_matrix_pytorch(v_features, v_picks, window_size=15, device=device)
             A_norm = compute_normalized_adjacency_matrix(preds, W_base, backbone_mask, sigma_s=0.15, device=device)
             
-            propagated_scores = propagate_graph_pytorch(preds, A_norm, alpha=0.8, iterations=10)
+            propagated_scores = propagate_graph_pytorch(preds, A_norm, alpha=0.1, iterations=5)
             yes_scores = propagated_scores.detach().cpu().float().numpy()
             all_preds.extend(yes_scores)
 
@@ -454,7 +450,7 @@ def evaluate(model, val_loader, dataset_name, h5_paths, tvsum_user_scores=None, 
 # ================= TRAINING LOOP =================
 
 def train_graph_dpo(args):
-    vlm_vars = load_vlm(args.model_path, args.model_type, device, load_in_4bit=args.load_in_4bit)
+    vlm_vars = load_vlm(args.model_path, args.model_type, device)
     wrapper_or_model, tokenizer, processor, yes_id, no_id = vlm_vars
     model = wrapper_or_model.model if args.model_type == "qwen" else wrapper_or_model
     
@@ -470,6 +466,8 @@ def train_graph_dpo(args):
         with open(args.split_file, 'r') as f:
             splits = json.load(f)
         print(f"Loaded {len(splits)} splits from {args.split_file}")
+
+    eval_split_metrics = {}
 
     if args.dataset == 'tvsum':
         tvsum_user_scores = get_gt('TVSum')
@@ -564,17 +562,17 @@ def train_graph_dpo(args):
                 'correct': 0, 'total': 0, 'loss': [],
             }
 
-            for step, batch_data in enumerate(train_loader):
+            for step, batch_data in enumerate(tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.num_epochs}", leave=False)):
                 titles = batch_data["title"]
                 video_names = batch_data["video_name"]
                 
                 # Fetch chosen/rejected ground truths and VLM inputs
-                c_gtscore = batch_data["chosen_gt"].to(device)
-                r_gtscore = batch_data["rejected_gt"].to(device)
+                c_gtscore = batch_data["chosen_gt"]     # list[Tensor]
+                r_gtscore = batch_data["rejected_gt"]     # list[Tensor]
                 
                 c_batch_data = batch_data["chosen_inputs"].to(device)
                 r_batch_data = batch_data["rejected_inputs"].to(device)
-                log_margin = batch_data["log_margin"].to(device)
+                log_margin = batch_data["log_margin"]     # list[Tensor]
                 
                 # Batch Graph metadata
                 chosen_idx = batch_data["chosen_idx"]
@@ -584,7 +582,7 @@ def train_graph_dpo(args):
                 n_frames = batch_data["n_frames"]
                 gtscore = batch_data["gtscore"]
 
-                # ── 1. Policy Forward pass on pairs (LoRA Enabled) ──
+                # 1. Policy Logps (LoRA Enabled)
                 peft_model.train()
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                     c_logits = peft_model.base_model(c_batch_data).logits[:, -1, :]
@@ -600,6 +598,7 @@ def train_graph_dpo(args):
                 batch_step_track_loss = []
                 
                 current_batch_size = len(video_names)
+                curr_idx = 0
                 for b in range(current_batch_size):
                     v_name = video_names[b]
                     v_chosen_idx = chosen_idx[b].to(device)
@@ -615,23 +614,26 @@ def train_graph_dpo(args):
                     # --- A. Policy Graph construction & propagation ---
                     pi_probs_all = torch.tensor(ref_scores_cache[v_name], dtype=pi_p_c.dtype, device=device)
                     
-                    # Insert active policy predictions (with gradients) into chosen/rejected indices
-                    # Slice slice elements for batch indexing
-                    v_pi_p_c = pi_p_c[b * args.clip_length : (b + 1) * args.clip_length]
-                    v_pi_p_r = pi_p_r[b * args.clip_length : (b + 1) * args.clip_length]
+                    # Slice active predictions using dynamic cumulative indices
+                    num_sub = len(v_chosen_idx)
+                    v_pi_p_c = pi_p_c[curr_idx : curr_idx + num_sub]
+                    v_pi_p_r = pi_p_r[curr_idx : curr_idx + num_sub]
+                    curr_idx += num_sub
                     
                     # Assign online predictions to score vector
                     pi_probs_all[v_chosen_idx] = v_pi_p_c
                     pi_probs_all[v_rejected_idx] = v_pi_p_r
                     
-                    # Compute query-conditioned adjacency matrix & propagate
-                    norm_pi_adjacency = compute_normalized_adjacency_matrix(pi_probs_all, W_base, backbone_mask, sigma_s=0.15, device=device)
-                    pi_propagated = propagate_graph_pytorch(pi_probs_all, norm_pi_adjacency, alpha=0.8, iterations=5)
+                    # Compute query-conditioned adjacency matrix (detached from autograd to prevent vanishing gradients through RBF kernel)
+                    with torch.no_grad():
+                        norm_pi_adjacency = compute_normalized_adjacency_matrix(pi_probs_all.detach(), W_base, backbone_mask, sigma_s=0.15, device=device)
+                    pi_propagated = propagate_graph_pytorch(pi_probs_all, norm_pi_adjacency, alpha=0.1, iterations=5)
                     
                     # --- B. Reference Graph construction & propagation ---
-                    ref_probs_all = torch.tensor(ref_scores_cache[v_name], dtype=pi_p_c.dtype, device=device)
-                    norm_ref_adjacency = compute_normalized_adjacency_matrix(ref_probs_all, W_base, backbone_mask, sigma_s=0.15, device=device)
-                    ref_propagated = propagate_graph_pytorch(ref_probs_all, norm_ref_adjacency, alpha=0.8, iterations=5)
+                    with torch.no_grad():
+                        ref_probs_all = torch.tensor(ref_scores_cache[v_name], dtype=pi_p_c.dtype, device=device)
+                        norm_ref_adjacency = compute_normalized_adjacency_matrix(ref_probs_all, W_base, backbone_mask, sigma_s=0.15, device=device)
+                        ref_propagated = propagate_graph_pytorch(ref_probs_all, norm_ref_adjacency, alpha=0.1, iterations=5)
                     
                     # ── 3. Extract log-probabilities of propagated scores ──
                     pi_logp_c = torch.log(pi_propagated[v_chosen_idx] + 1e-8)
@@ -731,9 +733,9 @@ def train_graph_dpo(args):
             val_loader=test_loader,
             dataset_name=args.dataset,
             h5_paths=h5_paths,
+            tvsum_user_scores=tvsum_user_scores,
             yes_id=yes_id,
-            no_id=no_id,
-            tvsum_user_scores=tvsum_user_scores
+            no_id=no_id
         )
 
         if not test_df.empty:
@@ -784,7 +786,6 @@ def main():
     parser.add_argument("--batch_size", type=int, default=2, help="Number of videos per training batch.")
     parser.add_argument("--clip_length", type=int, default=4, help="Number of sampled frames per clip.")
     parser.add_argument("--beta", type=float, default=0.5, help="Beta coefficient in DPO loss.")
-    parser.add_argument("--load_in_4bit", action="store_true", help="Load model in 4-bit for low-VRAM GPUs.")
     args = parser.parse_args()
     
     args.model_path = resolve_model_path(args.model_type)

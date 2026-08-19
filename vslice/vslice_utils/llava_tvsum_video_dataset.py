@@ -364,7 +364,8 @@ class TVSumLLaMA_DPODataset(Dataset):
     def __getitem__(self, index):
         video_name = self.train_keys[index]
         full_gtscore = torch.as_tensor(self.video_data[video_name + '/gtscore'])
-        picks = self.video_data[video_name + '/picks']
+        full_features = torch.as_tensor(self.video_data[video_name + '/features'], dtype=torch.float32)
+        picks = np.array(self.video_data[video_name + '/picks'])
 
         # Resolve video path and title via TVSum info file
         video_num = int(video_name.split('_')[-1])
@@ -406,7 +407,11 @@ class TVSumLLaMA_DPODataset(Dataset):
             'rejected_inputs': rejected_inputs,
             'chosen_gt': chosen_score,
             'rejected_gt': rejected_score,
-            'log_margin': log_margin
+            'log_margin': log_margin,
+            'chosen_idx':  chosen_idx,
+            'rejected_idx': rejected_idx,
+            'features': full_features,
+            'picks': torch.tensor(picks, dtype=torch.long)
         }
 
 class DPOTrainBatchCollator:
@@ -449,6 +454,11 @@ class DPOTrainBatchCollator:
         chosen_gt = torch.stack([data['chosen_gt'] for data in batch])
         rejected_gt = torch.stack([data['rejected_gt'] for data in batch])
 
+        chosen_idx = [data['chosen_idx'] for data in batch]
+        rejected_idx = [data['rejected_idx'] for data in batch]
+        features = [data['features'] for data in batch]
+        picks = [data['picks'] for data in batch]
+
         # Collate chosen and rejected separately so your DPO loop can handle them cleanly
         chosen_inputs = self._collate_hf_inputs([data['chosen_inputs'] for data in batch])
         rejected_inputs = self._collate_hf_inputs([data['rejected_inputs'] for data in batch])
@@ -460,5 +470,9 @@ class DPOTrainBatchCollator:
             'rejected_inputs': rejected_inputs,
             'chosen_gt': chosen_gt,
             'rejected_gt': rejected_gt,
-            'log_margin': log_margins
+            'log_margin': log_margins,
+            'chosen_idx': chosen_idx,
+            'rejected_idx': rejected_idx,
+            'features': features,
+            'picks': picks
         }

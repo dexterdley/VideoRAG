@@ -2,28 +2,28 @@ import sys
 import io
 import os
 import json
-import copy
 import argparse
 import numpy as np
+from scipy.stats import kendalltau, spearmanr
 import pandas as pd
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from tqdm import tqdm
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import DataLoader
 import h5py
 from torch.utils.tensorboard import SummaryWriter
+from peft import LoraConfig, get_peft_model, PeftModel, prepare_model_for_kbit_training
 from datetime import datetime
-from torch.nn.utils.rnn import pad_sequence
-from PIL import Image
-from decord import VideoReader, cpu
-import pickle
-from torch_geometric.nn import GATConv, GATv2Conv
-from vslice_utils.models import load_vlm, minicpm_inference, qwen_inference
+
+from vslice_utils.models import load_vlm, minicpm_extract_title_and_keywords, qwen_extract_title_and_keywords, minicpm_inference, qwen_inference
+from vslice_utils.dataloader import build_summe_manifest, build_tvsum_manifest, VideoSegmentDataset
 from vslice_utils.helpers import set_seed, compute_video_metrics
-from vslice_utils.llava_summe_video_dataset import load_video_from_picks, ValBatchCollator, SumMeLLaMA_VideoDataset
-from vslice_utils.llava_tvsum_video_dataset import load_video_from_picks, ValBatchCollator, TVSumLLaMA_VideoDataset
+
+from vslice_utils.llava_summe_video_dataset import SumMeLLaMA_VideoDataset, SumMeLLaMA_DPODataset, DPOTrainBatchCollator, ValBatchCollator
+from vslice_utils.llava_tvsum_video_dataset import TVSumLLaMA_VideoDataset, TVSumLLaMA_DPODataset, DPOTrainBatchCollator, ValBatchCollator
+import networkx as nx
 
 # Evaluation dependencies
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'csta'))
@@ -35,7 +35,7 @@ except ImportError:
 import warnings
 warnings.filterwarnings("ignore")
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 
@@ -46,476 +46,265 @@ if sys.platform == "win32":
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
     sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
 
-# ================= CUSTOM DATASET FOR GRAPH DPO =================
+"""
+TBD FIX TVSUM EVALUATION BUG
+SUMME: TO BEAT 0.256 0.285, TVSUM: 0.195 0.255
+==================== SPLIT 1/5 ====================
+[Split 1] Test | F-Score: 0.4464 | Tau: 0.1548 | Rho: 0.1723
+[Split 1] Test | F-Score: 0.4600 | Tau: 0.2379 | Rho: 0.2652
+==================== SPLIT 2/5 ====================
+[Split 2] Test | F-Score: 0.5475 | Tau: 0.2793 | Rho: 0.3109
+==================== SPLIT 3/5 ====================
+[Split 3] Test | F-Score: 0.5193 | Tau: 0.2429 | Rho: 0.2687
+==================== SPLIT 4/5 ====================
+[Split 4] Test | F-Score: 0.5311 | Tau: 0.2160 | Rho: 0.2430
+==================== SPLIT 5/5 ====================
+[Split 5] Test | F-Score: 0.5052 | Tau: 0.2333 | Rho: 0.2591
+════════════════════════════════════════════════════════════
+FINAL GLOBAL BENCHMARK SUMMARY (5 SPLITS)
+════════════════════════════════════════════════════════════
+Global Avg | F1: 0.5099 | Kendall: 0.2253 | Spearman: 0.2508 # Base
+Global Avg | F1: 0.5198 | Kendall: 0.2470 | Spearman: 0.2750 # w DPO
+TVSum:
+Global Avg | F1: 0.4788 | Kendall: 0.2438 | Spearman: 0.3118
 
-class GraphDPODataset(Dataset):
-    def __init__(self, dataset_name, split_idx, processor, root_dir=".", clip_length=4, frame_stride=1, random_sampling=True):
-        self.dataset_name = dataset_name.lower()
-        self.clip_length = clip_length
-        self.frame_stride = frame_stride
-        self.processor = processor
-        self.random_sampling = random_sampling
-        self.epsilon = 1e-5
+### CSTA
+# Summe
+Average F-score across 5 splits: 0.5515
+Average Kendall Tau across splits: 0.2532
+Average Spearman Rho across splits: 0.2819
+# TVSum
+Average F-score across 5 splits: 0.5437
+Average Kendall Tau across splits: 0.1925
+Average Spearman Rho across splits: 0.2532
+"""
 
-        if self.dataset_name == 'summe':
-            self.dataset = os.path.join(root_dir, 'SumMe', 'eccv16_dataset_summe_google_pool5.h5')
-            self.split_file = os.path.join(root_dir, 'dataset', 'summe_splits.json')
-            self.video_folder = os.path.join(root_dir, 'SumMe', 'raw', 'videos', '')
-            self.video_data = h5py.File(self.dataset, 'r')
-            with open(self.split_file, 'r') as f:
-                data = json.loads(f.read())
-                self.train_keys = data[split_idx]['train_keys']
-        elif self.dataset_name == 'tvsum':
-            self.dataset = os.path.join(root_dir, 'TVSum', 'eccv16_dataset_tvsum_google_pool5.h5')
-            self.split_file = os.path.join(root_dir, 'dataset', 'tvsum_splits.json')
-            self.video_folder = os.path.join(root_dir, 'TVSum', 'tvsum50_ver_1_1', 'ydata-tvsum50-v1_1', 'video', '')
-            self.video_data = h5py.File(self.dataset, 'r')
-            self.info_file = os.path.join(root_dir, 'TVSum', 'tvsum50_ver_1_1', 'ydata-tvsum50-v1_1', 'data', 'ydata-tvsum50-info.tsv')
-            self.info_file = pd.read_csv(self.info_file, sep='\t')
-            with open(self.split_file, 'r') as f:
-                data = json.loads(f.read())
-                self.train_keys = data[split_idx]['train_keys']
-        else:
-            raise ValueError(f"Unknown dataset: {self.dataset_name}")
-
-        self.system_prompt = "You are an expert video editor. Strictly answer only Yes or No."
-
-    def __len__(self):
-        return len(self.train_keys)
-
-    def _sample_frame_indices(self, total_frames):
-        if self.random_sampling:
-            start_idx = np.random.randint(0, max(1, total_frames - self.clip_length * self.frame_stride))
-        else:
-            start_idx = max(0, (total_frames - self.clip_length * self.frame_stride) // 2)
-
-        frame_indices = start_idx + np.arange(self.clip_length) * self.frame_stride
-        frame_indices = np.minimum(frame_indices, total_frames - 1)
-        return frame_indices.tolist()
-
-    def _process_clip(self, frames, formatted_prompt):
-        prompts_lists = []
-        input_images_lists = []
-        for img in frames:
-            msgs = [
-                {'role': 'system', 'content': self.system_prompt},
-                {'role': 'user', 'content': f"(<image>./</image>)\n{formatted_prompt}"}
-            ]
-            prompt_str = self.processor.tokenizer.apply_chat_template(
-                msgs, tokenize=False, add_generation_prompt=True
-            )
-            prompts_lists.append(prompt_str)
-            input_images_lists.append([img])
-
-        inputs = self.processor(
-            prompts_lists,
-            input_images_lists,
-            max_slice_nums=1,
-            use_image_id=False,
-            return_tensors="pt",
-            max_length=2048
-        )
-        if "position_ids" not in inputs:
-            batch_size, seq_len = inputs["input_ids"].shape
-            inputs["position_ids"] = torch.arange(seq_len, dtype=torch.long).unsqueeze(0).expand(batch_size, -1)
-        if "image_sizes" in inputs:
-            inputs.pop("image_sizes")
-        return inputs
-
-    def __getitem__(self, index):
-        video_name = self.train_keys[index]
-
-        # Load and normalize ground truth score
-        gtscore = np.array(self.video_data[video_name + '/gtscore'])
-        gt_min, gt_max = np.min(gtscore), np.max(gtscore)
-        if gt_max > gt_min:
-            gtscore = (gtscore - gt_min) / (gt_max - gt_min)
-        else:
-            gtscore = np.zeros_like(gtscore)
-
-        full_gtscore = torch.as_tensor(gtscore, dtype=torch.float32)
-        full_features = torch.as_tensor(self.video_data[video_name + '/features'], dtype=torch.float32)
-        picks = np.array(self.video_data[video_name + '/picks'])
-        n_frames = int(np.array(self.video_data[video_name + '/n_frames']))
-
-        # Use ALL picks for dense supervision.
-        # Sort picks by gtscore and pair the i-th worst with the i-th best:
-        #   rejected_idx[i]  <->  chosen_idx[i]
-        # This creates N//2 preference pairs per training step with no VRAM overhead
-        # (VLM is pre-cached; clip_length only limits VLM inference, not GNN training).
-        sorted_idx = np.argsort(gtscore)          # ascending: lowest -> highest score
-        half = len(sorted_idx) // 2
-        rejected_idx = sorted_idx[:half].tolist()        # N//2 lowest-score picks
-        chosen_idx   = sorted_idx[-half:][::-1].tolist() # N//2 highest-score picks (reversed so pair[i] = best-half[i] vs worst-half[i])
-
-        chosen_score   = full_gtscore[chosen_idx]
-        rejected_score = full_gtscore[rejected_idx]
-        log_margin     = chosen_score - rejected_score   # always >= 0 by construction
-
-        return {
-            'video_name':   video_name,
-            'log_margin':   log_margin,
-            'chosen_idx':   torch.tensor(chosen_idx,   dtype=torch.long),
-            'rejected_idx': torch.tensor(rejected_idx, dtype=torch.long),
-            'features':     full_features,
-            'picks':        torch.tensor(picks,         dtype=torch.long),
-            'n_frames':     n_frames,
-            'gtscore':      full_gtscore,
-        }
-
-
-class GraphDPOTrainBatchCollator:
-    """Collates lightweight training fields only — no VLM inputs needed.
-
-    log_margin is kept as a list of per-video tensors because different videos
-    have different numbers of pick-pairs (N//2 varies by video length).
+def evaluate_graph(model, val_loader, dataset_name, h5_paths, tvsum_user_scores=None, yes_id=9454, no_id=2753,
+                   output_dir=None, model_type="minicpm", alpha=0.5):
     """
-
-    def __call__(self, batch):
-        return {
-            'video_name':   [data['video_name']   for data in batch],
-            'log_margin':   [data['log_margin']   for data in batch],   # list[Tensor[N_i//2]]
-            'chosen_idx':   [data['chosen_idx']   for data in batch],
-            'rejected_idx': [data['rejected_idx'] for data in batch],
-            'features':     [data['features']     for data in batch],
-            'picks':        [data['picks']         for data in batch],
-            'n_frames':     [data['n_frames']      for data in batch],
-            'gtscore':      [data['gtscore']       for data in batch],
-        }
-
-
-# ================= VLM SCORE CACHING (frozen VLM, one-time) =================
-
-def precache_vlm_scores(model, dataset, yes_id, no_id, device):
-    """
-    Pre-caches frozen VLM Yes-probabilities for every frame in every training video.
-
-    The VLM is fully frozen throughout — this runs once and the results are
-    saved to disk so the training loop never needs to call the VLM again.
-    """
-    vlm_cache = {}
-    print(f"Pre-caching frozen VLM scores for {len(dataset)} videos...")
-
-    model.eval()
-    with torch.inference_mode():
-        for index in tqdm(range(len(dataset)), desc="VLM scoring"):
-            video_name = dataset.train_keys[index]
-            picks = np.array(dataset.video_data[video_name + '/picks'])
-
-            if dataset.dataset_name == 'summe':
-                video_filename = str(np.array(dataset.video_data[video_name + '/video_name']))
-                video_filename = video_filename.strip("b'").strip('"').strip()
-                clean_filename = "".join([item + "_" for item in video_filename.split(" ")])
-                video_path = os.path.join(dataset.video_folder, clean_filename)
-                title = video_filename
-            else:
-                video_num = int(video_name.split('_')[-1])
-                video_id = dataset.info_file.iloc[video_num - 1]['video_id']
-                video_path = os.path.join(dataset.video_folder, video_id + ".mp4")
-                title = str(dataset.info_file.iloc[video_num - 1]['title'])
-
-            if os.path.exists(video_path + ".webm"):
-                video_path += ".webm"
-            elif os.path.exists(video_path + ".mp4"):
-                video_path += ".mp4"
-
-            video_frames = load_video_from_picks(video_path, picks)
-            formatted_prompt = f"Does this image show a key highlight from the video titled '{title}'?"
-
-            chunk_size = 8
-            all_preds = []
-            for start_idx in range(0, len(video_frames), chunk_size):
-                end_idx = min(start_idx + chunk_size, len(video_frames))
-                chunk_frames = video_frames[start_idx:end_idx]
-
-                inputs = dataset._process_clip(chunk_frames, formatted_prompt)
-                inputs = inputs.to(device)
-
-                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                    outputs = model(inputs)
-                    logits = outputs.logits[:, -1, :]
-
-                binary_probs = F.softmax(
-                    torch.stack([logits[:, yes_id], logits[:, no_id]], dim=-1), dim=-1
-                )
-                all_preds.append(binary_probs[:, 0].detach().cpu().float().numpy())
-                del outputs, logits, inputs
-
-            vlm_cache[video_name] = np.concatenate(all_preds)
-
-    print(f"VLM scoring completed for {len(vlm_cache)} videos.")
-    return vlm_cache
-
-
-# ================= GNN SCORE PROPAGATOR (GAT / GATv2) =================
-
-class GATScorePropagator(nn.Module):
-    """
-    Lightweight GAT / GATv2 that propagates per-frame scores over the
-    visual-temporal graph.  This is the *only* trainable module in
-    Graph-DPO — the VLM is fully frozen and never updated.
-
-    Node features:  [normalized_visual_feat (D) | vlm_prob (1)]  =>  D+1 dims
-    Edge structure: visual-temporal similarity + sequential backbone + self-loops
-
-    Architecture:
-        Linear input projection  (D+1 => hidden)
-        LayerNorm + ReLU
-        x num_layers:
-            GATConv / GATv2Conv  (hidden => hidden, concat=True)
-            ELU  =>  Dropout  =>  LayerNorm  +  residual
-        Score head: Linear(hidden=>32) => ReLU => Linear(32=>1) => Sigmoid
-
-    Args:
-        in_channels:     Input node feature dim (visual_dim + 1).
-        hidden_channels: Total hidden dim; must be divisible by num_heads.
-        num_heads:       Number of attention heads per GAT layer.
-        num_layers:      Number of message-passing layers.
-        gnn_type:        'gat' or 'gatv2'.
-        dropout:         Dropout probability applied after each conv layer.
-    """
-
-    def __init__(
-        self,
-        in_channels: int,
-        hidden_channels: int = 64,
-        num_heads: int = 4,
-        num_layers: int = 2,
-        gnn_type: str = 'gatv2',
-        dropout: float = 0.1,
-    ):
-        super().__init__()
-        assert hidden_channels % num_heads == 0, (
-            f"hidden_channels ({hidden_channels}) must be divisible by "
-            f"num_heads ({num_heads})"
-        )
-
-        self.gnn_type = gnn_type
-        self.dropout = dropout
-        head_dim = hidden_channels // num_heads
-
-        # Input projection: (D+1) => hidden
-        self.input_proj = nn.Sequential(
-            nn.Linear(in_channels, hidden_channels),
-            nn.LayerNorm(hidden_channels),
-            nn.ReLU(),
-        )
-
-        ConvClass = GATv2Conv if gnn_type == 'gatv2' else GATConv
-
-        # Message-passing layers with residual connections
-        self.convs = nn.ModuleList()
-        self.norms = nn.ModuleList()
-        for _ in range(num_layers):
-            self.convs.append(
-                ConvClass(
-                    hidden_channels, head_dim,
-                    heads=num_heads, dropout=dropout, concat=True
-                )
-            )
-            self.norms.append(nn.LayerNorm(hidden_channels))
-
-        # Scalar score output in [0, 1]
-        self.score_head = nn.Sequential(
-            nn.Linear(hidden_channels, 32),
-            nn.ReLU(),
-            nn.Linear(32, 1),
-            nn.Sigmoid(),
-        )
-
-    def forward(self, x: torch.Tensor, edge_index: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            x:          Node features  [N, in_channels]
-            edge_index: COO edge index [2, E]  (long tensor)
-        Returns:
-            scores: [N, 1]  per-frame importance scores in (0, 1)
-        """
-        x = self.input_proj(x)                              # [N, hidden]
-
-        for conv, norm in zip(self.convs, self.norms):
-            residual = x
-            x = conv(x, edge_index)                         # [N, hidden]
-            x = F.elu(x)
-            x = F.dropout(x, p=self.dropout, training=self.training)
-            x = norm(x + residual)                          # residual + LN
-
-        return self.score_head(x)                           # [N, 1]
-
-
-# ================= GRAPH ADJACENCY UTILITIES =================
-
-def build_adjacency_matrix_pytorch(features, picks, window_size=15, device="cuda"):
-    """
-    Constructs the base visual-temporal weight matrix and backbone mask.
-    Used to derive the edge index for the GNN.
-    """
-    if features.dim() == 3:
-        features = features.squeeze(1)
-    num_picks = features.size(0)
-
-    # Cosine similarity
-    norms = torch.linalg.norm(features, dim=1, keepdim=True)
-    norm_features = features / (norms + 1e-8)
-    sim_matrix = torch.matmul(norm_features, norm_features.t())
-    sim_matrix = torch.clamp(sim_matrix, min=0.0)
-
-    # Window Mask
-    picks_col = picks.unsqueeze(1)
-    picks_row = picks.unsqueeze(0)
-    diff_picks = torch.abs(picks_col - picks_row)
-
-    temporal_mask = (diff_picks >= 1) & (diff_picks <= window_size)
-    backbone_mask = (torch.abs(
-        torch.arange(num_picks, device=device).unsqueeze(1) -
-        torch.arange(num_picks, device=device).unsqueeze(0)
-    ) == 1)
-
-    W_base = torch.zeros((num_picks, num_picks), dtype=features.dtype, device=device)
-    W_base[temporal_mask] = sim_matrix[temporal_mask]
-
-    return W_base, backbone_mask
-
-
-def build_edge_index(W_base: torch.Tensor, backbone_mask: torch.Tensor,
-                     device: str) -> torch.Tensor:
-    """
-    Converts adjacency matrices to a PyTorch Geometric COO edge_index.
-
-    Edges included:
-        - Visual-temporal similarity edges  (W_base > 0)
-        - Sequential backbone edges         (adjacent pick indices)
-        - Self-loops
-
-    Returns:
-        edge_index: [2, E]  long tensor
-    """
-    n = W_base.size(0)
-    combined = (
-        (W_base > 0)
-        | backbone_mask
-        | torch.eye(n, dtype=torch.bool, device=device)
-    )
-    edge_index = combined.nonzero(as_tuple=False).t().contiguous()
-    return edge_index
-
-
-def build_node_features(visual_features: torch.Tensor,
-                         vlm_probs: torch.Tensor) -> torch.Tensor:
-    """
-    Concatenates L2-normalized visual features with scalar VLM probabilities.
-
-    Args:
-        visual_features: [N, D] or [N, 1, D]  Pool5 features (h5 may add an extra dim)
-        vlm_probs:       [N]                   VLM Yes-probabilities
-    Returns:
-        node_feats: [N, D+1]
-    """
-    # Pool5 features from h5 are sometimes stored as [N, 1, D] — squeeze to [N, D]
-    if visual_features.dim() == 3:
-        visual_features = visual_features.squeeze(1)
-    norms = torch.linalg.norm(visual_features, dim=1, keepdim=True)
-    norm_feats = visual_features / (norms + 1e-8)
-    return torch.cat([norm_feats, vlm_probs.unsqueeze(1)], dim=1)
-
-
-# ================= EVALUATION =================
-
-def evaluate(model, gat_model, val_loader, dataset_name, h5_paths,
-             tvsum_user_scores=None, use_advanced_scoring=False,
-             yes_id=9454, no_id=2753):
-    """
-    Runs the full evaluation pipeline:
-        frozen VLM  ->  per-frame probs  ->  GATScorePropagator  ->  metrics
+    Evaluates the model using the ValBatchCollator and applies graph label propagation on full-video predictions.
     """
     split_results = []
     h5_path = h5_paths.get(dataset_name.lower())
     model.eval()
-    gat_model.eval()
+
+    torch.cuda.empty_cache()
 
     all_preds = []
+
     with torch.inference_mode():
         for step, batch_data in enumerate(tqdm(val_loader, desc=f"Evaluating {dataset_name}", leave=False)):
+            
             video_name = batch_data.pop("video_name")[0]
             titles = batch_data.pop("title")
             gtscores = batch_data.pop("gtscore")
-            features = batch_data.pop("features")
-
+            features = batch_data.pop("features")[0]
+            
             n_frames = batch_data.pop("n_frames")[0]
             n_frame_per_seg = batch_data.pop("n_frame_per_seg")[0]
             picks = batch_data.pop("picks")[0]
             change_points = batch_data.pop("change_points")[0]
             gt_summary = batch_data.pop("gt_summary")[0]
 
+            title = titles[0] if isinstance(titles, (list, tuple)) else titles
+            gtscore = gtscores.squeeze().numpy() if hasattr(gtscores, 'numpy') else np.array(gtscores)
+
             batch_data = batch_data.to(device)
+            outputs = model.base_model(batch_data)
 
-            # Frozen VLM forward pass (chunked to avoid OOM)
-            chunk_size = 8
-            num_frames = batch_data["input_ids"].size(0)
-            all_preds_chunk = []
+            logits = outputs.logits[:, -1, :].detach()
+            yes_logits, no_logits = logits[:, yes_id], logits[:, no_id]
+            binary_probs = F.softmax(torch.stack([yes_logits, no_logits], dim=-1), dim=-1)
+            raw_preds = binary_probs[:, 0].cpu().float()
 
-            for start_idx in range(0, num_frames, chunk_size):
-                end_idx = min(start_idx + chunk_size, num_frames)
+            # Eagerly free GPU memory: forward-pass outputs and inputs are no longer needed
+            del outputs, logits, yes_logits, no_logits, binary_probs, batch_data
+            torch.cuda.empty_cache()
 
-                mini_batch_dict = {}
-                for k, v in batch_data.items():
-                    if isinstance(v, torch.Tensor) and v.size(0) == num_frames:
-                        mini_batch_dict[k] = v[start_idx:end_idx]
-                    elif isinstance(v, list) and len(v) == num_frames:
-                        mini_batch_dict[k] = v[start_idx:end_idx]
-                    else:
-                        mini_batch_dict[k] = v
-
-                mini_batch = type(batch_data)(mini_batch_dict)
-                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                    chunk_outputs = model(mini_batch)
-                    chunk_logits = chunk_outputs.logits[:, -1, :]
-
-                chunk_binary_probs = F.softmax(
-                    torch.stack([chunk_logits[:, yes_id], chunk_logits[:, no_id]], dim=-1), dim=-1
-                )
-                all_preds_chunk.append(chunk_binary_probs[:, 0].detach().cpu().float())
-                del chunk_outputs, chunk_logits, mini_batch, mini_batch_dict
-
-            vlm_probs = torch.cat(all_preds_chunk, dim=0)  # [N]
-
-            # GNN propagation
-            v_features = features[0].to(device)
-            v_picks = picks.to(device)
-
-            W_base, backbone_mask = build_adjacency_matrix_pytorch(
-                v_features, v_picks, window_size=15, device=device
-            )
-            edge_index = build_edge_index(W_base, backbone_mask, device=device)
-            node_feats = build_node_features(v_features, vlm_probs.to(device))
-
-            propagated_scores = gat_model(node_feats, edge_index).squeeze(-1)
-            yes_scores = propagated_scores.detach().cpu().float().numpy()
+            yes_scores = raw_preds.numpy()
             all_preds.extend(yes_scores)
 
             res = compute_video_metrics(
-                yes_scores=yes_scores,
-                no_scores=1 - yes_scores,
-                h5_path=h5_path,
-                h5_key=video_name,
+                yes_scores=yes_scores, 
+                no_scores=1-yes_scores, 
+                h5_path=h5_path, 
+                h5_key=video_name, 
                 video_name=video_name,
                 dataset_name=dataset_name,
                 user_scores=tvsum_user_scores,
-                use_advanced_scoring=use_advanced_scoring,
+                use_advanced_scoring=False,
             )
+
             split_results.append(res)
 
     all_preds = np.array(all_preds)
+    unique_preds = len(np.unique(all_preds))
     return pd.DataFrame(split_results)
 
+def build_adjacency_matrix_pytorch(features, picks, window_size=15, threshold=0.95, device="cpu"):
+    if features.dim() == 3:
+        features = features.squeeze(1)
+    num_picks = features.size(0)
+    
+    # Cosine similarity
+    norms = torch.linalg.norm(features, dim=1, keepdim=True)
+    norm_features = features / (norms + 1e-8)
+    sim_matrix = torch.matmul(norm_features, norm_features.t())
+    threshold = torch.quantile(sim_matrix, threshold)
+    
+    # Create an index array [0, 1, 2... N] instead of raw frame numbers
+    idx = torch.arange(num_picks, device=device)
+    diff_idx = torch.abs(idx.unsqueeze(1) - idx.unsqueeze(0))
+    
+    # Mask 1: Within window size (e.g., up to 15 nodes away)
+    temporal_mask = (diff_idx >= 1) & (diff_idx <= window_size)
+    
+    # Mask 2: Only keep strong visual similarities
+    similarity_mask = sim_matrix >= threshold
+    
+    # Combine masks
+    valid_connections = temporal_mask & similarity_mask
+    backbone_mask = (diff_idx == 1)
+    
+    W_base = torch.zeros((num_picks, num_picks), dtype=features.dtype, device=device)
+    W_base[valid_connections] = sim_matrix[valid_connections]
+    
+    return W_base, backbone_mask
 
-# ================= TRAINING LOOP =================
+def build_video_graph(features, picks, window_size=15, sim_threshold=0.9):
+    """Build full video graph G over all N pick frames."""
+
+    W_base_tensor, backbone_mask = build_adjacency_matrix_pytorch(
+                                    features, picks, window_size=200, threshold=sim_threshold)
+    W_base_np = W_base_tensor.cpu().numpy()
+
+    G_temporal = nx.Graph()
+    num_nodes = len(picks)
+
+    for i in range(num_nodes):
+        G_temporal.add_node(i)
+
+    backbone_edges = []
+    for i in range(num_nodes - 1):
+        G_temporal.add_edge(i, i + 1, edge_type='backbone')
+        backbone_edges.append((i, i + 1))
+
+    rows, cols = np.where(W_base_np > 0)
+    similarity_edges = []
+
+    for r, c in zip(rows, cols):
+        if r < c:  # Avoid duplicate undirected pairs
+            if abs(r - c) > 1:  # Long-range non-adjacent connections ONLY
+                weight = float(W_base_np[r, c])
+                G_temporal.add_edge(r, c, weight=weight, edge_type='similarity')
+                similarity_edges.append((r, c))
+    
+    return G_temporal
+
+def sample_subgraph(G, seed_nodes, max_sub_nodes=30):
+    """
+    BFS from seed_nodes to collect up to max_sub_nodes.
+    Seeds are always included first, then neighbors expand outward.
+    """
+    visited = list(seed_nodes)   # Seeds always included
+    frontier = set(seed_nodes)
+    while len(visited) < max_sub_nodes:
+        next_frontier = set()
+        for node in frontier:
+            for neighbor in G.neighbors(node):
+                if neighbor not in set(visited):
+                    next_frontier.add(neighbor)
+        if not next_frontier:
+            break
+        # Sort by edge weight (most visually similar neighbors first).
+        # Use default=0 so nodes with no direct seed edge (e.g. backbone-only
+        # neighbours) don't crash max() with an empty sequence.
+        ranked = sorted(
+            next_frontier,
+            key=lambda n: max(
+                (G[n][s].get('weight', 0) for s in seed_nodes if G.has_edge(n, s)),
+                default=0,
+            ),
+            reverse=True
+        )
+        for node in ranked:
+            if len(visited) >= max_sub_nodes:
+                break
+            visited.append(node)
+        frontier = set(ranked[:len(ranked)])
+    return sorted(visited)  # Sorted for deterministic temporal ordering
+
+def sample_subgraph_ppr(G, seed_nodes, extra_neighbors=10, alpha=0.85):
+    """
+    Samples a subgraph anchored at seed_nodes using Personalized PageRank.
+    Guarantees ALL seed_nodes are included, plus extra_neighbors top PPR nodes.
+    """
+    if hasattr(seed_nodes, 'tolist'):
+        seed_nodes = seed_nodes.tolist()
+    seed_set = set(seed_nodes)
+    num_seeds = len(seed_set)
+    if num_seeds == 0:
+        return []
+
+    # 1. Define personalization dict: 1.0/K for seed nodes, 0.0 for all others
+    personalization = {
+        node: (1.0 / num_seeds if node in seed_set else 0.0) 
+        for node in G.nodes()
+    }
+
+    # 2. Compute Personalized PageRank scores
+    ppr_scores = nx.pagerank(
+        G, 
+        alpha=alpha, 
+        personalization=personalization, 
+        weight='weight',
+        max_iter=100,
+        tol=1e-4
+    )
+
+    # 3. Rank all nodes by PPR score descending
+    ranked_nodes = sorted(ppr_scores.keys(), key=lambda n: ppr_scores[n], reverse=True)
+
+    # 4. Guarantee ALL seed_nodes are included, plus top extra_neighbors
+    sub_nodes_set = set(seed_nodes)
+    for n in ranked_nodes:
+        if len(sub_nodes_set) >= len(seed_set) + extra_neighbors:
+            break
+        sub_nodes_set.add(n)
+
+    return sorted(list(sub_nodes_set))
+
+def get_graph_importance_weights(seed_local_pos, seed_probs, A_norm, S):
+    """
+    Uses graph diffusion to compute an importance weight for each seed.
+    Returns detached weights to scale the DPO loss.
+    """
+    with torch.no_grad():
+        # 1. Initialize the subgraph
+        p = seed_probs.mean().expand(S).clone().to(seed_probs.dtype)
+        p[seed_local_pos] = seed_probs
+        
+        A_norm_dev = A_norm.to(device=seed_probs.device, dtype=seed_probs.dtype)
+        
+        # 2. One-step diffusion to get the neighborhood consensus
+        p_diffused = torch.matmul(A_norm_dev, p)
+        
+        # 3. Extract just the seeds
+        orig_seeds = p[seed_local_pos]
+        diffused_seeds = p_diffused[seed_local_pos]
+        
+        # 4. The IS Ratio (Graph Consensus / VLM Original)
+        # If the graph expects a higher score than the VLM produced, weight > 1
+        weights =  orig_seeds / (diffused_seeds + 1e-8)
+        
+    return weights
 
 def train_graph_dpo(args):
-    vlm_vars = load_vlm(args.model_path, args.model_type, device, load_in_4bit=args.load_in_4bit)
+    # Load VLM
+    vlm_vars = load_vlm(args.model_path, args.model_type, device)
     wrapper_or_model, tokenizer, processor, yes_id, no_id = vlm_vars
     model = wrapper_or_model.model if args.model_type == "qwen" else wrapper_or_model
-
+    
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
     h5_paths = {
@@ -529,267 +318,377 @@ def train_graph_dpo(args):
             splits = json.load(f)
         print(f"Loaded {len(splits)} splits from {args.split_file}")
 
+    eval_split_metrics = {}
+
     if args.dataset == 'tvsum':
         tvsum_user_scores = get_gt('TVSum')
         print("TVSum GT Loaded")
     else:
         tvsum_user_scores = None
 
-    # Fully freeze the VLM — no LoRA, no gradient updates
-    print("Fully freezing VLM (no LoRA adapter, no gradient updates)...")
+    print("Freezing base model & use LoRA for fine-tuning ...")
     model.requires_grad_(False)
-    model.eval()
+
+    lora_config = LoraConfig(
+            r=8,
+            lora_alpha=16,
+            target_modules=["q_proj", "v_proj", "k_proj", "o_proj"],
+            lora_dropout=0.05,
+            bias="none",
+            task_type="CAUSAL_LM"
+    )
 
     for split_idx, split in enumerate(splits):
         print(f"\n==================== SPLIT {split_idx+1}/{len(splits)} ====================")
-
-        # Training dataset
-        train_dataset = GraphDPODataset(
-            dataset_name=args.dataset,
-            split_idx=split_idx,
-            processor=processor,
-            root_dir=args.root_dir,
-            clip_length=args.clip_length,
-        )
-
-        # VLM score caching (load from disk if available)
-        cache_dir = os.path.join(args.root_dir, "dpo_data")
-        os.makedirs(cache_dir, exist_ok=True)
-        cache_path = os.path.join(cache_dir, f"ref_scores_{args.dataset}_split_{split_idx}.pkl")
-
-        if os.path.exists(cache_path):
-            print(f"Loading cached VLM scores from {cache_path}...")
-            with open(cache_path, 'rb') as f:
-                vlm_cache = pickle.load(f)
-        else:
-            vlm_cache = precache_vlm_scores(model, train_dataset, yes_id, no_id, device)
-            with open(cache_path, 'wb') as f:
-                pickle.dump(vlm_cache, f)
-            print(f"Saved VLM score cache to {cache_path}.")
-
-        # Infer visual feature dimension from the h5 file
-        first_key = train_dataset.train_keys[0]
-        feat_dim = int(np.array(train_dataset.video_data[first_key + '/features']).shape[-1])
-        gnn_in_channels = feat_dim + 1          # normalized visual feat + VLM prob
-
-        print(f"Visual feature dim: {feat_dim}  |  GNN input dim: {gnn_in_channels}")
-
-        # Build policy GNN (the only trainable module)
-        gat_model = GATScorePropagator(
-            in_channels=gnn_in_channels,
-            hidden_channels=args.gnn_hidden,
-            num_heads=args.gnn_heads,
-            num_layers=args.gnn_layers,
-            gnn_type=args.gnn_type,
-            dropout=args.gnn_dropout,
-        ).to(device)
-
-        # Build reference GNN: frozen deep-copy of the initial policy GNN.
-        # DPO formulation: pi_ref = initial GNN weights (before any training).
-        # Backprop flows only through gat_model (policy), never gat_ref_model.
-        gat_ref_model = copy.deepcopy(gat_model)
-        gat_ref_model.requires_grad_(False)
-        gat_ref_model.eval()
-
-        trainable_params = sum(p.numel() for p in gat_model.parameters() if p.requires_grad)
-        print(f"GNN ({args.gnn_type.upper()}) trainable parameters: {trainable_params:,}")
-
-        # Optimizer: GNN parameters only — VLM is untouched
-        optimizer = optim.AdamW(
-            gat_model.parameters(),
-            lr=args.gnn_lr,
-            weight_decay=args.weight_decay,
-        )
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer, T_max=args.num_epochs, eta_min=1e-6
-        )
-
-        # Validation / Test datasets
+        
+        peft_model = get_peft_model(model, lora_config)
+        peft_model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+        peft_model.print_trainable_parameters()
+        
+        optimizer = optim.AdamW(peft_model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.num_epochs, eta_min=1e-6)
+        
+        # --- Datasets and Dataloaders ---
         if args.dataset == 'summe':
-            val_dataset  = SumMeLLaMA_VideoDataset(mode='test', split_idx=split_idx, clip_length=args.clip_length * args.batch_size, processor=processor, load_test=False)
+            train_dataset = SumMeLLaMA_DPODataset(split_idx=split_idx, clip_length=args.clip_length, processor=processor, load_test=False)
+            val_dataset = SumMeLLaMA_VideoDataset(mode='test', split_idx=split_idx, clip_length=args.clip_length * args.batch_size, processor=processor, load_test=False)
             test_dataset = SumMeLLaMA_VideoDataset(mode='test', split_idx=split_idx, clip_length=args.clip_length * args.batch_size, processor=processor, load_test=True)
-        else:
-            val_dataset  = TVSumLLaMA_VideoDataset(mode='test', split_idx=split_idx, clip_length=args.clip_length * args.batch_size, processor=processor, load_test=False)
+
+        elif args.dataset == 'tvsum':
+            train_dataset = TVSumLLaMA_DPODataset(split_idx=split_idx, clip_length=args.clip_length, processor=processor, load_test=False)
+            val_dataset = TVSumLLaMA_VideoDataset(mode='test', split_idx=split_idx, clip_length=args.clip_length * args.batch_size, processor=processor, load_test=False)
             test_dataset = TVSumLLaMA_VideoDataset(mode='test', split_idx=split_idx, clip_length=args.clip_length * args.batch_size, processor=processor, load_test=True)
 
-        train_collator = GraphDPOTrainBatchCollator()
-        val_collator   = ValBatchCollator(processor=processor)
+        else:
+            raise NotImplementedError(f"Dataset {args.dataset} not implemented.")
+
+        train_collator = DPOTrainBatchCollator(processor=processor)
+        val_collator = ValBatchCollator(processor=processor)
 
         train_loader = DataLoader(
-            train_dataset, batch_size=args.batch_size, shuffle=True,
-            collate_fn=train_collator, num_workers=0, pin_memory=True,
-        )
-        test_loader = DataLoader(
-            test_dataset, batch_size=1, shuffle=False,
-            collate_fn=val_collator, num_workers=0, pin_memory=True,
+            train_dataset,
+            batch_size=args.batch_size, # Number of videos per batch
+            shuffle=True,
+            collate_fn=train_collator,
+            num_workers=0,
+            pin_memory=True
         )
 
-        writer = SummaryWriter(f"runs/graph_dpo_{args.dataset}_{split_idx}_{timestamp}")
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=1, 
+            shuffle=False,
+            collate_fn=val_collator, 
+            num_workers=0,
+            pin_memory=True
+        )
+
+        test_loader = DataLoader(
+            test_dataset,
+            batch_size=1, 
+            shuffle=False,
+            collate_fn=val_collator, 
+            num_workers=0,
+            pin_memory=True
+        )
+       
+        writer = SummaryWriter(f"runs/graph_{args.dataset}_{split_idx}_{timestamp}")
         writer.add_text(
             "hyperparameters",
-            "|param|value|\n|-|-|\n%s" % (
-                "\n".join([f"|{key}|{value}|" for key, value in vars(args).items()])
-            ),
+            "|param|value|\n|-|-|\n%s" % ("\n".join([f"|{key}|{value}|" for key, value in vars(args).items()])),
         )
 
         best_corr = -float('inf')
+        save_path = None
 
         for epoch in tqdm(range(args.num_epochs), desc="Graph DPO Training.."):
-            epoch_loss  = 0.0
+            epoch_loss = 0.0
             num_batches = 0
 
             # Diagnostic accumulators
             diag = {
-                'pi_ratio': [], 'ref_ratio': [], 'logits': [], 'margin': [],
-                'correct': 0, 'total': 0, 'loss': [],
+                'loss': [],
+                # Probability-space separation
+                'chosen_prob': [], 'rejected_prob': [], 'prob_gap': [],
+                'pairwise_acc': 0, 'total': 0,
+                # Batch-level correlation (direct eval proxy)
+                'batch_tau': [], 'batch_rho': [],
+                # Distribution health
+                'pred_std': [],
+                # Policy vs reference calibration
+                'policy_chosen_delta': [], 'policy_rejected_delta': [],
             }
 
-            gat_model.train()
-
             for step, batch_data in enumerate(train_loader):
-                video_names  = batch_data["video_name"]
-                log_margin   = batch_data["log_margin"]   # list[Tensor] — variable length per video
-                chosen_idx   = batch_data["chosen_idx"]
-                rejected_idx = batch_data["rejected_idx"]
-                features     = batch_data["features"]
-                picks        = batch_data["picks"]
+                titles = batch_data.pop("title")
+                video_names = batch_data.pop("video_name")
+                c_gtscore = batch_data.pop("chosen_gt").to(device)
+                r_gtscore = batch_data.pop("rejected_gt").to(device)
+        
+                c_batch_data = batch_data.pop("chosen_inputs").to(device)
+                r_batch_data = batch_data.pop("rejected_inputs").to(device)
+
+                log_margin = batch_data.pop("log_margin").to(device)
+
+                chosen_idx = batch_data.pop("chosen_idx")
+                rejected_idx = batch_data.pop("rejected_idx")
+                full_features = batch_data.pop("features")
+                picks = batch_data.pop("picks")
+
+                # ── 1. Reference Logps (LoRA Disabled) ──
+                peft_model.eval()
+                with peft_model.disable_adapter():
+                    with torch.no_grad():
+                        ref_c_logits = peft_model.base_model(c_batch_data).logits[:, -1, :]
+                        ref_r_logits = peft_model.base_model(r_batch_data).logits[:, -1, :]
+                        
+                        ref_p_c = F.softmax(
+                            torch.stack([ref_c_logits[:, yes_id], ref_c_logits[:, no_id]], dim=-1), dim=-1
+                        )[:, 0]
+                        ref_p_r = F.softmax(
+                            torch.stack([ref_r_logits[:, yes_id], ref_r_logits[:, no_id]], dim=-1), dim=-1
+                        )[:, 0]
+
+                # ── 2.  Policy Logps (LoRA Enabled)
+                peft_model.train()
+                c_logits = peft_model.base_model(c_batch_data).logits[:, -1, :]
+                r_logits = peft_model.base_model(r_batch_data).logits[:, -1, :]
+
+                pi_p_c = F.softmax(torch.stack([c_logits[:, yes_id], c_logits[:, no_id]], dim=-1),dim=-1)[:, 0]
+                pi_p_r = F.softmax(torch.stack([r_logits[:, yes_id], r_logits[:, no_id]], dim=-1),dim=-1)[:, 0]
+
+                # ── 3. Temporal Video Graph Importance Sampling Logic
+                c_weights_list, r_weights_list = [], []
+
+                offset = 0
+                for i in range(len(video_names)):
+                    G = build_video_graph(full_features[i], picks[i])  # Full graph
+                    
+                    c_seeds, r_seeds = chosen_idx[i], rejected_idx[i]
+
+                    K_c = len(c_seeds)
+                    K_r = len(r_seeds)
+
+                    c_sub_nodes = sample_subgraph(G, seed_nodes=c_seeds, max_sub_nodes=10) 
+                    r_sub_nodes = sample_subgraph(G, seed_nodes=r_seeds, max_sub_nodes=10)
+                    
+                    # Seed positions within the sampled subgraph
+                    c_seed_pos = [c_sub_nodes.index(j) for j in c_seeds]
+                    r_seed_pos = [r_sub_nodes.index(j) for j in r_seeds]
+
+                    c_sub_feats = full_features[i][c_sub_nodes].to(device)
+                    r_sub_feats = full_features[i][r_sub_nodes].to(device)
+                    
+                    # --- Build Normalized Adjacency Matrices ---
+                    c_feats_norm = F.normalize(c_sub_feats, p=2, dim=1)
+                    c_sim = torch.matmul(c_feats_norm, c_feats_norm.T)
+                    c_adj = torch.where(c_sim > 0.9, c_sim, torch.zeros_like(c_sim))
+                    c_A_norm = c_adj / (c_adj.sum(dim=1, keepdim=True) + 1e-8)
+                    
+                    r_feats_norm = F.normalize(r_sub_feats, p=2, dim=1)
+                    r_sim = torch.matmul(r_feats_norm, r_feats_norm.T)
+                    r_adj = torch.where(r_sim > 0.9, r_sim, torch.zeros_like(r_sim))
+                    r_A_norm = r_adj / (r_adj.sum(dim=1, keepdim=True) + 1e-8)
+                    
+                    S_c = c_sub_feats.size(0)
+                    S_r = r_sub_feats.size(0)
+
+                    # Extract the pure VLM probabilities for this specific video
+                    cur_pi_c  = pi_p_c[offset : offset + K_c]
+                    cur_pi_r  = pi_p_r[offset : offset + K_r]
+                    offset += K_c
+
+                    # ── Calculate Importance Weights ──
+                    c_weights = get_graph_importance_weights(c_seed_pos, cur_pi_c, c_A_norm, S_c)
+                    c_weights_list.append(c_weights)
+
+                    r_weights = get_graph_importance_weights(r_seed_pos, cur_pi_r, r_A_norm, S_r)
+                    r_weights_list.append(r_weights)
+                
+                pi_logp_c, pi_logp_r  = torch.log(pi_p_c + 1e-8), torch.log(pi_p_r + 1e-8)
+                ref_logp_c, ref_logp_r = torch.log(ref_p_c + 1e-8), torch.log(ref_p_r + 1e-8)
+
+                pi_ratio = pi_logp_c - pi_logp_r
+                ref_ratio = ref_logp_c - ref_logp_r
+                logits = pi_ratio - ref_ratio
+
+                batch_c_weights = torch.cat(c_weights_list)
+                batch_r_weights = torch.cat(r_weights_list)
+                importance_weights = batch_c_weights / (batch_r_weights + 1e-8)
+                importance_weights = torch.clamp(importance_weights, min=0.1, max=5.0)
+
+                loss = -F.logsigmoid(args.beta * (logits - log_margin.reshape(logits.shape)))
+                loss =  (loss * importance_weights).mean()
+
+                track_loss = -F.logsigmoid((logits - log_margin.reshape(logits.shape))).mean()
+
+                binary_probs = F.softmax(torch.stack([c_logits[:, yes_id], c_logits[:, no_id]], dim=-1), dim=-1)
+                preds = binary_probs[:, 0]
+                mse_loss = F.mse_loss(preds, c_gtscore.reshape(preds.shape))
+
+                # Track diagnostics
+                diag['loss'].append(track_loss.item())
+
+                with torch.no_grad():
+                    # Cast to float32 — numpy does not support BFloat16
+                    pc = torch.exp(pi_logp_c).detach().cpu().float()
+                    pr = torch.exp(pi_logp_r).detach().cpu().float()
+                    rc = torch.exp(ref_logp_c).detach().cpu().float()
+                    rr = torch.exp(ref_logp_r).detach().cpu().float()
+                    gt_c = c_gtscore.reshape(pc.shape).detach().cpu().float()
+                    gt_r = r_gtscore.reshape(pr.shape).detach().cpu().float()
+
+                    diag['chosen_prob'].append(pc.mean().item())
+                    diag['rejected_prob'].append(pr.mean().item())
+                    diag['prob_gap'].append((pc - pr).mean().item())
+                    diag['pairwise_acc'] += (pc > pr).sum().item()
+                    diag['total'] += pc.size(0)
+                    diag['pred_std'].append(torch.cat([pc, pr]).std().item())
+                    diag['policy_chosen_delta'].append((pc - rc).mean().item())
+                    diag['policy_rejected_delta'].append((pr - rr).mean().item())
+
+                    # Batch-level Kendall τ / Spearman ρ — direct proxy for eval metric
+                    all_preds = torch.cat([pc, pr]).numpy()
+                    all_gt    = torch.cat([gt_c, gt_r]).numpy()
+                    if all_preds.std() > 1e-4:
+                        tau, _ = kendalltau(all_preds, all_gt)
+                        rho, _ = spearmanr(all_preds, all_gt)
+                        diag['batch_tau'].append(float(tau))
+                        diag['batch_rho'].append(float(rho))
 
                 optimizer.zero_grad()
-                batch_step_loss       = []
-                batch_step_track_loss = []
-
-                current_batch_size = len(video_names)
-                for b in range(current_batch_size):
-                    v_name         = video_names[b]
-                    v_chosen_idx   = chosen_idx[b].to(device)
-                    v_rejected_idx = rejected_idx[b].to(device)
-                    v_features     = features[b].to(device=device, dtype=torch.float32)
-                    v_picks        = picks[b].to(device)
-
-                    # 1. Load cached VLM probs — no VLM forward pass needed during training
-                    vlm_probs = torch.tensor(
-                        vlm_cache[v_name], dtype=torch.float32, device=device
-                    )                                                       # [N]
-
-                    # 2. Build visual-temporal graph
-                    W_base, backbone_mask = build_adjacency_matrix_pytorch(
-                        v_features, v_picks, window_size=15, device=device
-                    )
-                    edge_index = build_edge_index(W_base, backbone_mask, device=device)
-
-                    # 3. Build node features: L2-normalized visual feat || VLM prob
-                    node_feats = build_node_features(v_features, vlm_probs)     # [N, D+1]
-
-                    # 4. Policy GNN forward — backpropagation flows entirely here
-                    pi_propagated = gat_model(node_feats, edge_index).squeeze(-1)   # [N]
-
-                    # 5. Reference GNN forward — frozen initial weights, no gradient
-                    with torch.no_grad():
-                        ref_propagated = gat_ref_model(node_feats, edge_index).squeeze(-1)  # [N]
-
-                    # 6. Log-probabilities at chosen / rejected frame positions
-                    pi_logp_c  = torch.log(pi_propagated[v_chosen_idx]   + 1e-8)
-                    pi_logp_r  = torch.log(pi_propagated[v_rejected_idx]  + 1e-8)
-                    ref_logp_c = torch.log(ref_propagated[v_chosen_idx]  + 1e-8)
-                    ref_logp_r = torch.log(ref_propagated[v_rejected_idx] + 1e-8)
-
-                    # 7. Margin-DPO loss
-                    pi_ratio     = pi_logp_c  - pi_logp_r
-                    ref_ratio    = ref_logp_c - ref_logp_r
-                    logits_v     = pi_ratio   - ref_ratio
-                    v_log_margin = log_margin[b].to(device)
-
-                    loss_v       = -F.logsigmoid(args.beta * (logits_v - v_log_margin)).mean()
-                    track_loss_v = -F.logsigmoid(logits_v - v_log_margin).mean()
-
-                    batch_step_loss.append(loss_v)
-                    batch_step_track_loss.append(track_loss_v.item())
-
-                    # Accumulate diagnostics
-                    diag['loss'].append(track_loss_v.item())
-                    diag['pi_ratio'].append(pi_ratio.mean().item())
-                    diag['ref_ratio'].append(ref_ratio.mean().item())
-                    diag['logits'].append(logits_v.mean().item())
-                    diag['margin'].append(v_log_margin.mean().item())
-                    diag['correct'] += (logits_v > v_log_margin).sum().item()
-                    diag['total']   += logits_v.size(0)
-
-                # Average loss over batch items  —  backward through GNN only
-                loss = torch.stack(batch_step_loss).mean()
                 loss.backward()
-                torch.nn.utils.clip_grad_norm_(gat_model.parameters(), max_norm=1.0)
                 optimizer.step()
 
-                epoch_loss  += np.mean(batch_step_track_loss)
+                epoch_loss += track_loss.item()
                 num_batches += 1
 
-            # Epoch diagnostics
-            acc = diag['correct'] / diag['total'] * 100
-            print(f"\n{'='*70}")
-            print(f"EPOCH {epoch+1} DIAGNOSTICS (GRAPH-DPO / {args.gnn_type.upper()}):")
-            print(f"{'='*70}")
-            print(f"  Total Loss:                          {np.mean(diag['loss']):.4f}")
-            print(f"  Preference Accuracy (logits>margin): {diag['correct']}/{diag['total']} ({acc:.1f}%)")
-            print(f"  pi(c)-pi(r) (pi_ratio):  {np.mean(diag['pi_ratio']):.4f} +/- {np.std(diag['pi_ratio']):.4f}")
-            print(f"  mu(c)-mu(r) (ref_ratio): {np.mean(diag['ref_ratio']):.4f} +/- {np.std(diag['ref_ratio']):.4f}")
-            print(f"  DPO logits (pi-ref):     {np.mean(diag['logits']):.4f} +/- {np.std(diag['logits']):.4f}")
-            print(f"  GT margin (target):      {np.mean(diag['margin']):.4f} +/- {np.std(diag['margin']):.4f}")
-            print(f"{'='*70}")
+            pair_acc = diag['pairwise_acc'] / max(1, diag['total']) * 100
+            print(f"\n{'═'*70}")
+            print(f"EPOCH {epoch+1} DIAGNOSTICS:")
+            print(f"{'═'*70}")
+            print(f"  Loss              : {np.mean(diag['loss']):.4f}")
+            print(f"")
+            print(f"  ── Separation (prob space) ──────────────────────────────────")
+            print(f"  Chosen  prob mean : {np.mean(diag['chosen_prob']):.4f}  (↑ good)")
+            print(f"  Rejected prob mean: {np.mean(diag['rejected_prob']):.4f}  (↓ good)")
+            print(f"  Prob gap (c-r)    : {np.mean(diag['prob_gap']):.4f} ± {np.std(diag['prob_gap']):.4f}  (↑ good)")
+            print(f"  Pairwise Acc      : {diag['pairwise_acc']}/{diag['total']} ({pair_acc:.1f}%)  (target >50%)")
+            print(f"")
+            print(f"  ── Batch Correlation (eval proxy) ──────────────────────────")
+            if diag['batch_tau']:
+                print(f"  Batch Kendall τ   : {np.mean(diag['batch_tau']):.4f} ± {np.std(diag['batch_tau']):.4f}")
+                print(f"  Batch Spearman ρ  : {np.mean(diag['batch_rho']):.4f} ± {np.std(diag['batch_rho']):.4f}")
+            else:
+                print(f"  Batch τ/ρ         : N/A (predictions collapsed — pred_std too low)")
+            print(f"")
+            print(f"  ── Distribution Health ─────────────────────────────────────")
+            print(f"  Pred std          : {np.mean(diag['pred_std']):.4f}  (<0.01 = collapsed)")
+            print(f"  Policy Δ chosen   : {np.mean(diag['policy_chosen_delta']):+.4f}  (+ = improved over ref)")
+            print(f"  Policy Δ rejected : {np.mean(diag['policy_rejected_delta']):+.4f}  (- = suppressed vs ref)")
+            print(f"{'═'*70}")
 
+            # Log metrics to tensorboard
             avg_epoch_loss = epoch_loss / num_batches
             writer.add_scalar("Train/loss", avg_epoch_loss, epoch)
             writer.add_scalar("Train/learning_rate", scheduler.get_last_lr()[0], epoch)
+            writer.add_scalar("Train/chosen_prob", np.mean(diag['chosen_prob']), epoch)
+            writer.add_scalar("Train/rejected_prob", np.mean(diag['rejected_prob']), epoch)
+            writer.add_scalar("Train/prob_gap", np.mean(diag['prob_gap']), epoch)
+            writer.add_scalar("Train/pairwise_acc", pair_acc, epoch)
+            writer.add_scalar("Train/pred_std", np.mean(diag['pred_std']), epoch)
+            writer.add_scalar("Train/policy_chosen_delta", np.mean(diag['policy_chosen_delta']), epoch)
+            writer.add_scalar("Train/policy_rejected_delta", np.mean(diag['policy_rejected_delta']), epoch)
+            if diag['batch_tau']:
+                writer.add_scalar("Train/batch_kendall_tau", np.mean(diag['batch_tau']), epoch)
+                writer.add_scalar("Train/batch_spearman_rho", np.mean(diag['batch_rho']), epoch)
             scheduler.step()
 
-            # Validation
+            # ================= VALIDATION BLOCK =================
+            # Evaluate every epochs, or on the final epoch
             if (epoch + 1) % 1 == 0 or epoch == args.num_epochs - 1:
                 print("--> Running Validation...")
-                val_df = evaluate(
-                    model=model,
-                    gat_model=gat_model,
-                    val_loader=test_loader,
-                    dataset_name=args.dataset,
+
+                # Clear training gradients and cached allocations before eval
+                optimizer.zero_grad(set_to_none=True)
+
+                val_df = evaluate_graph(
+                    model=peft_model, 
+                    val_loader=test_loader, 
+                    dataset_name=args.dataset, 
                     h5_paths=h5_paths,
-                    tvsum_user_scores=tvsum_user_scores,
                     yes_id=yes_id,
                     no_id=no_id,
+                    tvsum_user_scores=tvsum_user_scores
                 )
-                mean_f   = val_df['f_score'].mean()
-                mean_tau = val_df['kendall'].mean()
-                mean_rho = val_df['spearman'].mean()
-                mean_corr = (mean_tau + mean_rho) / 2.0
-                print(f"[Epoch {epoch+1}] Val Results | F-Score: {mean_f:.4f} | Tau: {mean_tau:.4f} | Rho: {mean_rho:.4f} | Corr: {mean_corr:.4f}")
+                
+                if not val_df.empty:
+                    avg_f1 = val_df['f_score'].mean()
+                    avg_tau = val_df['kendall'].mean()
+                    avg_rho = val_df['spearman'].mean()
+                    print(f"\n[Split {split_idx+1}] Val Epoch {epoch+1} | F-Score: {avg_f1:.4f} | Tau: {avg_tau:.4f} | Rho: {avg_rho:.4f}")
+                    
+                    writer.add_scalar("Val/F-Score", avg_f1, epoch)
+                    writer.add_scalar("Val/Kendall_Tau", avg_tau, epoch)
+                    writer.add_scalar("Val/Spearman_Rho", avg_rho, epoch)
 
-                writer.add_scalar("Val/f_score",  mean_f,    epoch)
-                writer.add_scalar("Val/kendall",  mean_tau,  epoch)
-                writer.add_scalar("Val/spearman", mean_rho,  epoch)
-                writer.add_scalar("Val/corr",     mean_corr, epoch)
+                    current_corr = avg_tau + avg_rho
+                    if current_corr > best_corr:
+                        best_corr = current_corr
+                        save_path = os.path.join(args.output_dir, f"{args.dataset}_graph_{timestamp}_best_dpo_split{split_idx}.pth")
+                        os.makedirs(args.output_dir, exist_ok=True)
+                        peft_model.save_pretrained(save_path)
+                        print(f"Saved LoRA weights to {save_path}")
 
-                # Checkpoint: save GNN when mean correlation (tau+rho)/2 improves
-                if mean_corr > best_corr:
-                    best_corr = mean_corr
-                    checkpoint_dir = (
-                        f"./checkpoints/graph_dpo_{args.dataset}_split{split_idx}_{timestamp}"
-                    )
-                    os.makedirs(checkpoint_dir, exist_ok=True)
-                    torch.save(
-                        {
-                            'gat_state_dict':  gat_model.state_dict(),
-                            'gnn_type':        args.gnn_type,
-                            'gnn_in_channels': gnn_in_channels,
-                            'gnn_hidden':      args.gnn_hidden,
-                            'gnn_heads':       args.gnn_heads,
-                            'gnn_layers':      args.gnn_layers,
-                            'epoch':           epoch,
-                            'corr':            best_corr,
-                            'f_score':         mean_f,
-                        },
-                        os.path.join(checkpoint_dir, 'gat_model.pt'),
-                    )
-                    print(f"[CHECKPOINT] Saved GNN -> {checkpoint_dir}  (Corr: {best_corr:.4f} | F: {mean_f:.4f})")
+        print(f"Finished Split {split_idx+1}. Best Correlation: {best_corr:.4f}\n")
 
-        writer.close()
+        # ================= FINAL TEST BLOCK =================
+        print(f"--> Running Final Test for Split {split_idx+1}...")
 
+        # Load the best saved model for testing
+        if save_path and os.path.exists(save_path):
+            peft_model = PeftModel.from_pretrained(model, save_path)
+            peft_model.to(device)
+            print(f"Loaded best LORA checkpoint from {save_path}")
+
+        test_df = evaluate_graph(
+            model=peft_model,
+            val_loader=test_loader,
+            dataset_name=args.dataset,
+            h5_paths=h5_paths,
+            yes_id=yes_id,
+            no_id=no_id,
+            tvsum_user_scores=tvsum_user_scores
+        )
+
+        if not test_df.empty:
+            test_f1 = test_df['f_score'].mean()
+            test_tau = test_df['kendall'].mean()
+            test_rho = test_df['spearman'].mean()
+            print(f"\n[Split {split_idx+1}] Test | F-Score: {test_f1:.4f} | Tau: {test_tau:.4f} | Rho: {test_rho:.4f}\n")
+            
+            # Log test scores to tensorboard (logged at step = split_idx so you can see across splits)
+            writer.add_scalar("Test/F-Score", test_f1, split_idx)
+            writer.add_scalar("Test/Kendall_Tau", test_tau, split_idx)
+            writer.add_scalar("Test/Spearman_Rho", test_rho, split_idx)
+
+            eval_split_metrics[split_idx] = {}
+            eval_split_metrics[split_idx]['f_score'] = test_f1
+            eval_split_metrics[split_idx]['kendall'] = test_tau
+            eval_split_metrics[split_idx]['spearman'] = test_rho
+    
+    if eval_split_metrics:
+        print("\n" + "═"*60)
+        print(f"FINAL GLOBAL BENCHMARK SUMMARY ({len(splits)} SPLITS)")
+        print("═"*60)
+
+        # Calculate averages across all processed splits
+        avg_overall_f1 = np.mean([m['f_score'] for m in eval_split_metrics.values()])
+        avg_overall_tau = np.mean([m['kendall'] for m in eval_split_metrics.values()])
+        avg_overall_rho = np.mean([m['spearman'] for m in eval_split_metrics.values()])
+        print(f"Global Avg | F1: {avg_overall_f1:.4f} | Kendall: {avg_overall_tau:.4f} | Spearman: {avg_overall_rho:.4f}")
+
+    writer.close()
 
 def resolve_model_path(mtype):
     if mtype == "qwen": return "Qwen/Qwen3.5-9B"
@@ -798,39 +697,26 @@ def resolve_model_path(mtype):
         if os.path.exists(p): return p
     return "openbmb/MiniCPM-V-2_6"
 
-
-def main():
-    parser = argparse.ArgumentParser(
-        description="Graph-DPO: Train a GAT/GATv2 score propagator on a fully frozen VLM."
-    )
-    # Model / data
-    parser.add_argument("--model_type",   type=str,   default="minicpm", choices=["minicpm", "qwen"])
-    parser.add_argument("--dataset",      type=str,   default="summe",   choices=["summe", "tvsum"])
-    parser.add_argument("--split_file",   type=str,   default="./dataset/summe_splits.json")
-    parser.add_argument("--root_dir",     type=str,   default=".")
-    parser.add_argument("--load_in_4bit", action="store_true",
-                        help="Load VLM in 4-bit quantization (saves VRAM; VLM stays frozen).")
-    # Training
-    parser.add_argument("--num_epochs",   type=int,   default=10)
-    parser.add_argument("--batch_size",   type=int,   default=2,    help="Videos per training step.")
-    parser.add_argument("--clip_length",  type=int,   default=4,    help="Sampled frames per clip.")
-    parser.add_argument("--beta",         type=float, default=0.5,  help="DPO beta coefficient.")
-    parser.add_argument("--weight_decay", type=float, default=1e-5)
-    # GNN hyperparameters
-    parser.add_argument("--gnn_type",    type=str,   default="gatv2", choices=["gat", "gatv2"],
-                        help="Graph attention variant.")
-    parser.add_argument("--gnn_hidden",  type=int,   default=64,
-                        help="Total hidden dim per layer (divisible by gnn_heads).")
-    parser.add_argument("--gnn_heads",   type=int,   default=4,    help="Number of attention heads.")
-    parser.add_argument("--gnn_layers",  type=int,   default=2,    help="Number of GAT conv layers.")
-    parser.add_argument("--gnn_lr",      type=float, default=5e-4, help="GNN learning rate.")
-    parser.add_argument("--gnn_dropout", type=float, default=0.1)
-
-    args = parser.parse_args()
-    args.model_path = resolve_model_path(args.model_type)
-
-    train_graph_dpo(args)
-
-
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--model_type", type=str, default="minicpm", choices=["minicpm", "qwen"])
+    parser.add_argument("--dataset", type=str, default="both", choices=["summe", "tvsum", "both"])
+    parser.add_argument("--root_dir", type=str, default=".")
+    parser.add_argument("--model_path", type=str, default=None)
+    parser.add_argument("--split_file", type=str, default="./dataset/summe_splits.json")
+    parser.add_argument("--output_dir", type=str, default="./checkpoints")
+    parser.add_argument("--num_epochs", type=int, default=5)
+    parser.add_argument("--learning_rate", type=float, default=1e-5)
+    parser.add_argument("--weight_decay", type=float, default=1e-5)
+
+    parser.add_argument('--batch_size', type=int, default=2, help='Batch size (number of videos per batch)')
+    parser.add_argument('--clip_length', type=int, default=4)
+    parser.add_argument("--accumulation_steps", type=int, default=8)
+    parser.add_argument("--beta", type=float, default=0.1)
+    parser.add_argument("--use_advanced_scoring", action="store_true", help="Use action based ranking")
+    args = parser.parse_args()
+    
+    if args.model_path is None:
+        args.model_path = resolve_model_path(args.model_type)
+    
+    train_graph_dpo(args)
