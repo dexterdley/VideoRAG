@@ -295,7 +295,9 @@ def train_dpo(args):
                 ref_ratio = ref_logp_c - ref_logp_r
                 logits = pi_ratio - ref_ratio
 
-                loss = -F.logsigmoid(args.beta * (logits - log_margin.reshape(logits.shape))).mean()
+                # loss = -F.logsigmoid(args.beta * (logits - log_margin.reshape(logits.shape))).mean()
+                loss = (args.beta * logits - (log_margin.reshape(logits.shape))).pow(2)
+                loss = loss.mean()
                 track_loss = -F.logsigmoid((logits - log_margin.reshape(logits.shape))).mean()
 
                 binary_probs = F.softmax(torch.stack([c_logits[:, yes_id], c_logits[:, no_id]], dim=-1), dim=-1)

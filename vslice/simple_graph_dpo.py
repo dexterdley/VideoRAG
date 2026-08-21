@@ -274,7 +274,7 @@ def sample_subgraph_ppr(G, seed_nodes, extra_neighbors=10, alpha=0.85):
 
     return sorted(list(sub_nodes_set))
 
-def get_graph_importance_weights(seed_local_pos, seed_probs, A_norm, S):
+def get_graph_policy(seed_local_pos, seed_probs, A_norm, S):
     """
     Uses graph diffusion to compute an importance weight for each seed.
     Returns detached weights to scale the DPO loss.
@@ -288,16 +288,9 @@ def get_graph_importance_weights(seed_local_pos, seed_probs, A_norm, S):
         
         # 2. One-step diffusion to get the neighborhood consensus
         p_diffused = torch.matmul(A_norm_dev, p)
-        
-        # 3. Extract just the seeds
-        orig_seeds = p[seed_local_pos]
         diffused_seeds = p_diffused[seed_local_pos]
         
-        # 4. The IS Ratio (Graph Consensus / VLM Original)
-        # If the graph expects a higher score than the VLM produced, weight > 1
-        weights =  orig_seeds / (diffused_seeds + 1e-8)
-        
-    return weights
+    return diffused_seeds
 
 def train_graph_dpo(args):
     # Load VLM
@@ -458,7 +451,7 @@ def train_graph_dpo(args):
                 pi_p_r = F.softmax(torch.stack([r_logits[:, yes_id], r_logits[:, no_id]], dim=-1),dim=-1)[:, 0]
 
                 # ── 3. Temporal Video Graph Importance Sampling Logic
-                c_weights_list, r_weights_list = [], []
+                c_pi_graph_list, r_pi_graph_list = [], []
 
                 offset = 0
                 for i in range(len(video_names)):
@@ -469,8 +462,8 @@ def train_graph_dpo(args):
                     K_c = len(c_seeds)
                     K_r = len(r_seeds)
 
-                    c_sub_nodes = sample_subgraph(G, seed_nodes=c_seeds, max_sub_nodes=10) 
-                    r_sub_nodes = sample_subgraph(G, seed_nodes=r_seeds, max_sub_nodes=10)
+                    c_sub_nodes = sample_subgraph(G, seed_nodes=c_seeds, max_sub_nodes=30) 
+                    r_sub_nodes = sample_subgraph(G, seed_nodes=r_seeds, max_sub_nodes=30)
                     
                     # Seed positions within the sampled subgraph
                     c_seed_pos = [c_sub_nodes.index(j) for j in c_seeds]
@@ -499,11 +492,11 @@ def train_graph_dpo(args):
                     offset += K_c
 
                     # ── Calculate Importance Weights ──
-                    c_weights = get_graph_importance_weights(c_seed_pos, cur_pi_c, c_A_norm, S_c)
-                    c_weights_list.append(c_weights)
+                    pi_graph_c = get_graph_policy(c_seed_pos, cur_pi_c, c_A_norm, S_c)
+                    c_pi_graph_list.append(pi_graph_c)
 
-                    r_weights = get_graph_importance_weights(r_seed_pos, cur_pi_r, r_A_norm, S_r)
-                    r_weights_list.append(r_weights)
+                    pi_graph_r = get_graph_policy(r_seed_pos, cur_pi_r, r_A_norm, S_r)
+                    r_pi_graph_list.append(pi_graph_r)
                 
                 pi_logp_c, pi_logp_r  = torch.log(pi_p_c + 1e-8), torch.log(pi_p_r + 1e-8)
                 ref_logp_c, ref_logp_r = torch.log(ref_p_c + 1e-8), torch.log(ref_p_r + 1e-8)
@@ -512,13 +505,15 @@ def train_graph_dpo(args):
                 ref_ratio = ref_logp_c - ref_logp_r
                 logits = pi_ratio - ref_ratio
 
-                batch_c_weights = torch.cat(c_weights_list)
-                batch_r_weights = torch.cat(r_weights_list)
-                importance_weights = batch_c_weights / (batch_r_weights + 1e-8)
+                batch_c_pi_graph = torch.cat(c_pi_graph_list)
+                batch_r_pi_graph = torch.cat(r_pi_graph_list)
+
+                importance_weights = batch_c_pi_graph/batch_r_pi_graph
                 importance_weights = torch.clamp(importance_weights, min=0.1, max=5.0)
 
-                loss = -F.logsigmoid(args.beta * (logits - log_margin.reshape(logits.shape)))
-                loss =  (loss * importance_weights).mean()
+                # loss = -F.logsigmoid(args.beta * (logits - log_margin.reshape(logits.shape) + importance_weights))
+                loss = (args.beta * logits - (log_margin.reshape(logits.shape) * importance_weights)).pow(2)
+                loss =  (loss).mean()
 
                 track_loss = -F.logsigmoid((logits - log_margin.reshape(logits.shape))).mean()
 
