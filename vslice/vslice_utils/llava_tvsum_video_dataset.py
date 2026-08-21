@@ -314,19 +314,30 @@ class TVSumLLaMA_DPODataset(Dataset):
 
         self.system_prompt = "You are an expert video editor. Strictly answer only Yes or No."
 
+        # Build sub-clips per video
+        self.preference_pairs = []
+        for video_name in self.train_keys:
+            gtscore = np.array(self.video_data[video_name + '/gtscore'])
+            vid_len = len(gtscore)
+            sub_clips = []
+
+            for start_idx in range(0, vid_len, self.clip_length):
+                end_idx = min(start_idx + self.clip_length, vid_len)
+                if end_idx - start_idx < self.clip_length:
+                    continue    
+                sub_scores = np.mean(gtscore[start_idx:end_idx])
+                sub_clips.append((video_name, start_idx, end_idx, sub_scores))
+
+            sub_clips.sort(key=lambda x: x[3], reverse=True)
+            mid = len(sub_clips) // 2
+            chosen = sub_clips[:mid]
+            rejected = sub_clips[mid:]
+
+            for c, r in zip(chosen, reversed(rejected)):
+                self.preference_pairs.append((c, r))
+
     def __len__(self):
-        return len(self.train_keys)
-
-    def _sample_frame_indices(self, total_frames):
-        """Sample frame indices for a clip"""
-        if self.random_sampling:
-            start_idx = np.random.randint(0, max(1, total_frames - self.clip_length * self.frame_stride))
-        else:
-            start_idx = max(0, (total_frames - self.clip_length * self.frame_stride) // 2)
-
-        frame_indices = start_idx + np.arange(self.clip_length) * self.frame_stride
-        frame_indices = np.minimum(frame_indices, total_frames - 1)
-        return frame_indices.tolist()
+        return len(self.preference_pairs)
 
     def _process_clip(self, frames, formatted_prompt):
         """Helper function to run the VLM processor over a list of PIL frames"""
@@ -362,7 +373,13 @@ class TVSumLLaMA_DPODataset(Dataset):
         return inputs
 
     def __getitem__(self, index):
-        video_name = self.train_keys[index]
+        chosen_clip, rejected_clip = self.preference_pairs[index]
+        video_name, chosen_start_idx, chosen_end_idx, chosen_sub_score = chosen_clip
+        _, rejected_start_idx, rejected_end_idx, rejected_sub_score = rejected_clip
+
+        chosen_idx = range(chosen_start_idx, chosen_end_idx)
+        rejected_idx = range(rejected_start_idx, rejected_end_idx)
+
         full_gtscore = torch.as_tensor(self.video_data[video_name + '/gtscore'])
         full_features = torch.as_tensor(self.video_data[video_name + '/features'], dtype=torch.float32)
         picks = np.array(self.video_data[video_name + '/picks'])
@@ -376,20 +393,6 @@ class TVSumLLaMA_DPODataset(Dataset):
         video_frames = load_video_from_picks(video_path, picks)
         total_frames = len(video_frames)
         formatted_prompt = f"Does this image show a key highlight from the video titled '{title}'?"
-
-        # 1. Sample two independent sets of frame indices
-        clip1_indices = self._sample_frame_indices(total_frames)
-        clip2_indices = self._sample_frame_indices(total_frames)
-
-        # 2. Calculate the average ground truth score for each clip
-        score1 = full_gtscore[clip1_indices].mean().item()
-        score2 = full_gtscore[clip2_indices].mean().item()
-
-        # 3. Assign higher-scoring clip to be 'chosen' and the lower to be 'rejected'
-        if score1 >= score2:
-            chosen_idx, rejected_idx = clip1_indices, clip2_indices
-        else:
-            chosen_idx, rejected_idx = clip2_indices, clip1_indices
 
         chosen_frames = [video_frames[i] for i in chosen_idx]
         rejected_frames = [video_frames[i] for i in rejected_idx]

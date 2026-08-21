@@ -19,15 +19,15 @@ def mock_summarize(video_file, prompt, progress=gr.Progress()):
     
     return video_file
 
-fig_misalignment = "results/fig1_misalignment_real.png"
-fig_reliability = "results/fig1_reliability_split.png"
-fig_bin_strength = "results/fig2_bin_strength.png"
-fig_posthoc = "results/fig4_posthoc_graph_failure.png"
+fig_misalignment = "./assets/fig1_misalignment_real.png"
+fig_reliability = "./assets/fig1_reliability_split.png"
+fig_bin_strength = "./assets/fig2_bin_strength.png"
+fig_posthoc = "./assets/fig4_posthoc_graph_failure.png"
 
 # Placeholders for example Videos
-video_example1 = "/mnt/c/Users/dexter.neo/Downloads/69118fe052fb155119d76733j1I4g7PP06.mp4"
-video_example2 = "/home/dex/Downloads/safe_1771730634.mp4"
-video_example3 = "/home/dex/Downloads/safe_1771730634.mp4"
+video_example1 = "./assets/69118fe052fb155119d76733j1I4g7PP06.mp4"
+video_example2 = "./assets/safe_1771730634.mp4"
+video_example3 = "./assets/safe_1771730634.mp4"
 
 def build_content(lang):
     if lang == "EN":
@@ -311,7 +311,7 @@ theme = gr.themes.Glass(
     button_secondary_border_color_dark="#334155",
 )
 
-with gr.Blocks() as demo:
+with gr.Blocks(theme=theme) as demo:
     demo.load(None, None, None)
     
     # Top right language toggle
@@ -346,4 +346,4 @@ with gr.Blocks() as demo:
     )
 
 if __name__ == "__main__":
-    demo.launch(theme=theme)
+    demo.launch()

@@ -552,7 +552,7 @@ def train_graph_dpo(args):
 
         best_corr = -float('inf')
         
-        for epoch in tqdm(range(args.num_epochs), desc="Graph DPO Training.."):
+        for epoch in range(args.num_epochs):
             epoch_loss = 0.0
             num_batches = 0
 

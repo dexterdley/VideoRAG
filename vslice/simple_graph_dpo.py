@@ -84,13 +84,12 @@ def evaluate_graph(model, val_loader, dataset_name, h5_paths, tvsum_user_scores=
     """
     Evaluates the model using the ValBatchCollator and applies graph label propagation on full-video predictions.
     """
+    all_preds = []
     split_results = []
     h5_path = h5_paths.get(dataset_name.lower())
     model.eval()
 
     torch.cuda.empty_cache()
-
-    all_preds = []
 
     with torch.inference_mode():
         for step, batch_data in enumerate(tqdm(val_loader, desc=f"Evaluating {dataset_name}", leave=False)):
@@ -117,9 +116,9 @@ def evaluate_graph(model, val_loader, dataset_name, h5_paths, tvsum_user_scores=
             binary_probs = F.softmax(torch.stack([yes_logits, no_logits], dim=-1), dim=-1)
             raw_preds = binary_probs[:, 0].cpu().float()
 
-            # Eagerly free GPU memory: forward-pass outputs and inputs are no longer needed
-            del outputs, logits, yes_logits, no_logits, binary_probs, batch_data
-            torch.cuda.empty_cache()
+            # Eagerly free up GPU memory
+            # del outputs, logits, yes_logits, no_logits, binary_probs, batch_data
+            # torch.cuda.empty_cache()
 
             yes_scores = raw_preds.numpy()
             all_preds.extend(yes_scores)
@@ -394,7 +393,7 @@ def train_graph_dpo(args):
         best_corr = -float('inf')
         save_path = None
 
-        for epoch in tqdm(range(args.num_epochs), desc="Graph DPO Training.."):
+        for epoch in range(args.num_epochs):
             epoch_loss = 0.0
             num_batches = 0
 
@@ -412,7 +411,7 @@ def train_graph_dpo(args):
                 'policy_chosen_delta': [], 'policy_rejected_delta': [],
             }
 
-            for step, batch_data in enumerate(train_loader):
+            for step, batch_data in enumerate(tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.num_epochs}", leave=False)):
                 titles = batch_data.pop("title")
                 video_names = batch_data.pop("video_name")
                 c_gtscore = batch_data.pop("chosen_gt").to(device)
@@ -462,8 +461,8 @@ def train_graph_dpo(args):
                     K_c = len(c_seeds)
                     K_r = len(r_seeds)
 
-                    c_sub_nodes = sample_subgraph(G, seed_nodes=c_seeds, max_sub_nodes=30) 
-                    r_sub_nodes = sample_subgraph(G, seed_nodes=r_seeds, max_sub_nodes=30)
+                    c_sub_nodes = sample_subgraph(G, seed_nodes=c_seeds, max_sub_nodes=20) 
+                    r_sub_nodes = sample_subgraph(G, seed_nodes=r_seeds, max_sub_nodes=20)
                     
                     # Seed positions within the sampled subgraph
                     c_seed_pos = [c_sub_nodes.index(j) for j in c_seeds]
@@ -511,8 +510,8 @@ def train_graph_dpo(args):
                 importance_weights = batch_c_pi_graph/batch_r_pi_graph
                 importance_weights = torch.clamp(importance_weights, min=0.1, max=5.0)
 
-                # loss = -F.logsigmoid(args.beta * (logits - log_margin.reshape(logits.shape) + importance_weights))
-                loss = (args.beta * logits - (log_margin.reshape(logits.shape) * importance_weights)).pow(2)
+                loss = -F.logsigmoid(args.beta * (logits - log_margin.reshape(logits.shape) * importance_weights))
+                # loss = (args.beta * logits - (log_margin.reshape(logits.shape) * importance_weights)).pow(2)
                 loss =  (loss).mean()
 
                 track_loss = -F.logsigmoid((logits - log_margin.reshape(logits.shape))).mean()
