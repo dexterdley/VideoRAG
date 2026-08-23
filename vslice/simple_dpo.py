@@ -115,8 +115,8 @@ def evaluate(model, val_loader, dataset_name, h5_paths, tvsum_user_scores=None, 
             raw_preds = binary_probs[:, 0].cpu().float()
 
             # Eagerly free up GPU memory
-            # del outputs, logits, yes_logits, no_logits, binary_probs, batch_data
-            # torch.cuda.empty_cache()
+            del outputs, logits, yes_logits, no_logits, binary_probs, batch_data
+            torch.cuda.empty_cache()
 
             yes_scores = raw_preds.numpy()
             all_preds.extend(yes_scores)
@@ -291,7 +291,7 @@ def train_dpo(args):
                 loss = -F.logsigmoid(args.beta * (logits - log_margin.reshape(logits.shape))).mean()
                 # loss = (args.beta * logits - (log_margin.reshape(logits.shape))).pow(2)
                 loss = loss.mean()
-                track_loss = -F.logsigmoid((logits - log_margin.reshape(logits.shape))).mean()
+                track_loss = -F.logsigmoid((logits - log_margin.reshape(logits.shape))).mean().detach().cpu()
 
                 binary_probs = F.softmax(torch.stack([c_logits[:, yes_id], c_logits[:, no_id]], dim=-1), dim=-1)
                 preds = binary_probs[:, 0]
@@ -313,6 +313,8 @@ def train_dpo(args):
 
                 epoch_loss += track_loss.item()
                 num_batches += 1
+            
+            torch.cuda.empty_cache()
 
             acc = diag['correct'] / diag['total'] * 100
             print(f"\n{'═'*70}")

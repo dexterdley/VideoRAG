@@ -309,6 +309,7 @@ class SumMeLLaMA_DPODataset(Dataset):
         self.video_folder = './SumMe/raw/videos/'
         self.video_data = h5py.File(self.dataset, 'r')
         self.epsilon = 1e-5
+        self.quantile = 0.25
 
         with open(self.split_file, 'r') as f:
             data = json.loads(f.read())
@@ -331,12 +332,20 @@ class SumMeLLaMA_DPODataset(Dataset):
                 sub_clips.append((video_name, start_idx, end_idx, sub_scores))
 
             sub_clips.sort(key=lambda x: x[3], reverse=True)
-            mid = len(sub_clips) // 2
-            chosen = sub_clips[:mid]
-            rejected = sub_clips[mid:]
+            #mid = len(sub_clips) // 2
+            k = max(1, int(len(sub_clips) * self.quantile))
 
-            for c, r in zip(chosen, reversed(rejected)):
-                self.preference_pairs.append((c, r))
+            chosen = sub_clips[:k] # peaks
+            rejected = sub_clips[-k:] # valleys
+
+            if self.random_sampling:
+                # Add 'k' entries of the full pools to keep epoch length consistent
+                for _ in range(k):
+                    self.preference_pools.append((chosen, rejected))
+            else:
+                # Static fallback: wrap static pairs in lists so __getitem__ logic remains the same
+                for c, r in zip(chosen, reversed(rejected)):
+                    self.preference_pools.append(([c], [r]))
 
     def __len__(self):
         return len(self.preference_pairs)
@@ -375,7 +384,11 @@ class SumMeLLaMA_DPODataset(Dataset):
         return inputs
 
     def __getitem__(self, index):
-        chosen_clip, rejected_clip = self.preference_pairs[index]
+        peaks, valleys = self.preference_pools[index]
+        
+        chosen_clip = random.choice(peaks)
+        rejected_clip = random.choice(valleys)
+
         video_name, chosen_start_idx, chosen_end_idx, chosen_sub_score = chosen_clip
         _, rejected_start_idx, rejected_end_idx, rejected_sub_score = rejected_clip
 
