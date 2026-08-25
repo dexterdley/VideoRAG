@@ -441,6 +441,11 @@ def train_graph_dpo(args):
                             torch.stack([ref_r_logits[:, yes_id], ref_r_logits[:, no_id]], dim=-1), dim=-1
                         )[:, 0]
 
+                # ref_logp_c = ref_logp_c.detach()
+                # ref_logp_r = ref_logp_r.detach()
+                # del ref_c_logits, ref_r_logits
+                # torch.cuda.empty_cache()
+
                 # ── 2.  Policy Logps (LoRA Enabled)
                 peft_model.train()
                 c_logits = peft_model.base_model(c_batch_data).logits[:, -1, :]

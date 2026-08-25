@@ -2,6 +2,7 @@ import os
 import h5py
 import json
 import torch
+import random
 from torch.nn.utils.rnn import pad_sequence
 import numpy as np
 import torch.nn.functional as F
@@ -10,6 +11,8 @@ from torch.utils.data import Dataset
 from decord import VideoReader, cpu
 import pandas as pd
 device = "cuda" if torch.cuda.is_available() else "cpu"
+
+random.seed(42)
 
 def load_video_from_picks(video_path, picks, width=896, height=672):
     """
@@ -304,6 +307,7 @@ class TVSumLLaMA_DPODataset(Dataset):
         self.video_folder = './TVSum/tvsum50_ver_1_1/ydata-tvsum50-v1_1/video/'
         self.video_data = h5py.File(self.dataset, 'r')
         self.epsilon = 1e-5
+        self.quantile = 0.5
 
         self.info_file = './TVSum/tvsum50_ver_1_1/ydata-tvsum50-v1_1/data/ydata-tvsum50-info.tsv'
         self.info_file = pd.read_csv(self.info_file, sep='\t')
@@ -315,7 +319,7 @@ class TVSumLLaMA_DPODataset(Dataset):
         self.system_prompt = "You are an expert video editor. Strictly answer only Yes or No."
 
         # Build sub-clips per video
-        self.preference_pairs = []
+        self.preference_pools = []
         for video_name in self.train_keys:
             gtscore = np.array(self.video_data[video_name + '/gtscore'])
             vid_len = len(gtscore)
@@ -329,15 +333,22 @@ class TVSumLLaMA_DPODataset(Dataset):
                 sub_clips.append((video_name, start_idx, end_idx, sub_scores))
 
             sub_clips.sort(key=lambda x: x[3], reverse=True)
-            mid = len(sub_clips) // 2
-            chosen = sub_clips[:mid]
-            rejected = sub_clips[mid:]
+            k = max(1, int(len(sub_clips) * self.quantile))
 
-            for c, r in zip(chosen, reversed(rejected)):
-                self.preference_pairs.append((c, r))
+            chosen = sub_clips[:k] # peaks
+            rejected = sub_clips[-k:] # valleys
+
+            if self.random_sampling:
+                # Add 'k' entries of the full pools to keep epoch length consistent
+                for _ in range(k):
+                    self.preference_pools.append((chosen, rejected))
+            else:
+                # Static fallback: wrap static pairs in lists so __getitem__ logic remains the same
+                for c, r in zip(chosen, reversed(rejected)):
+                    self.preference_pools.append(([c], [r]))
 
     def __len__(self):
-        return len(self.preference_pairs)
+        return len(self.preference_pools)
 
     def _process_clip(self, frames, formatted_prompt):
         """Helper function to run the VLM processor over a list of PIL frames"""
@@ -373,7 +384,11 @@ class TVSumLLaMA_DPODataset(Dataset):
         return inputs
 
     def __getitem__(self, index):
-        chosen_clip, rejected_clip = self.preference_pairs[index]
+        peaks, valleys = self.preference_pools[index]
+        
+        chosen_clip = random.choice(peaks)
+        rejected_clip = random.choice(valleys)
+
         video_name, chosen_start_idx, chosen_end_idx, chosen_sub_score = chosen_clip
         _, rejected_start_idx, rejected_end_idx, rejected_sub_score = rejected_clip
 

@@ -11,8 +11,8 @@ import torch.nn.functional as F
 import torch.optim as optim
 from tqdm import tqdm
 from torch.utils.data import DataLoader
-import h5py
 from torch.utils.tensorboard import SummaryWriter
+from transformers import get_cosine_schedule_with_warmup
 from peft import LoraConfig, get_peft_model, PeftModel, prepare_model_for_kbit_training
 from datetime import datetime
 
@@ -111,11 +111,12 @@ def evaluate(model, val_loader, dataset_name, h5_paths, tvsum_user_scores=None, 
 
             logits = outputs.logits[:, -1, :].detach()
             yes_logits, no_logits = logits[:, yes_id], logits[:, no_id]
-            binary_probs = F.softmax(torch.stack([yes_logits, no_logits], dim=-1), dim=-1)
-            raw_preds = binary_probs[:, 0].cpu().float()
-
+            # binary_probs = F.softmax(torch.stack([yes_logits, no_logits], dim=-1), dim=-1)
+            # raw_preds = binary_probs[:, 0].cpu().float()
+            raw_preds = F.sigmoid(yes_logits - no_logits).cpu().float()
+            
             # Eagerly free up GPU memory
-            del outputs, logits, yes_logits, no_logits, binary_probs, batch_data
+            del outputs, logits, yes_logits, no_logits, batch_data
             torch.cuda.empty_cache()
 
             yes_scores = raw_preds.numpy()
@@ -185,7 +186,6 @@ def train_dpo(args):
         peft_model.print_trainable_parameters()
         
         optimizer = optim.AdamW(peft_model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.num_epochs, eta_min=1e-6)
         
         # --- Datasets and Dataloaders ---
         if args.dataset == 'summe':
@@ -211,6 +211,14 @@ def train_dpo(args):
             collate_fn=train_collator,
             num_workers=0,
             pin_memory=True
+        )
+
+        total_training_steps = len(train_loader) * args.num_epochs
+        warmup_steps = int(total_training_steps * args.warmup_ratio)
+        scheduler = get_cosine_schedule_with_warmup(
+            optimizer,
+            num_warmup_steps=warmup_steps,
+            num_training_steps=total_training_steps
         )
 
         val_loader = DataLoader(
@@ -239,6 +247,8 @@ def train_dpo(args):
 
         best_corr = -float('inf')
         save_path = None
+
+        print(f"Dataset length:{train_dataset.__len__()}")
 
         for epoch in range(args.num_epochs):
             epoch_loss = 0.0
@@ -275,6 +285,11 @@ def train_dpo(args):
                             torch.stack([ref_r_logits[:, yes_id], ref_r_logits[:, no_id]], dim=-1), dim=-1
                         )[:, 0]
                 
+                # ref_logp_c = ref_logp_c.detach()
+                # ref_logp_r = ref_logp_r.detach()
+                # del ref_c_logits, ref_r_logits
+                # torch.cuda.empty_cache()
+
                 # Policy Logps (LoRA Enabled)
                 peft_model.train()
                 c_logits = peft_model.base_model(c_batch_data).logits[:, -1, :]
@@ -289,12 +304,14 @@ def train_dpo(args):
                 logits = pi_ratio - ref_ratio
 
                 loss = -F.logsigmoid(args.beta * (logits - log_margin.reshape(logits.shape))).mean()
+                grad_scalar = args.beta * torch.sigmoid(-args.beta * (logits - log_margin.reshape(logits.shape)))
                 # loss = (args.beta * logits - (log_margin.reshape(logits.shape))).pow(2)
                 loss = loss.mean()
                 track_loss = -F.logsigmoid((logits - log_margin.reshape(logits.shape))).mean().detach().cpu()
 
-                binary_probs = F.softmax(torch.stack([c_logits[:, yes_id], c_logits[:, no_id]], dim=-1), dim=-1)
-                preds = binary_probs[:, 0]
+                # binary_probs = F.softmax(torch.stack([c_logits[:, yes_id], c_logits[:, no_id]], dim=-1), dim=-1)
+                # preds = binary_probs[:, 0]
+                preds = F.sigmoid(c_logits[:, yes_id] - c_logits[:, no_id])
                 mse_loss = F.mse_loss(preds, c_gtscore.reshape(preds.shape))
 
                 # Track diagnostics
@@ -307,14 +324,13 @@ def train_dpo(args):
                 diag['mse'].append(mse_loss.item())
                 diag['total'] += logits.size(0)
 
+                optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
-                optimizer.zero_grad()
+                scheduler.step()
 
                 epoch_loss += track_loss.item()
                 num_batches += 1
-            
-            torch.cuda.empty_cache()
 
             acc = diag['correct'] / diag['total'] * 100
             print(f"\n{'═'*70}")
@@ -333,7 +349,7 @@ def train_dpo(args):
             avg_epoch_loss = epoch_loss / num_batches
             writer.add_scalar("Train/loss", avg_epoch_loss, epoch)
             writer.add_scalar("Train/learning_rate", scheduler.get_last_lr()[0], epoch)
-            scheduler.step()
+            writer.add_scalar("Train/gradient_scalar", grad_scalar.mean().item(), epoch)
 
             # ================= VALIDATION BLOCK =================
             # Evaluate every epochs, or on the final epoch
@@ -441,6 +457,7 @@ if __name__ == "__main__":
     parser.add_argument('--clip_length', type=int, default=4)
     parser.add_argument("--accumulation_steps", type=int, default=8)
     parser.add_argument("--beta", type=float, default=0.1)
+    parser.add_argument("--warmup_ratio", type=float, default=0.1, help="Ratio of total training steps for linear LR warmup")
     parser.add_argument("--use_advanced_scoring", action="store_true", help="Use action based ranking")
     args = parser.parse_args()
     

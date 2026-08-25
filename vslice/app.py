@@ -25,9 +25,9 @@ fig_bin_strength = "./assets/fig2_bin_strength.png"
 fig_posthoc = "./assets/fig4_posthoc_graph_failure.png"
 
 # Placeholders for example Videos
-video_example1 = "./assets/69118fe052fb155119d76733j1I4g7PP06.mp4"
-video_example2 = "./assets/safe_1771730634.mp4"
-video_example3 = "./assets/safe_1771730634.mp4"
+video_example1 = "./assets/full_highlights_0.mp4"
+video_example2 = "./assets/full_highlights_1.mp4"
+video_example3 = "./assets/full_highlights_2.mp4"
 
 def build_content(lang):
     if lang == "EN":
@@ -43,17 +43,17 @@ def build_content(lang):
         
         with gr.Row():
             if os.path.exists(video_example1):
-                gr.Video(value=video_example1, label="Sports Example", interactive=False, autoplay=True, elem_classes=["gallery-video"])
+                gr.Video(value=video_example1, label="Sports Example", interactive=False, autoplay=False, elem_classes=["gallery-video"])
             else:
                 gr.Markdown(f"*(Video placeholder 1: {video_example1})*")
 
             if os.path.exists(video_example2):
-                gr.Video(value=video_example2, label="Politics Example", interactive=False, autoplay=True, elem_classes=["gallery-video"])
+                gr.Video(value=video_example2, label="Politics Example", interactive=False, autoplay=False, elem_classes=["gallery-video"])
             else:
                 gr.Markdown(f"*(Video placeholder 2: {video_example2})*")
                 
             if os.path.exists(video_example3):
-                gr.Video(value=video_example3, label="Video Games Example", interactive=False, autoplay=True, elem_classes=["gallery-video"])
+                gr.Video(value=video_example3, label="Video Games Example", interactive=False, autoplay=False, elem_classes=["gallery-video"])
             else:
                 gr.Markdown(f"*(Video placeholder 3: {video_example3})*")
 

@@ -2,6 +2,7 @@ import os
 import h5py
 import json
 import torch
+import random
 from torch.nn.utils.rnn import pad_sequence
 import numpy as np
 import torch.nn.functional as F
@@ -10,6 +11,7 @@ from torch.utils.data import Dataset
 from decord import VideoReader, cpu
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
+random.seed(42)
 
 def load_video_from_picks(video_path, picks, width=896, height=672):
     """
@@ -293,7 +295,8 @@ class SumMeLLaMA_DPODataset(Dataset):
                  clip_length=16, 
                  frame_stride=1,
                  load_test=False,
-                 random_sampling=True):
+                 random_sampling=True,
+                 min_margin=0.25):
         """
         SumMe Video Dataset strictly for Direct Preference Optimization (DPO) Training.
         Generates pairs of Chosen (Peak) and Rejected (Valley) frames.
@@ -303,13 +306,14 @@ class SumMeLLaMA_DPODataset(Dataset):
         self.processor = processor
         self.load_test = load_test
         self.random_sampling = random_sampling
+        self.min_margin = min_margin
         
         self.dataset = './SumMe/eccv16_dataset_summe_google_pool5.h5'
         self.split_file = './dataset/summe_splits.json'
         self.video_folder = './SumMe/raw/videos/'
         self.video_data = h5py.File(self.dataset, 'r')
         self.epsilon = 1e-5
-        self.quantile = 0.25
+        self.quantile = 0.5
 
         with open(self.split_file, 'r') as f:
             data = json.loads(f.read())
@@ -318,7 +322,7 @@ class SumMeLLaMA_DPODataset(Dataset):
         self.system_prompt = "You are an expert video editor. Strictly answer only Yes or No."
 
         # Build sub-clips per video
-        self.preference_pairs = []
+        self.preference_pools = []
         for video_name in self.train_keys:
             gtscore = np.array(self.video_data[video_name + '/gtscore'])
             vid_len = len(gtscore)
@@ -332,23 +336,24 @@ class SumMeLLaMA_DPODataset(Dataset):
                 sub_clips.append((video_name, start_idx, end_idx, sub_scores))
 
             sub_clips.sort(key=lambda x: x[3], reverse=True)
-            #mid = len(sub_clips) // 2
             k = max(1, int(len(sub_clips) * self.quantile))
 
             chosen = sub_clips[:k] # peaks
             rejected = sub_clips[-k:] # valleys
+            valid_chosen = [c for c in chosen if c[3] - rejected[0][3] >= self.min_margin] # filter
+            
+            if not valid_chosen:
+                continue
 
             if self.random_sampling:
-                # Add 'k' entries of the full pools to keep epoch length consistent
                 for _ in range(k):
-                    self.preference_pools.append((chosen, rejected))
+                    self.preference_pools.append((valid_chosen, rejected))
             else:
-                # Static fallback: wrap static pairs in lists so __getitem__ logic remains the same
-                for c, r in zip(chosen, reversed(rejected)):
+                for c, r in zip(valid_chosen, reversed(rejected)):
                     self.preference_pools.append(([c], [r]))
 
     def __len__(self):
-        return len(self.preference_pairs)
+        return len(self.preference_pools)
 
     def _process_clip(self, frames, formatted_prompt):
         """Helper function to run the VLM processor over a list of PIL frames"""
