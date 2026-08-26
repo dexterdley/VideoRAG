@@ -111,8 +111,6 @@ def evaluate(model, val_loader, dataset_name, h5_paths, tvsum_user_scores=None, 
 
             logits = outputs.logits[:, -1, :].detach()
             yes_logits, no_logits = logits[:, yes_id], logits[:, no_id]
-            # binary_probs = F.softmax(torch.stack([yes_logits, no_logits], dim=-1), dim=-1)
-            # raw_preds = binary_probs[:, 0].cpu().float()
             raw_preds = F.sigmoid(yes_logits - no_logits).cpu().float()
             
             # Eagerly free up GPU memory
@@ -121,6 +119,9 @@ def evaluate(model, val_loader, dataset_name, h5_paths, tvsum_user_scores=None, 
 
             yes_scores = raw_preds.numpy()
             all_preds.extend(yes_scores)
+            
+            # Apply Min-Max Scaling
+            yes_scores = (yes_scores - yes_scores.min()) / (yes_scores.max() - yes_scores.min() + 1e-8)
 
             res = compute_video_metrics(
                 yes_scores=yes_scores, 
@@ -303,14 +304,20 @@ def train_dpo(args):
                 ref_ratio = ref_logp_c - ref_logp_r
                 logits = pi_ratio - ref_ratio
 
-                loss = -F.logsigmoid(args.beta * (logits - log_margin.reshape(logits.shape))).mean()
-                grad_scalar = args.beta * torch.sigmoid(-args.beta * (logits - log_margin.reshape(logits.shape)))
-                # loss = (args.beta * logits - (log_margin.reshape(logits.shape))).pow(2)
-                loss = loss.mean()
-                track_loss = -F.logsigmoid((logits - log_margin.reshape(logits.shape))).mean().detach().cpu()
+                log_margin = log_margin.to(dtype=logits.dtype)
+                z = args.beta * logits - log_margin.reshape(logits.shape)
 
-                # binary_probs = F.softmax(torch.stack([c_logits[:, yes_id], c_logits[:, no_id]], dim=-1), dim=-1)
-                # preds = binary_probs[:, 0]
+                if args.loss_type == "DPO":
+                    loss = -F.logsigmoid(z).mean() # DPO
+
+                elif args.loss_type == "IPO":
+                    loss = z.pow(2).mean() # IPO
+
+                elif args.loss_type == "MPO":
+                    loss = - ((1.0 - F.sigmoid(z)).pow(2.0) * F.logsigmoid(z)).mean() # MPO
+
+                grad_scalar = torch.sigmoid(-z).mean()
+                track_loss = -F.logsigmoid((logits - log_margin.reshape(logits.shape))).mean().detach().cpu()
                 preds = F.sigmoid(c_logits[:, yes_id] - c_logits[:, no_id])
                 mse_loss = F.mse_loss(preds, c_gtscore.reshape(preds.shape))
 
@@ -444,7 +451,7 @@ def resolve_model_path(mtype):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--model_type", type=str, default="minicpm", choices=["minicpm", "qwen"])
-    parser.add_argument("--dataset", type=str, default="both", choices=["summe", "tvsum", "both"])
+    parser.add_argument("--dataset", type=str, default="both", choices=["summe", "tvsum"])
     parser.add_argument("--root_dir", type=str, default=".")
     parser.add_argument("--model_path", type=str, default=None)
     parser.add_argument("--split_file", type=str, default="./dataset/summe_splits.json")
@@ -459,6 +466,7 @@ if __name__ == "__main__":
     parser.add_argument("--beta", type=float, default=0.1)
     parser.add_argument("--warmup_ratio", type=float, default=0.1, help="Ratio of total training steps for linear LR warmup")
     parser.add_argument("--use_advanced_scoring", action="store_true", help="Use action based ranking")
+    parser.add_argument("--loss_type", type=str, default="DPO")
     args = parser.parse_args()
     
     if args.model_path is None:

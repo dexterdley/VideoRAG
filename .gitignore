@@ -22,3 +22,4 @@ dpo_data/__pycache__/
 dpo_data
 *.txt
 vslice/test_graph_dpo.py
+*.npz
