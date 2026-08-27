@@ -291,7 +291,8 @@ class TVSumLLaMA_DPODataset(Dataset):
                  clip_length=16,
                  frame_stride=1,
                  load_test=False,
-                 random_sampling=True):
+                 random_sampling=True,
+                 min_margin=0.2):
         """
         TVSum Video Dataset strictly for Direct Preference Optimization (DPO) Training.
         Generates pairs of Chosen (Peak) and Rejected (Valley) frames.
@@ -337,14 +338,16 @@ class TVSumLLaMA_DPODataset(Dataset):
 
             chosen = sub_clips[:k] # peaks
             rejected = sub_clips[-k:] # valleys
+            valid_chosen = [c for c in chosen if c[3] - rejected[0][3] >= self.min_margin] # filter
+            
+            if not valid_chosen:
+                continue
 
             if self.random_sampling:
-                # Add 'k' entries of the full pools to keep epoch length consistent
                 for _ in range(k):
-                    self.preference_pools.append((chosen, rejected))
+                    self.preference_pools.append((valid_chosen, rejected))
             else:
-                # Static fallback: wrap static pairs in lists so __getitem__ logic remains the same
-                for c, r in zip(chosen, reversed(rejected)):
+                for c, r in zip(valid_chosen, reversed(rejected)):
                     self.preference_pools.append(([c], [r]))
 
     def __len__(self):

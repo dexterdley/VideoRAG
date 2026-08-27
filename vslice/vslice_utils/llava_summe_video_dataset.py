@@ -313,7 +313,7 @@ class SumMeLLaMA_DPODataset(Dataset):
         self.video_folder = './SumMe/raw/videos/'
         self.video_data = h5py.File(self.dataset, 'r')
         self.epsilon = 1e-5
-        self.quantile = 0.25
+        self.quantile = 0.5
 
         with open(self.split_file, 'r') as f:
             data = json.loads(f.read())
@@ -321,9 +321,8 @@ class SumMeLLaMA_DPODataset(Dataset):
         
         self.system_prompt = "You are an expert video editor. Strictly answer only Yes or No."
 
-        self.video_clips = {}
-        self.total_clips = 0
-        
+        # Build sub-clips per video
+        self.preference_pools = []
         for video_name in self.train_keys:
             gtscore = np.array(self.video_data[video_name + '/gtscore'])
             vid_len = len(gtscore)
@@ -335,15 +334,26 @@ class SumMeLLaMA_DPODataset(Dataset):
                     continue    
                 sub_scores = np.mean(gtscore[start_idx:end_idx])
                 sub_clips.append((video_name, start_idx, end_idx, sub_scores))
+
+            sub_clips.sort(key=lambda x: x[3], reverse=True)
+            k = max(1, int(len(sub_clips) * self.quantile))
+
+            chosen = sub_clips[:k] # peaks
+            rejected = sub_clips[-k:] # valleys
+            valid_chosen = [c for c in chosen if c[3] - rejected[0][3] >= self.min_margin] # filter
             
-            self.video_clips[video_name] = sub_clips
-            self.total_clips += len(sub_clips)
-                
-        # List of videos we can actually sample from
-        self.valid_videos = list(self.video_clips.keys())
-        
+            if not valid_chosen:
+                continue
+
+            if self.random_sampling:
+                for _ in range(k):
+                    self.preference_pools.append((valid_chosen, rejected))
+            else:
+                for c, r in zip(valid_chosen, reversed(rejected)):
+                    self.preference_pools.append(([c], [r]))
+
     def __len__(self):
-        return self.total_clips // 2 # because of pairing
+        return len(self.preference_pools)
 
     def _process_clip(self, frames, formatted_prompt):
         """Helper function to run the VLM processor over a list of PIL frames"""
@@ -379,15 +389,10 @@ class SumMeLLaMA_DPODataset(Dataset):
         return inputs
 
     def __getitem__(self, index):
-        #peaks, valleys = self.preference_pools[index]
+        peaks, valleys = self.preference_pools[index]
         
-        video_name = random.choice(self.valid_videos)
-        clip1, clip2 = random.sample(self.video_clips[video_name], 2)
-
-        if clip1[3] > clip2[3]:
-            chosen_clip, rejected_clip = clip1, clip2
-        else:
-            chosen_clip, rejected_clip = clip2, clip1
+        chosen_clip = random.choice(peaks)
+        rejected_clip = random.choice(valleys)
 
         video_name, chosen_start_idx, chosen_end_idx, chosen_sub_score = chosen_clip
         _, rejected_start_idx, rejected_end_idx, rejected_sub_score = rejected_clip
