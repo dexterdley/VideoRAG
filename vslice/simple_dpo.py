@@ -248,6 +248,7 @@ def train_dpo(args):
 
         best_corr = -float('inf')
         save_path = None
+        global_step = 0
 
         print(f"Dataset length:{train_dataset.__len__()}")
 
@@ -301,7 +302,7 @@ def train_dpo(args):
                 logits = pi_ratio - ref_ratio
 
                 log_margin = log_margin.to(dtype=logits.dtype)
-                z = args.beta * logits - log_margin.reshape(logits.shape)
+                z = args.beta * (logits - log_margin.reshape(logits.shape))
 
                 if args.loss_type == "DPO":
                     loss = -F.logsigmoid(z).mean() # DPO
@@ -311,9 +312,9 @@ def train_dpo(args):
 
                 elif args.loss_type == "MPO":
                     loss = - ((1.0 - F.sigmoid(z)).pow(2.0) * F.logsigmoid(z)).mean() # MPO
-
+                
                 grad_scalar = torch.sigmoid(-z).mean().detach().cpu()
-                track_loss = -F.logsigmoid((logits - log_margin.reshape(logits.shape))).mean().detach().cpu()
+                track_loss = -F.logsigmoid(z/args.beta).mean().detach().cpu()
                 preds = F.sigmoid(c_logits[:, yes_id] - c_logits[:, no_id])
                 mse_loss = F.mse_loss(preds, c_gtscore.reshape(preds.shape))
 
@@ -334,6 +335,12 @@ def train_dpo(args):
 
                 epoch_loss += track_loss.item()
                 num_batches += 1
+
+                # Log per global step across epochs
+                writer.add_scalar("Train/step_loss", track_loss, global_step)
+                writer.add_scalar("Train/step_learning_rate", scheduler.get_last_lr()[0], global_step)
+                writer.add_scalar("Train/step_gradient_scalar", grad_scalar.mean().item(), global_step)
+                global_step += 1
 
             acc = diag['correct'] / diag['total'] * 100
             print(f"\n{'═'*70}")
