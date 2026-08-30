@@ -12,6 +12,7 @@ import torch.optim as optim
 from tqdm import tqdm
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
+import bitsandbytes as bnb
 from transformers import get_cosine_schedule_with_warmup
 from peft import LoraConfig, get_peft_model, PeftModel, prepare_model_for_kbit_training
 from datetime import datetime
@@ -21,7 +22,7 @@ from vslice_utils.dataloader import build_summe_manifest, build_tvsum_manifest, 
 from vslice_utils.helpers import set_seed, compute_video_metrics
 
 from vslice_utils.llava_summe_video_dataset import SumMeLLaMA_VideoDataset, SumMeLLaMA_DPODataset, DPOTrainBatchCollator, ValBatchCollator
-from vslice_utils.llava_tvsum_video_dataset import TVSumLLaMA_VideoDataset, TVSumLLaMA_DPODataset, DPOTrainBatchCollator, ValBatchCollator
+from vslice_utils.llava_tvsum_video_dataset import TVSumLLaMA_VideoDataset, TVSumLLaMA_DPODataset#, DPOTrainBatchCollator, ValBatchCollator
 
 # Evaluation dependencies
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'csta'))
@@ -75,6 +76,39 @@ Average Spearman Rho across splits: 0.2819
 Average F-score across 5 splits: 0.5437
 Average Kendall Tau across splits: 0.1925
 Average Spearman Rho across splits: 0.2532
+                                                                                                                                                                          
+                                                                                                                                                                                              
+══════════════════════════════════════════════════════════════════════                                                                                                                        
+EPOCH 1 DIAGNOSTICS:                                                                                                                                                                          
+══════════════════════════════════════════════════════════════════════                                                                                                                        
+  Total Loss: 6.6625                                                                                                                                                                          
+  DPO Preference Accuracy (logits > margin): 22/1196 (1.8%)                                                                                                                                   
+  π(c)-π(r)  (pi_ratio): 0.2762 ± 0.8436                                                                                                                                                      
+  μ(c)-μ(r) (ref_ratio): 0.0992 ± 0.3961                                                                                                                                                      
+  DPO logits (pi-ref)  : 0.1768 ± 0.7209                                                                                                                                                      
+  GT margin (target)   : 6.7096 ± 2.7231                                                                                                                                                      
+  MSE   : 0.1496 ± 0.0926                                                                                                                                                                     
+══════════════════════════════════════════════════════════════════════                                                                                                                        
+--> Running Validation...                                                                                                                                                                     
+                                                                                
+[Split 1] Val Epoch 1 | F-Score: 0.4111 | Tau: 0.1347 | Rho: 0.1499             
+Saved LoRA weights to ./checkpoints/summe_20260830_194005_best_dpo_split0.pth   
+                                                                                
+══════════════════════════════════════════════════════════════════════          
+EPOCH 2 DIAGNOSTICS:                                                            
+══════════════════════════════════════════════════════════════════════          
+  Total Loss: 4.656210172683192                                                 
+  DPO Preference Accuracy (logits > margin): 462/1196 (38.6%)                   
+  π(c)-π(r)  (pi_ratio): 7.2868 ± 9.0886                                        
+  μ(c)-μ(r) (ref_ratio): 0.1319 ± 0.4000                                        
+  DPO logits (pi-ref)  : 7.1545 ± 8.9226                                        
+  GT margin (target)   : 6.6935 ± 2.6354                                        
+  MSE   : 0.1988 ± 0.1160                                                       
+══════════════════════════════════════════════════════════════════════          
+--> Running Validation...                                                       
+                                                                                
+[Split 1] Val Epoch 2 | F-Score: 0.5264 | Tau: 0.2630 | Rho: 0.2932             
+Saved LoRA weights to ./checkpoints/summe_20260830_194005_best_dpo_split0.pth 
 """
 
 def evaluate(model, val_loader, dataset_name, h5_paths, tvsum_user_scores=None, yes_id=9454, no_id=2753,
@@ -183,10 +217,10 @@ def train_dpo(args):
         print(f"\n==================== SPLIT {split_idx+1}/{len(splits)} ====================")
         
         peft_model = get_peft_model(model, lora_config)
-        peft_model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+        # peft_model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": True})
         peft_model.print_trainable_parameters()
         
-        optimizer = optim.AdamW(peft_model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
+        optimizer = bnb.optim.AdamW8bit(peft_model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
         
         # --- Datasets and Dataloaders ---
         if args.dataset == 'summe':
@@ -214,14 +248,6 @@ def train_dpo(args):
             pin_memory=True
         )
 
-        total_training_steps = len(train_loader) * args.num_epochs
-        warmup_steps = int(total_training_steps * args.warmup_ratio)
-        scheduler = get_cosine_schedule_with_warmup(
-            optimizer,
-            num_warmup_steps=warmup_steps,
-            num_training_steps=total_training_steps
-        )
-
         val_loader = DataLoader(
             val_dataset,
             batch_size=1, 
@@ -238,6 +264,14 @@ def train_dpo(args):
             collate_fn=val_collator, 
             num_workers=0,
             pin_memory=True
+        )
+
+        total_training_steps = len(train_loader) * args.num_epochs
+        warmup_steps = int(total_training_steps * args.warmup_ratio)
+        scheduler = get_cosine_schedule_with_warmup(
+            optimizer,
+            num_warmup_steps=warmup_steps,
+            num_training_steps=total_training_steps
         )
        
         writer = SummaryWriter(f"runs/tune_{args.dataset}_{split_idx}_{timestamp}")
@@ -283,10 +317,10 @@ def train_dpo(args):
                         ref_logp_c = F.logsigmoid(ref_c_logits[:, yes_id] - ref_c_logits[:, no_id])
                         ref_logp_r = F.logsigmoid(ref_r_logits[:, yes_id] - ref_r_logits[:, no_id])
                 
-                #ref_logp_c = ref_logp_c.detach()
-                #ref_logp_r = ref_logp_r.detach()
-                #del ref_c_logits, ref_r_logits
-                #torch.cuda.empty_cache()
+                ref_logp_c = ref_logp_c.detach()
+                ref_logp_r = ref_logp_r.detach()
+                del ref_c_logits, ref_r_logits
+                torch.cuda.empty_cache()
 
                 # Policy Logps (LoRA Enabled)
                 peft_model.train()

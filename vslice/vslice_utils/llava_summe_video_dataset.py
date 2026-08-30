@@ -296,231 +296,11 @@ class SumMeLLaMA_DPODataset(Dataset):
                  frame_stride=1,
                  load_test=False,
                  random_sampling=True,
-                 min_margin=0.25):
+                 min_margin=0.2):
         """
         SumMe Video Dataset strictly for Direct Preference Optimization (DPO) Training.
         Generates pairs of Chosen (Peak) and Rejected (Valley) frames.
-        """
-        self.clip_length = clip_length
-        self.frame_stride = frame_stride
-        self.processor = processor
-        self.load_test = load_test
-        self.random_sampling = random_sampling
-        self.min_margin = min_margin
-        
-        self.dataset = './SumMe/eccv16_dataset_summe_google_pool5.h5'
-        self.split_file = './dataset/summe_splits.json'
-        self.video_folder = './SumMe/raw/videos/'
-        self.video_data = h5py.File(self.dataset, 'r')
-        self.epsilon = 1e-5
-        self.quantile = 0.5
-
-        with open(self.split_file, 'r') as f:
-            data = json.loads(f.read())
-            self.train_keys = data[split_idx]['train_keys']
-        
-        self.system_prompt = "You are an expert video editor. Strictly answer only Yes or No."
-
-        # Build sub-clips per video
-        self.preference_pools = []
-        for video_name in self.train_keys:
-            gtscore = np.array(self.video_data[video_name + '/gtscore'])
-            vid_len = len(gtscore)
-            sub_clips = []
-
-            for start_idx in range(0, vid_len - self.clip_length + 1, self.clip_length):
-                end_idx = start_idx + self.clip_length   
-                sub_scores = np.mean(gtscore[start_idx:end_idx])
-                sub_clips.append((video_name, start_idx, end_idx, sub_scores))
-
-            sub_clips.sort(key=lambda x: x[3], reverse=True)
-            n = len(sub_clips)
-            offsets = sorted(set([1, max(1, n // 4), max(1, n // 2), n - 1]))
-
-            seen = set()
-            for i in range(n):
-                for off in offsets:
-                    j = i + off
-                    if j >= n:
-                        continue
-                    # sub_clips[i] has higher score than sub_clips[j] (sorted desc)
-                    chosen, rejected = sub_clips[i], sub_clips[j]
-                    margin = chosen[3] - rejected[3]
-                    
-                    if margin < self.min_margin:
-                        continue  # skip small margins
-                    
-                    pair_key = (chosen[1], rejected[1])  # deduplicate by start indices
-                    if pair_key in seen:
-                        continue
-                    seen.add(pair_key)
-                    
-                    self.preference_pools.append((chosen, rejected))
-
-    def __len__(self):
-        return len(self.preference_pools)//2
-
-    def _process_clip(self, frames, formatted_prompt):
-        """Helper function to run the VLM processor over a list of PIL frames"""
-        prompts_lists = []
-        input_images_lists = []
-
-        for img in frames:
-            msgs = [
-                {'role': 'system', 'content': self.system_prompt},
-                {'role': 'user', 'content': f"(<image>./</image>)\n{formatted_prompt}"}
-            ]
-            prompt_str = self.processor.tokenizer.apply_chat_template(
-                msgs, tokenize=False, add_generation_prompt=True
-            )
-            prompts_lists.append(prompt_str)
-            input_images_lists.append([img])
-
-        inputs = self.processor(
-            prompts_lists,
-            input_images_lists,
-            max_slice_nums=1,
-            use_image_id=False,
-            return_tensors="pt",
-            max_length=2048
-        )
-
-        if "position_ids" not in inputs:
-            batch_size, seq_len = inputs["input_ids"].shape
-            inputs["position_ids"] = torch.arange(seq_len, dtype=torch.long).unsqueeze(0).expand(batch_size, -1)
-        if "image_sizes" in inputs:
-            inputs.pop("image_sizes")
-
-        return inputs
-
-    def __getitem__(self, index):
-        chosen_clip, rejected_clip = self.preference_pools[index]
-
-        video_name, chosen_start_idx, chosen_end_idx, chosen_sub_score = chosen_clip
-        _, rejected_start_idx, rejected_end_idx, rejected_sub_score = rejected_clip
-
-        chosen_idx = range(chosen_start_idx, chosen_end_idx)
-        rejected_idx = range(rejected_start_idx, rejected_end_idx)
-
-        full_gtscore = torch.as_tensor(self.video_data[video_name + '/gtscore'])
-        full_features = torch.as_tensor(self.video_data[video_name + '/features'], dtype=torch.float32)
-        picks = np.array(self.video_data[video_name + '/picks'])
-        
-        # Parse filename safely
-        video_filename = str(np.array(self.video_data[video_name + '/video_name']))
-        video_filename = video_filename.strip("b'").strip('"').strip()
-        clean_filename = "".join([item + "_" for item in video_filename.split(" ")])
-        video_path = os.path.join(self.video_folder, clean_filename)
-
-        if os.path.exists(video_path + ".webm"):
-            video_path += ".webm"
-        else:
-            video_path += ".mp4"
-
-        video_frames = load_video_from_picks(video_path, picks)
-        total_frames = len(video_frames)
-        title = video_filename
-        formatted_prompt = f"Does this image show a key highlight from the video titled '{title}'?"
-
-        chosen_frames = [video_frames[i] for i in chosen_idx]
-        rejected_frames = [video_frames[i] for i in rejected_idx]
-
-        chosen_inputs = self._process_clip(chosen_frames, formatted_prompt)
-        rejected_inputs = self._process_clip(rejected_frames, formatted_prompt)
-        
-        chosen_score, rejected_score = full_gtscore[chosen_idx], full_gtscore[rejected_idx]
-        log_margin = torch.log(chosen_score + self.epsilon) - torch.log(rejected_score + self.epsilon)
-
-        return {
-            'video_name': video_name,
-            'title': title,
-            'chosen_inputs': chosen_inputs,
-            'rejected_inputs': rejected_inputs,
-            'chosen_gt': chosen_score,
-            'rejected_gt': rejected_score,
-            'log_margin': log_margin,
-            'chosen_idx':  chosen_idx,
-            'rejected_idx': rejected_idx,
-            'features': full_features,
-            'picks': torch.tensor(picks, dtype=torch.long)
-        }
-
-class DPOTrainBatchCollator:
-    def __init__(self, processor):
-        self.processor = processor
-        self.pad_token_id = self.processor.tokenizer.pad_token_id
-
-    def _collate_hf_inputs(self, hf_inputs):
-        """Helper to pad and stack MiniCPM input dictionaries"""
-        max_len = max(x['input_ids'].size(-1) for x in hf_inputs)
-        
-        padded_input_ids = [F.pad(x['input_ids'], (0, max_len - x['input_ids'].size(-1)), value=self.pad_token_id) for x in hf_inputs]
-        padded_position_ids = [F.pad(x['position_ids'], (0, max_len - x['position_ids'].size(-1)), value=0) for x in hf_inputs]
-        padded_attention_masks = [F.pad(x['attention_mask'], (0, max_len - x['attention_mask'].size(-1)), value=0) for x in hf_inputs]
-
-        input_ids = torch.cat(padded_input_ids, dim=0)
-        position_ids = torch.cat(padded_position_ids, dim=0)
-        attention_mask = torch.cat(padded_attention_masks, dim=0)
-
-        pixel_values, image_bound, tgt_sizes = [], [], []
-        for x in hf_inputs:
-            if 'pixel_values' in x: pixel_values.extend(x['pixel_values'])
-            if 'image_bound' in x: image_bound.extend(x['image_bound'])
-            if 'tgt_sizes' in x: tgt_sizes.extend(x['tgt_sizes'])
-
-        MiniCPMClass = type(hf_inputs[0])
-        return MiniCPMClass({
-            'input_ids': input_ids,
-            'attention_mask': attention_mask,
-            'position_ids': position_ids,
-            'pixel_values': pixel_values,
-            'image_bound': image_bound,
-            'tgt_sizes': tgt_sizes,
-        })
-
-    def __call__(self, batch):
-        video_names = [data['video_name'] for data in batch]
-        titles = [data['title'] for data in batch]
-        log_margins = torch.stack([data['log_margin'] for data in batch])
-        chosen_gt = torch.stack([data['chosen_gt'] for data in batch])
-        rejected_gt = torch.stack([data['rejected_gt'] for data in batch])
-
-        chosen_idx = [data['chosen_idx'] for data in batch]
-        rejected_idx = [data['rejected_idx'] for data in batch]
-        features = [data['features'] for data in batch]
-        picks = [data['picks'] for data in batch]
-
-        # Collate chosen and rejected separately so your DPO loop can handle them cleanly
-        chosen_inputs = self._collate_hf_inputs([data['chosen_inputs'] for data in batch])
-        rejected_inputs = self._collate_hf_inputs([data['rejected_inputs'] for data in batch])
-
-        return {
-            'video_name': video_names,
-            'title': titles,
-            'chosen_inputs': chosen_inputs,
-            'rejected_inputs': rejected_inputs,
-            'chosen_gt': chosen_gt,
-            'rejected_gt': rejected_gt,
-            'log_margin': log_margins,
-            'chosen_idx': chosen_idx,
-            'rejected_idx': rejected_idx,
-            'features': features,
-            'picks': picks
-        }
-
-'''
-class SumMeLLaMA_DPODataset(Dataset):
-    def __init__(self, 
-                 split_idx,
-                 processor,
-                 clip_length=16, 
-                 frame_stride=1,
-                 load_test=False,
-                 random_sampling=True,
-                 min_margin=0.15):
-        """
-        SumMe Video Dataset strictly for Direct Preference Optimization (DPO) Training.
-        Generates pairs of Chosen (Peak) and Rejected (Valley) frames.
+        min_margin=0.25
         """
         self.clip_length = clip_length
         self.frame_stride = frame_stride
@@ -555,11 +335,11 @@ class SumMeLLaMA_DPODataset(Dataset):
                 clip1_start_idx, clip1_end_idx, sub_scores1 = self._sample_random_clip(vid_len, gtscore)
                 clip2_start_idx, clip2_end_idx, sub_scores2 = self._sample_random_clip(vid_len, gtscore)
 
-                if sub_scores1 >= sub_scores2 and sub_scores1 - sub_scores2 >= self.min_margin:
+                if sub_scores1 - sub_scores2 >= self.min_margin:
                     chosen.append((video_name, clip1_start_idx , clip1_end_idx, sub_scores1))
                     rejected.append((video_name, clip2_start_idx , clip2_end_idx, sub_scores2))
 
-                elif sub_scores2 > sub_scores1 and sub_scores2 - sub_scores1 >= self.min_margin:
+                elif sub_scores2 - sub_scores1 >= self.min_margin:
                     chosen.append((video_name, clip2_start_idx , clip2_end_idx, sub_scores2))
                     rejected.append((video_name, clip1_start_idx , clip1_end_idx, sub_scores1))
 
@@ -660,159 +440,57 @@ class SumMeLLaMA_DPODataset(Dataset):
             'features': full_features,
             'picks': torch.tensor(picks, dtype=torch.long)
         }
-
-
-class SumMeLLaMA_DPODataset(Dataset):
-    def __init__(self, 
-                 split_idx,
-                 processor,
-                 clip_length=16, 
-                 frame_stride=1,
-                 load_test=False,
-                 random_sampling=True,
-                 min_margin=0.15):
-        """
-        SumMe Video Dataset strictly for Direct Preference Optimization (DPO) Training.
-        Generates pairs of Chosen (Peak) and Rejected (Valley) frames.
-        """
-        self.clip_length = clip_length
-        self.frame_stride = frame_stride
+        
+class DPOTrainBatchCollator:
+    def __init__(self, processor):
         self.processor = processor
-        self.load_test = load_test
-        self.random_sampling = random_sampling
-        self.min_margin = min_margin
+        self.pad_token_id = self.processor.tokenizer.pad_token_id
+
+    def _collate_hf_inputs(self, hf_inputs):
+        """Helper to pad and stack MiniCPM input dictionaries"""
+        max_len = max(x['input_ids'].size(-1) for x in hf_inputs)
         
-        self.dataset = './SumMe/eccv16_dataset_summe_google_pool5.h5'
-        self.split_file = './dataset/summe_splits.json'
-        self.video_folder = './SumMe/raw/videos/'
-        self.video_data = h5py.File(self.dataset, 'r')
-        self.epsilon = 1e-5
-        self.quantile = 0.5
+        padded_input_ids = [F.pad(x['input_ids'], (0, max_len - x['input_ids'].size(-1)), value=self.pad_token_id) for x in hf_inputs]
+        padded_position_ids = [F.pad(x['position_ids'], (0, max_len - x['position_ids'].size(-1)), value=0) for x in hf_inputs]
+        padded_attention_masks = [F.pad(x['attention_mask'], (0, max_len - x['attention_mask'].size(-1)), value=0) for x in hf_inputs]
 
-        with open(self.split_file, 'r') as f:
-            data = json.loads(f.read())
-            self.train_keys = data[split_idx]['train_keys']
-        
-        self.system_prompt = "You are an expert video editor. Strictly answer only Yes or No."
+        input_ids = torch.cat(padded_input_ids, dim=0)
+        position_ids = torch.cat(padded_position_ids, dim=0)
+        attention_mask = torch.cat(padded_attention_masks, dim=0)
 
-        # Build sub-clips per video
-        self.preference_pools = []
-        for video_name in self.train_keys:
-            gtscore = np.array(self.video_data[video_name + '/gtscore'])
-            vid_len = len(gtscore)
-            sub_clips = []
+        pixel_values, image_bound, tgt_sizes = [], [], []
+        for x in hf_inputs:
+            if 'pixel_values' in x: pixel_values.extend(x['pixel_values'])
+            if 'image_bound' in x: image_bound.extend(x['image_bound'])
+            if 'tgt_sizes' in x: tgt_sizes.extend(x['tgt_sizes'])
 
-            for start_idx in range(0, vid_len, self.clip_length):
-                end_idx = min(start_idx + self.clip_length, vid_len)
-                if end_idx - start_idx < self.clip_length:
-                    continue    
-                sub_scores = np.mean(gtscore[start_idx:end_idx])
-                sub_clips.append((video_name, start_idx, end_idx, sub_scores))
+        MiniCPMClass = type(hf_inputs[0])
+        return MiniCPMClass({
+            'input_ids': input_ids,
+            'attention_mask': attention_mask,
+            'position_ids': position_ids,
+            'pixel_values': pixel_values,
+            'image_bound': image_bound,
+            'tgt_sizes': tgt_sizes,
+        })
 
-            sub_clips.sort(key=lambda x: x[3], reverse=True)
-            k = max(1, int(len(sub_clips) * self.quantile))
+    def __call__(self, batch):
+        video_names = [data['video_name'] for data in batch]
+        titles = [data['title'] for data in batch]
+        log_margins = torch.stack([data['log_margin'] for data in batch])
+        chosen_gt = torch.stack([data['chosen_gt'] for data in batch])
+        rejected_gt = torch.stack([data['rejected_gt'] for data in batch])
 
-            chosen = sub_clips[:k] # peaks
-            rejected = sub_clips[-k:] # valleys
-            valid_chosen = [c for c in chosen if c[3] - rejected[0][3] >= self.min_margin] # filter
-            
-            if not valid_chosen:
-                continue
-
-            if self.random_sampling:
-                for _ in range(k):
-                    self.preference_pools.append((valid_chosen, rejected))
-            else:
-                for c, r in zip(valid_chosen, reversed(rejected)):
-                    self.preference_pools.append(([c], [r]))
-
-    def __len__(self):
-        return len(self.preference_pools)
-
-    def _process_clip(self, frames, formatted_prompt):
-        """Helper function to run the VLM processor over a list of PIL frames"""
-        prompts_lists = []
-        input_images_lists = []
-
-        for img in frames:
-            msgs = [
-                {'role': 'system', 'content': self.system_prompt},
-                {'role': 'user', 'content': f"(<image>./</image>)\n{formatted_prompt}"}
-            ]
-            prompt_str = self.processor.tokenizer.apply_chat_template(
-                msgs, tokenize=False, add_generation_prompt=True
-            )
-            prompts_lists.append(prompt_str)
-            input_images_lists.append([img])
-
-        inputs = self.processor(
-            prompts_lists,
-            input_images_lists,
-            max_slice_nums=1,
-            use_image_id=False,
-            return_tensors="pt",
-            max_length=2048
-        )
-
-        if "position_ids" not in inputs:
-            batch_size, seq_len = inputs["input_ids"].shape
-            inputs["position_ids"] = torch.arange(seq_len, dtype=torch.long).unsqueeze(0).expand(batch_size, -1)
-        if "image_sizes" in inputs:
-            inputs.pop("image_sizes")
-
-        return inputs
-
-    def __getitem__(self, index):
-        peaks, valleys = self.preference_pools[index]
-        chosen_clip = random.choice(peaks)
-        rejected_clip = random.choice(valleys)
-
-        video_name, chosen_start_idx, chosen_end_idx, chosen_sub_score = chosen_clip
-        _, rejected_start_idx, rejected_end_idx, rejected_sub_score = rejected_clip
-
-        chosen_idx = range(chosen_start_idx, chosen_end_idx)
-        rejected_idx = range(rejected_start_idx, rejected_end_idx)
-
-        full_gtscore = torch.as_tensor(self.video_data[video_name + '/gtscore'])
-        full_features = torch.as_tensor(self.video_data[video_name + '/features'], dtype=torch.float32)
-        picks = np.array(self.video_data[video_name + '/picks'])
-        
-        # Parse filename safely
-        video_filename = str(np.array(self.video_data[video_name + '/video_name']))
-        video_filename = video_filename.strip("b'").strip('"').strip()
-        clean_filename = "".join([item + "_" for item in video_filename.split(" ")])
-        video_path = os.path.join(self.video_folder, clean_filename)
-
-        if os.path.exists(video_path + ".webm"):
-            video_path += ".webm"
-        else:
-            video_path += ".mp4"
-
-        video_frames = load_video_from_picks(video_path, picks)
-        total_frames = len(video_frames)
-        title = video_filename
-        formatted_prompt = f"Does this image show a key highlight from the video titled '{title}'?"
-
-        chosen_frames = [video_frames[i] for i in chosen_idx]
-        rejected_frames = [video_frames[i] for i in rejected_idx]
-
-        chosen_inputs = self._process_clip(chosen_frames, formatted_prompt)
-        rejected_inputs = self._process_clip(rejected_frames, formatted_prompt)
-        
-        chosen_score, rejected_score = full_gtscore[chosen_idx], full_gtscore[rejected_idx]
-        log_margin = torch.log(chosen_score + self.epsilon) - torch.log(rejected_score + self.epsilon)
+        # Collate chosen and rejected separately so your DPO loop can handle them cleanly
+        chosen_inputs = self._collate_hf_inputs([data['chosen_inputs'] for data in batch])
+        rejected_inputs = self._collate_hf_inputs([data['rejected_inputs'] for data in batch])
 
         return {
-            'video_name': video_name,
-            'title': title,
+            'video_name': video_names,
+            'title': titles,
             'chosen_inputs': chosen_inputs,
             'rejected_inputs': rejected_inputs,
-            'chosen_gt': chosen_score,
-            'rejected_gt': rejected_score,
-            'log_margin': log_margin,
-            'chosen_idx':  chosen_idx,
-            'rejected_idx': rejected_idx,
-            'features': full_features,
-            'picks': torch.tensor(picks, dtype=torch.long)
+            'chosen_gt': chosen_gt,
+            'rejected_gt': rejected_gt,
+            'log_margin': log_margins
         }
-'''
