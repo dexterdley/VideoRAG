@@ -12,8 +12,9 @@ import torch.nn.functional as F
 import torch.optim as optim
 from tqdm import tqdm
 from torch.utils.data import DataLoader
-import h5py
 from torch.utils.tensorboard import SummaryWriter
+import bitsandbytes as bnb
+from transformers import get_cosine_schedule_with_warmup
 from peft import LoraConfig, get_peft_model, PeftModel, prepare_model_for_kbit_training
 from datetime import datetime
 
@@ -22,7 +23,7 @@ from vslice_utils.dataloader import build_summe_manifest, build_tvsum_manifest, 
 from vslice_utils.helpers import set_seed, compute_video_metrics
 
 from vslice_utils.llava_summe_video_dataset import SumMeLLaMA_VideoDataset, SumMeLLaMA_DPODataset, DPOTrainBatchCollator, ValBatchCollator
-from vslice_utils.llava_tvsum_video_dataset import TVSumLLaMA_VideoDataset, TVSumLLaMA_DPODataset, DPOTrainBatchCollator, ValBatchCollator
+from vslice_utils.llava_tvsum_video_dataset import TVSumLLaMA_VideoDataset, TVSumLLaMA_DPODataset#, DPOTrainBatchCollator, ValBatchCollator
 import networkx as nx
 
 # Evaluation dependencies
@@ -334,11 +335,9 @@ def train_graph_dpo(args):
         print(f"\n==================== SPLIT {split_idx+1}/{len(splits)} ====================")
         
         peft_model = get_peft_model(model, lora_config)
-        peft_model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
         peft_model.print_trainable_parameters()
         
-        optimizer = optim.AdamW(peft_model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.num_epochs, eta_min=1e-6)
+        optimizer = bnb.optim.AdamW8bit(peft_model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
         
         # --- Datasets and Dataloaders ---
         if args.dataset == 'summe':
@@ -383,8 +382,16 @@ def train_graph_dpo(args):
             num_workers=0,
             pin_memory=True
         )
-       
-        writer = SummaryWriter(f"runs/graph_{args.dataset}_{split_idx}_{timestamp}")
+
+        total_training_steps = len(train_loader) * args.num_epochs
+        warmup_steps = int(total_training_steps * args.warmup_ratio)
+        scheduler = get_cosine_schedule_with_warmup(
+            optimizer,
+            num_warmup_steps=warmup_steps,
+            num_training_steps=total_training_steps
+        )
+
+        writer = SummaryWriter(f"runs/vslice_graph_{args.loss_type}_{args.dataset}_{split_idx}_{timestamp}")
         writer.add_text(
             "hyperparameters",
             "|param|value|\n|-|-|\n%s" % ("\n".join([f"|{key}|{value}|" for key, value in vars(args).items()])),
@@ -412,14 +419,13 @@ def train_graph_dpo(args):
             }
 
             for step, batch_data in enumerate(tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.num_epochs}", leave=False)):
+                
                 titles = batch_data.pop("title")
                 video_names = batch_data.pop("video_name")
                 c_gtscore = batch_data.pop("chosen_gt").to(device)
                 r_gtscore = batch_data.pop("rejected_gt").to(device)
-        
                 c_batch_data = batch_data.pop("chosen_inputs").to(device)
                 r_batch_data = batch_data.pop("rejected_inputs").to(device)
-
                 log_margin = batch_data.pop("log_margin").to(device)
 
                 chosen_idx = batch_data.pop("chosen_idx")
@@ -434,12 +440,8 @@ def train_graph_dpo(args):
                         ref_c_logits = peft_model.base_model(c_batch_data).logits[:, -1, :]
                         ref_r_logits = peft_model.base_model(r_batch_data).logits[:, -1, :]
                         
-                        ref_p_c = F.softmax(
-                            torch.stack([ref_c_logits[:, yes_id], ref_c_logits[:, no_id]], dim=-1), dim=-1
-                        )[:, 0]
-                        ref_p_r = F.softmax(
-                            torch.stack([ref_r_logits[:, yes_id], ref_r_logits[:, no_id]], dim=-1), dim=-1
-                        )[:, 0]
+                        ref_p_c = F.sigmoid(ref_c_logits[:, yes_id] - ref_c_logits[:, no_id])
+                        ref_p_r = F.sigmoid(ref_r_logits[:, yes_id] - ref_r_logits[:, no_id])
 
                 # ref_logp_c = ref_logp_c.detach()
                 # ref_logp_r = ref_logp_r.detach()
@@ -451,13 +453,14 @@ def train_graph_dpo(args):
                 c_logits = peft_model.base_model(c_batch_data).logits[:, -1, :]
                 r_logits = peft_model.base_model(r_batch_data).logits[:, -1, :]
 
-                pi_p_c = F.softmax(torch.stack([c_logits[:, yes_id], c_logits[:, no_id]], dim=-1),dim=-1)[:, 0]
-                pi_p_r = F.softmax(torch.stack([r_logits[:, yes_id], r_logits[:, no_id]], dim=-1),dim=-1)[:, 0]
+                pi_p_c = F.sigmoid(c_logits[:, yes_id] - c_logits[:, no_id])
+                pi_p_r = F.sigmoid(r_logits[:, yes_id] - r_logits[:, no_id])
 
                 # ── 3. Temporal Video Graph Importance Sampling Logic
                 c_pi_graph_list, r_pi_graph_list = [], []
 
-                offset = 0
+                c_offset = 0
+                r_offset = 0
                 for i in range(len(video_names)):
                     G = build_video_graph(full_features[i], picks[i])  # Full graph
                     
@@ -491,9 +494,10 @@ def train_graph_dpo(args):
                     S_r = r_sub_feats.size(0)
 
                     # Extract the pure VLM probabilities for this specific video
-                    cur_pi_c  = pi_p_c[offset : offset + K_c]
-                    cur_pi_r  = pi_p_r[offset : offset + K_r]
-                    offset += K_c
+                    cur_pi_c  = pi_p_c[c_offset : c_offset + K_c]
+                    cur_pi_r  = pi_p_r[r_offset : r_offset + K_r]
+                    c_offset += K_c
+                    r_offset += K_r
 
                     # ── Calculate Importance Weights ──
                     pi_graph_c = get_graph_policy(c_seed_pos, cur_pi_c, c_A_norm, S_c)
@@ -515,13 +519,12 @@ def train_graph_dpo(args):
                 importance_weights = batch_c_pi_graph/batch_r_pi_graph
                 importance_weights = torch.clamp(importance_weights, min=0.1, max=5.0)
 
-                loss = -F.logsigmoid(args.beta * (logits - log_margin.reshape(logits.shape) * importance_weights))
+                loss = -F.logsigmoid(args.beta * (logits - log_margin.reshape(logits.shape) ))
                 # loss = (args.beta * logits - (log_margin.reshape(logits.shape) * importance_weights)).pow(2)
                 loss =  loss.mean()
                 track_loss = -F.logsigmoid((logits - log_margin.reshape(logits.shape))).mean().detach().cpu()
 
-                binary_probs = F.softmax(torch.stack([c_logits[:, yes_id], c_logits[:, no_id]], dim=-1), dim=-1)
-                preds = binary_probs[:, 0]
+                preds = F.sigmoid(c_logits[:, yes_id] - c_logits[:, no_id])
                 mse_loss = F.mse_loss(preds, c_gtscore.reshape(preds.shape))
 
                 # Track diagnostics
@@ -557,6 +560,7 @@ def train_graph_dpo(args):
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
+                scheduler.step()
 
                 epoch_loss += track_loss.item()
                 num_batches += 1
@@ -600,7 +604,6 @@ def train_graph_dpo(args):
             if diag['batch_tau']:
                 writer.add_scalar("Train/batch_kendall_tau", np.mean(diag['batch_tau']), epoch)
                 writer.add_scalar("Train/batch_spearman_rho", np.mean(diag['batch_rho']), epoch)
-            scheduler.step()
 
             # ================= VALIDATION BLOCK =================
             # Evaluate every epochs, or on the final epoch
@@ -633,7 +636,7 @@ def train_graph_dpo(args):
                     current_corr = avg_tau + avg_rho
                     if current_corr > best_corr:
                         best_corr = current_corr
-                        save_path = os.path.join(args.output_dir, f"{args.dataset}_graph_{timestamp}_best_dpo_split{split_idx}.pth")
+                        save_path = os.path.join(args.output_dir, f"{args.dataset}_{timestamp}_best_{args.loss_type}_split{split_idx}.pth")
                         os.makedirs(args.output_dir, exist_ok=True)
                         peft_model.save_pretrained(save_path)
                         print(f"Saved LoRA weights to {save_path}")
@@ -711,7 +714,9 @@ if __name__ == "__main__":
     parser.add_argument('--clip_length', type=int, default=4)
     parser.add_argument("--accumulation_steps", type=int, default=8)
     parser.add_argument("--beta", type=float, default=0.1)
+    parser.add_argument("--warmup_ratio", type=float, default=0.1, help="Ratio of total training steps for linear LR warmup")
     parser.add_argument("--use_advanced_scoring", action="store_true", help="Use action based ranking")
+    parser.add_argument("--loss_type", type=str, default="DPO")
     args = parser.parse_args()
     
     if args.model_path is None:

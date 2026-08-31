@@ -289,18 +289,17 @@ class ValBatchCollator:
         return collated_inputs
 
 class SumMeLLaMA_DPODataset(Dataset):
-    def __init__(self, 
+    def __init__(self,
                  split_idx,
                  processor,
-                 clip_length=16, 
+                 clip_length=16,
                  frame_stride=1,
                  load_test=False,
                  random_sampling=True,
-                 min_margin=0.2):
+                 min_margin=0.25):
         """
         SumMe Video Dataset strictly for Direct Preference Optimization (DPO) Training.
         Generates pairs of Chosen (Peak) and Rejected (Valley) frames.
-        min_margin=0.25
         """
         self.clip_length = clip_length
         self.frame_stride = frame_stride
@@ -308,43 +307,52 @@ class SumMeLLaMA_DPODataset(Dataset):
         self.load_test = load_test
         self.random_sampling = random_sampling
         self.min_margin = min_margin
-        
+
         self.dataset = './SumMe/eccv16_dataset_summe_google_pool5.h5'
         self.split_file = './dataset/summe_splits.json'
         self.video_folder = './SumMe/raw/videos/'
         self.video_data = h5py.File(self.dataset, 'r')
         self.epsilon = 1e-5
-        self.quantile = 0.5
+        self.quantile = 0.4
 
         with open(self.split_file, 'r') as f:
             data = json.loads(f.read())
             self.train_keys = data[split_idx]['train_keys']
-        
+
         self.system_prompt = "You are an expert video editor. Strictly answer only Yes or No."
 
         # Build sub-clips per video
-        self.preference_pools = []
+        self.video_pools = []
         for video_name in self.train_keys:
             gtscore = np.array(self.video_data[video_name + '/gtscore'])
             vid_len = len(gtscore)
-            chosen = []
-            rejected = []
+            sub_clips = []
+            for start_idx in range(0, vid_len - self.clip_length, self.clip_length):
+                end_idx = start_idx + self.clip_length
+                sub_scores = np.mean(gtscore[start_idx:end_idx])
+                sub_clips.append((video_name, start_idx, end_idx, sub_scores))
+            sub_clips.sort(key=lambda x: x[3], reverse=True)
+            k = max(1, int(len(sub_clips) * self.quantile))
+            chosen = sub_clips[:k]   # peaks
+            rejected = sub_clips[-k:] # valleys
+            valid_chosen = [c for c in chosen if c[3] - rejected[0][3] >= self.min_margin]
+            if valid_chosen:
+                self.video_pools.append((valid_chosen, rejected))
+        # Build initial paired pool
+        self.preference_pools = []
+        self.shuffle_preference_pools()
 
-            for _ in range(0, vid_len, self.clip_length):
-                
-                clip1_start_idx, clip1_end_idx, sub_scores1 = self._sample_random_clip(vid_len, gtscore)
-                clip2_start_idx, clip2_end_idx, sub_scores2 = self._sample_random_clip(vid_len, gtscore)
-
-                if sub_scores1 - sub_scores2 >= self.min_margin:
-                    chosen.append((video_name, clip1_start_idx , clip1_end_idx, sub_scores1))
-                    rejected.append((video_name, clip2_start_idx , clip2_end_idx, sub_scores2))
-
-                elif sub_scores2 - sub_scores1 >= self.min_margin:
-                    chosen.append((video_name, clip2_start_idx , clip2_end_idx, sub_scores2))
-                    rejected.append((video_name, clip1_start_idx , clip1_end_idx, sub_scores1))
-
-            for c, r in zip(chosen, rejected):
-                self.preference_pools.append((c, r)) #flatten
+    def shuffle_preference_pools(self):
+        """Re-pairs chosen and rejected clips randomly for a new epoch."""
+        self.preference_pools = []
+        for valid_chosen, rejected in self.video_pools:
+            # Shuffle rejected candidate order to create new pairings
+            shuffled_rejected = list(rejected)
+            random.shuffle(shuffled_rejected)
+            
+            for c in valid_chosen:
+                r = random.choice(shuffled_rejected)
+                self.preference_pools.append((c, r))
 
     def __len__(self):
         return len(self.preference_pools)
@@ -481,6 +489,11 @@ class DPOTrainBatchCollator:
         chosen_gt = torch.stack([data['chosen_gt'] for data in batch])
         rejected_gt = torch.stack([data['rejected_gt'] for data in batch])
 
+        chosen_idx = [data['chosen_idx'] for data in batch]
+        rejected_idx = [data['rejected_idx'] for data in batch]
+        features = [data['features'] for data in batch]
+        picks = [data['picks'] for data in batch]
+
         # Collate chosen and rejected separately so your DPO loop can handle them cleanly
         chosen_inputs = self._collate_hf_inputs([data['chosen_inputs'] for data in batch])
         rejected_inputs = self._collate_hf_inputs([data['rejected_inputs'] for data in batch])
@@ -492,5 +505,9 @@ class DPOTrainBatchCollator:
             'rejected_inputs': rejected_inputs,
             'chosen_gt': chosen_gt,
             'rejected_gt': rejected_gt,
-            'log_margin': log_margins
+            'log_margin': log_margins,
+            'chosen_idx': chosen_idx,
+            'rejected_idx': rejected_idx,
+            'features': features,
+            'picks': picks
         }

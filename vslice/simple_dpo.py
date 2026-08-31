@@ -22,7 +22,7 @@ from vslice_utils.dataloader import build_summe_manifest, build_tvsum_manifest, 
 from vslice_utils.helpers import set_seed, compute_video_metrics
 
 from vslice_utils.llava_summe_video_dataset import SumMeLLaMA_VideoDataset, SumMeLLaMA_DPODataset, DPOTrainBatchCollator, ValBatchCollator
-from vslice_utils.llava_tvsum_video_dataset import TVSumLLaMA_VideoDataset, TVSumLLaMA_DPODataset#, DPOTrainBatchCollator, ValBatchCollator
+from vslice_utils.llava_tvsum_video_dataset import TVSumLLaMA_VideoDataset, TVSumLLaMA_DPODataset, DPOTrainBatchCollator, ValBatchCollator
 
 # Evaluation dependencies
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'csta'))
@@ -76,39 +76,6 @@ Average Spearman Rho across splits: 0.2819
 Average F-score across 5 splits: 0.5437
 Average Kendall Tau across splits: 0.1925
 Average Spearman Rho across splits: 0.2532
-                                                                                                                                                                          
-                                                                                                                                                                                              
-══════════════════════════════════════════════════════════════════════                                                                                                                        
-EPOCH 1 DIAGNOSTICS:                                                                                                                                                                          
-══════════════════════════════════════════════════════════════════════                                                                                                                        
-  Total Loss: 6.6625                                                                                                                                                                          
-  DPO Preference Accuracy (logits > margin): 22/1196 (1.8%)                                                                                                                                   
-  π(c)-π(r)  (pi_ratio): 0.2762 ± 0.8436                                                                                                                                                      
-  μ(c)-μ(r) (ref_ratio): 0.0992 ± 0.3961                                                                                                                                                      
-  DPO logits (pi-ref)  : 0.1768 ± 0.7209                                                                                                                                                      
-  GT margin (target)   : 6.7096 ± 2.7231                                                                                                                                                      
-  MSE   : 0.1496 ± 0.0926                                                                                                                                                                     
-══════════════════════════════════════════════════════════════════════                                                                                                                        
---> Running Validation...                                                                                                                                                                     
-                                                                                
-[Split 1] Val Epoch 1 | F-Score: 0.4111 | Tau: 0.1347 | Rho: 0.1499             
-Saved LoRA weights to ./checkpoints/summe_20260830_194005_best_dpo_split0.pth   
-                                                                                
-══════════════════════════════════════════════════════════════════════          
-EPOCH 2 DIAGNOSTICS:                                                            
-══════════════════════════════════════════════════════════════════════          
-  Total Loss: 4.656210172683192                                                 
-  DPO Preference Accuracy (logits > margin): 462/1196 (38.6%)                   
-  π(c)-π(r)  (pi_ratio): 7.2868 ± 9.0886                                        
-  μ(c)-μ(r) (ref_ratio): 0.1319 ± 0.4000                                        
-  DPO logits (pi-ref)  : 7.1545 ± 8.9226                                        
-  GT margin (target)   : 6.6935 ± 2.6354                                        
-  MSE   : 0.1988 ± 0.1160                                                       
-══════════════════════════════════════════════════════════════════════          
---> Running Validation...                                                       
-                                                                                
-[Split 1] Val Epoch 2 | F-Score: 0.5264 | Tau: 0.2630 | Rho: 0.2932             
-Saved LoRA weights to ./checkpoints/summe_20260830_194005_best_dpo_split0.pth 
 """
 
 def evaluate(model, val_loader, dataset_name, h5_paths, tvsum_user_scores=None, yes_id=9454, no_id=2753,
@@ -155,7 +122,7 @@ def evaluate(model, val_loader, dataset_name, h5_paths, tvsum_user_scores=None, 
             all_preds.extend(yes_scores)
             
             # Apply Min-Max Scaling
-            #yes_scores = (yes_scores - yes_scores.min()) / (yes_scores.max() - yes_scores.min() + 1e-8)
+            yes_scores = (yes_scores - yes_scores.min()) / (yes_scores.max() - yes_scores.min() + 1e-8)
 
             res = compute_video_metrics(
                 yes_scores=yes_scores, 
@@ -217,7 +184,6 @@ def train_dpo(args):
         print(f"\n==================== SPLIT {split_idx+1}/{len(splits)} ====================")
         
         peft_model = get_peft_model(model, lora_config)
-        # peft_model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": True})
         peft_model.print_trainable_parameters()
         
         optimizer = bnb.optim.AdamW8bit(peft_model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
@@ -274,7 +240,7 @@ def train_dpo(args):
             num_training_steps=total_training_steps
         )
        
-        writer = SummaryWriter(f"runs/tune_{args.dataset}_{split_idx}_{timestamp}")
+        writer = SummaryWriter(f"runs/vslice_{args.loss_type}_{args.dataset}_{split_idx}_{timestamp}")
         writer.add_text(
             "hyperparameters",
             "|param|value|\n|-|-|\n%s" % ("\n".join([f"|{key}|{value}|" for key, value in vars(args).items()])),
@@ -296,18 +262,20 @@ def train_dpo(args):
                 'correct': 0, 'total': 0, 'mse': [], 'loss': [],
             }
 
+            if hasattr(train_dataset, "shuffle_preference_pools"):
+                train_dataset.shuffle_preference_pools()
+
             for step, batch_data in enumerate(tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.num_epochs}", leave=False)):
+
                 titles = batch_data.pop("title")
                 video_names = batch_data.pop("video_name")
                 c_gtscore = batch_data.pop("chosen_gt").to(device)
                 r_gtscore = batch_data.pop("rejected_gt").to(device)
-        
                 c_batch_data = batch_data.pop("chosen_inputs").to(device)
                 r_batch_data = batch_data.pop("rejected_inputs").to(device)
-
                 log_margin = batch_data.pop("log_margin").to(device)
                 
-                 # ── 1. Reference Logps (LoRA Disabled) ──
+                # ── 1. Reference Logps (LoRA Disabled) ──
                 peft_model.eval()
                 with peft_model.disable_adapter():
                     with torch.no_grad():
@@ -317,10 +285,10 @@ def train_dpo(args):
                         ref_logp_c = F.logsigmoid(ref_c_logits[:, yes_id] - ref_c_logits[:, no_id])
                         ref_logp_r = F.logsigmoid(ref_r_logits[:, yes_id] - ref_r_logits[:, no_id])
                 
-                ref_logp_c = ref_logp_c.detach()
-                ref_logp_r = ref_logp_r.detach()
-                del ref_c_logits, ref_r_logits
-                torch.cuda.empty_cache()
+                #ref_logp_c = ref_logp_c.detach()
+                #ref_logp_r = ref_logp_r.detach()
+                #del ref_c_logits, ref_r_logits
+                #torch.cuda.empty_cache()
 
                 # Policy Logps (LoRA Enabled)
                 peft_model.train()
@@ -374,6 +342,8 @@ def train_dpo(args):
                 writer.add_scalar("Train/step_loss", track_loss, global_step)
                 writer.add_scalar("Train/step_learning_rate", scheduler.get_last_lr()[0], global_step)
                 writer.add_scalar("Train/step_gradient_scalar", grad_scalar.mean().item(), global_step)
+                writer.add_scalar("Train/step_pref_accuracy", (logits > log_margin.reshape(logits.shape)).sum().item(), global_step)
+                writer.add_scalar("Train/step_pi_ratio", pi_ratio.mean().item(), global_step)
                 global_step += 1
 
             acc = diag['correct'] / diag['total'] * 100
@@ -393,7 +363,8 @@ def train_dpo(args):
             avg_epoch_loss = epoch_loss / num_batches
             writer.add_scalar("Train/loss", avg_epoch_loss, epoch)
             writer.add_scalar("Train/learning_rate", scheduler.get_last_lr()[0], epoch)
-            writer.add_scalar("Train/gradient_scalar", grad_scalar.mean().item(), epoch)
+            writer.add_scalar("Train/pref_accuracy", acc, epoch)
+            writer.add_scalar("Train/pi_ratio", np.mean(diag['pi_ratio']), epoch)
 
             # ================= VALIDATION BLOCK =================
             # Evaluate every epochs, or on the final epoch
@@ -423,7 +394,7 @@ def train_dpo(args):
                     current_corr = avg_tau + avg_rho
                     if current_corr > best_corr:
                         best_corr = current_corr
-                        save_path = os.path.join(args.output_dir, f"{args.dataset}_{timestamp}_best_dpo_split{split_idx}.pth")
+                        save_path = os.path.join(args.output_dir, f"{args.dataset}_{timestamp}_best_{args.loss_type}_split{split_idx}.pth")
                         os.makedirs(args.output_dir, exist_ok=True)
                         peft_model.save_pretrained(save_path)
                         print(f"Saved LoRA weights to {save_path}")

@@ -292,7 +292,7 @@ class TVSumLLaMA_DPODataset(Dataset):
                  frame_stride=1,
                  load_test=False,
                  random_sampling=True,
-                 min_margin=0.2):
+                 min_margin=0.25):
         """
         TVSum Video Dataset strictly for Direct Preference Optimization (DPO) Training.
         Generates pairs of Chosen (Peak) and Rejected (Valley) frames.
@@ -302,13 +302,14 @@ class TVSumLLaMA_DPODataset(Dataset):
         self.processor = processor
         self.load_test = load_test
         self.random_sampling = random_sampling
-
+        self.min_margin = min_margin
+        
         self.dataset = './TVSum/eccv16_dataset_tvsum_google_pool5.h5'
         self.split_file = './dataset/tvsum_splits.json'
         self.video_folder = './TVSum/tvsum50_ver_1_1/ydata-tvsum50-v1_1/video/'
         self.video_data = h5py.File(self.dataset, 'r')
         self.epsilon = 1e-5
-        self.quantile = 0.5
+        self.quantile = 0.4
 
         self.info_file = './TVSum/tvsum50_ver_1_1/ydata-tvsum50-v1_1/data/ydata-tvsum50-info.tsv'
         self.info_file = pd.read_csv(self.info_file, sep='\t')
@@ -326,29 +327,22 @@ class TVSumLLaMA_DPODataset(Dataset):
             vid_len = len(gtscore)
             sub_clips = []
 
-            for start_idx in range(0, vid_len, self.clip_length):
-                end_idx = min(start_idx + self.clip_length, vid_len)
-                if end_idx - start_idx < self.clip_length:
-                    continue    
+            for start_idx in range(0, vid_len - self.clip_length, self.clip_length):
+                end_idx = start_idx + self.clip_length
                 sub_scores = np.mean(gtscore[start_idx:end_idx])
                 sub_clips.append((video_name, start_idx, end_idx, sub_scores))
 
             sub_clips.sort(key=lambda x: x[3], reverse=True)
             k = max(1, int(len(sub_clips) * self.quantile))
-
             chosen = sub_clips[:k] # peaks
             rejected = sub_clips[-k:] # valleys
             valid_chosen = [c for c in chosen if c[3] - rejected[0][3] >= self.min_margin] # filter
-            
+
             if not valid_chosen:
                 continue
 
-            if self.random_sampling:
-                for _ in range(k):
-                    self.preference_pools.append((valid_chosen, rejected))
-            else:
-                for c, r in zip(valid_chosen, reversed(rejected)):
-                    self.preference_pools.append(([c], [r]))
+            for c, r in zip(valid_chosen, rejected):
+                self.preference_pools.append((c, r)) #flatten
 
     def __len__(self):
         return len(self.preference_pools)
@@ -387,10 +381,7 @@ class TVSumLLaMA_DPODataset(Dataset):
         return inputs
 
     def __getitem__(self, index):
-        peaks, valleys = self.preference_pools[index]
-        
-        chosen_clip = random.choice(peaks)
-        rejected_clip = random.choice(valleys)
+        chosen_clip, rejected_clip = self.preference_pools[index]
 
         video_name, chosen_start_idx, chosen_end_idx, chosen_sub_score = chosen_clip
         _, rejected_start_idx, rejected_end_idx, rejected_sub_score = rejected_clip
