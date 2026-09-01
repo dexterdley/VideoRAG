@@ -296,7 +296,7 @@ class SumMeLLaMA_DPODataset(Dataset):
                  frame_stride=1,
                  load_test=False,
                  random_sampling=True,
-                 min_margin=0.25):
+                 min_margin=0.2):
         """
         SumMe Video Dataset strictly for Direct Preference Optimization (DPO) Training.
         Generates pairs of Chosen (Peak) and Rejected (Valley) frames.
@@ -335,7 +335,7 @@ class SumMeLLaMA_DPODataset(Dataset):
             k = max(1, int(len(sub_clips) * self.quantile))
             chosen = sub_clips[:k]   # peaks
             rejected = sub_clips[-k:] # valleys
-            valid_chosen = [c for c in chosen if c[3] - rejected[0][3] >= self.min_margin]
+            valid_chosen = [c for c in chosen if c[3] - rejected[0][3] > self.min_margin]
             if valid_chosen:
                 self.video_pools.append((valid_chosen, rejected))
         # Build initial paired pool
@@ -356,13 +356,6 @@ class SumMeLLaMA_DPODataset(Dataset):
 
     def __len__(self):
         return len(self.preference_pools)
-
-    def _sample_random_clip(self, vid_len, gtscore):
-        """Samples a random start index and returns start, end, and mean score."""
-        start_idx = np.random.randint(0, max(1, vid_len - self.clip_length))
-        end_idx = start_idx + self.clip_length
-        score = np.mean(gtscore[start_idx:end_idx])
-        return start_idx, end_idx, score
 
     def _process_clip(self, frames, formatted_prompt):
         """Helper function to run the VLM processor over a list of PIL frames"""

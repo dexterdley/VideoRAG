@@ -10,8 +10,8 @@ from PIL import Image
 from torch.utils.data import Dataset
 from decord import VideoReader, cpu
 import pandas as pd
-device = "cuda" if torch.cuda.is_available() else "cpu"
 
+device = "cuda" if torch.cuda.is_available() else "cpu"
 random.seed(42)
 
 def load_video_from_picks(video_path, picks, width=896, height=672):
@@ -342,7 +342,7 @@ class TVSumLLaMA_DPODataset(Dataset):
                 continue
 
             for c, r in zip(valid_chosen, rejected):
-                self.preference_pools.append((c, r)) #flatten
+                self.preference_pools.append((c, r)) # Flatten
 
     def __len__(self):
         return len(self.preference_pools)

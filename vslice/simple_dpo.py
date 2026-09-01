@@ -76,6 +76,11 @@ Average Spearman Rho across splits: 0.2819
 Average F-score across 5 splits: 0.5437
 Average Kendall Tau across splits: 0.1925
 Average Spearman Rho across splits: 0.2532
+[Split 1] Test | F-Score: 0.5086 | Tau: 0.2293 | Rho: 0.2561
+[Split 2] Test | F-Score: 0.5368 | Tau: 0.2460 | Rho: 0.2738
+[Split 3] Test | F-Score: 0.7210 | Tau: 0.3915 | Rho: 0.4349
+[Split 4] Test | F-Score: 0.4544 | Tau: 0.1869 | Rho: 0.2100
+[Split 5] Test | F-Score: 0.5321 | Tau: 0.2294 | Rho: 0.2541
 """
 
 def evaluate(model, val_loader, dataset_name, h5_paths, tvsum_user_scores=None, yes_id=9454, no_id=2753,
@@ -256,14 +261,14 @@ def train_dpo(args):
             epoch_loss = 0.0
             num_batches = 0
 
+            if hasattr(train_dataset, "shuffle_preference_pools"):
+                train_dataset.shuffle_preference_pools()
+                
             # Diagnostic accumulators
             diag = {
                 'pi_ratio': [], 'ref_ratio': [], 'logits': [], 'margin': [],
                 'correct': 0, 'total': 0, 'mse': [], 'loss': [],
             }
-
-            if hasattr(train_dataset, "shuffle_preference_pools"):
-                train_dataset.shuffle_preference_pools()
 
             for step, batch_data in enumerate(tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.num_epochs}", leave=False)):
 
@@ -274,7 +279,7 @@ def train_dpo(args):
                 c_batch_data = batch_data.pop("chosen_inputs").to(device)
                 r_batch_data = batch_data.pop("rejected_inputs").to(device)
                 log_margin = batch_data.pop("log_margin").to(device)
-                
+
                 # ── 1. Reference Logps (LoRA Disabled) ──
                 peft_model.eval()
                 with peft_model.disable_adapter():
@@ -284,7 +289,7 @@ def train_dpo(args):
 
                         ref_logp_c = F.logsigmoid(ref_c_logits[:, yes_id] - ref_c_logits[:, no_id])
                         ref_logp_r = F.logsigmoid(ref_r_logits[:, yes_id] - ref_r_logits[:, no_id])
-                
+
                 #ref_logp_c = ref_logp_c.detach()
                 #ref_logp_r = ref_logp_r.detach()
                 #del ref_c_logits, ref_r_logits
@@ -424,8 +429,22 @@ def train_dpo(args):
             test_f1 = test_df['f_score'].mean()
             test_tau = test_df['kendall'].mean()
             test_rho = test_df['spearman'].mean()
-            print(f"\n[Split {split_idx+1}] Test | F-Score: {test_f1:.4f} | Tau: {test_tau:.4f} | Rho: {test_rho:.4f}\n")
+            print(f"\n[Split {split_idx+1}] Test | F-Score: {test_f1:.4f} | Tau: {test_tau:.4f} | Rho: {test_rho:.4f}")
             
+            baselines = {
+                0: {"f_score": 0.5086, "kendall": 0.2293, "spearman": 0.2561},
+                1: {"f_score": 0.5368, "kendall": 0.2460, "spearman": 0.2738},
+                2: {"f_score": 0.7210, "kendall": 0.3915, "spearman": 0.4349},
+                3: {"f_score": 0.4544, "kendall": 0.1869, "spearman": 0.2100},
+                4: {"f_score": 0.5321, "kendall": 0.2294, "spearman": 0.2541},
+            }
+            if split_idx in baselines:
+                b = baselines[split_idx]
+                f1_status = f"BEAT ({test_f1 - b['f_score']:+.4f})" if test_f1 > b['f_score'] else f"BELOW ({test_f1 - b['f_score']:+.4f})"
+                tau_status = f"BEAT ({test_tau - b['kendall']:+.4f})" if test_tau > b['kendall'] else f"BELOW ({test_tau - b['kendall']:+.4f})"
+                rho_status = f"BEAT ({test_rho - b['spearman']:+.4f})" if test_rho > b['spearman'] else f"BELOW ({test_rho - b['spearman']:+.4f})"
+                print(f"  >>> Final Baseline Check | F-Score: {f1_status} | Tau: {tau_status} | Rho: {rho_status}\n")
+
             # Log test scores to tensorboard (logged at step = split_idx so you can see across splits)
             writer.add_scalar("Test/F-Score", test_f1, split_idx)
             writer.add_scalar("Test/Kendall_Tau", test_tau, split_idx)
