@@ -335,7 +335,7 @@ class SumMeLLaMA_DPODataset(Dataset):
             k = max(1, int(len(sub_clips) * self.quantile))
             chosen = sub_clips[:k]   # peaks
             rejected = sub_clips[-k:] # valleys
-            valid_chosen = [c for c in chosen if c[3] - rejected[0][3] > self.min_margin]
+            valid_chosen = [c for c in chosen if c[3] - rejected[0][3] >= self.min_margin]
             if valid_chosen:
                 self.video_pools.append((valid_chosen, rejected))
         # Build initial paired pool
