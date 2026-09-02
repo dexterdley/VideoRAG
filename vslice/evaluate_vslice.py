@@ -3,166 +3,189 @@ import io
 import os
 import json
 import argparse
-import time
-import warnings
-import h5py
 import numpy as np
 import pandas as pd
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
-import matplotlib.pyplot as plt
+import torch.optim as optim
 from tqdm import tqdm
-from torch.utils.data import Dataset, DataLoader
-from decord import VideoReader, cpu
+from torch.utils.data import DataLoader
+import h5py
+from torch.utils.tensorboard import SummaryWriter
+from peft import LoraConfig, get_peft_model, PeftModel, prepare_model_for_kbit_training
+from datetime import datetime
 
-from vslice_utils.models import load_vlm, minicpm_inference, qwen_inference, minicpm_extract_title_and_keywords, qwen_extract_title_and_keywords
+from vslice_utils.models import load_vlm, minicpm_extract_title_and_keywords, qwen_extract_title_and_keywords, minicpm_inference, qwen_inference
 from vslice_utils.dataloader import build_summe_manifest, build_tvsum_manifest, VideoSegmentDataset
-from vslice_utils.measure_calibration import soft_expected_calibration_error
 from vslice_utils.helpers import set_seed, compute_video_metrics
+
+from vslice_utils.llava_summe_video_dataset import SumMeLLaMA_VideoDataset, SumMeLLaMA_DPODataset, DPOTrainBatchCollator, ValBatchCollator
+from vslice_utils.llava_tvsum_video_dataset import TVSumLLaMA_VideoDataset, TVSumLLaMA_DPODataset, DPOTrainBatchCollator, ValBatchCollator
 
 # Evaluation dependencies
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'csta'))
 try:
-    from generate_summary import generate_summary
-    from evaluation_metrics import get_corr_coeff
     from utils import get_gt
 except ImportError:
-    generate_summary = get_corr_coeff = get_gt = None
+    get_gt = None
 
-warnings.filterwarnings("ignore", category=FutureWarning)
-warnings.filterwarnings("ignore", message=".*not a valid Python identifier.*")
+import warnings
+warnings.filterwarnings("ignore")
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 set_seed(42)
 
-# Fix Windows console encoding for non-ASCII characters
 if sys.platform == "win32":
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
     sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
 
-def _process_clip(frames, formatted_prompt, processor):
-    """Helper function to run the VLM processor over a list of PIL frames"""
-    prompts_lists = []
-    input_images_lists = []
-    system_prompt = "You are an expert video editor. Strictly answer only Yes or No."
-
-    for img in frames:
-        msgs = [
-            {'role': 'system', 'content': system_prompt},
-            {'role': 'user', 'content': f"(<image>./</image>)\n{formatted_prompt}"}
-        ]
-        prompt_str = processor.tokenizer.apply_chat_template(
-            msgs, tokenize=False, add_generation_prompt=True
-        )
-        prompts_lists.append(prompt_str)
-        input_images_lists.append([img])
-
-    inputs = processor(
-        prompts_lists,
-        input_images_lists,
-        max_slice_nums=1,
-        use_image_id=False,
-        return_tensors="pt",
-        max_length=2048
-    )
-
-    if "position_ids" not in inputs:
-        batch_size, seq_len = inputs["input_ids"].shape
-        inputs["position_ids"] = torch.arange(seq_len, dtype=torch.long).unsqueeze(0).expand(batch_size, -1)
-    if "image_sizes" in inputs:
-        inputs.pop("image_sizes")
-    return inputs
-
-# ──────────────────────── INFERENCE PIPELINE ────────────────────────
-def evaluate_splits(args):
-    # 1. Manifest building
-    manifest = []
-    if args.dataset in ("summe", "both"): manifest.extend(build_summe_manifest(args.root_dir))
-    if args.dataset in ("tvsum", "both"): manifest.extend(build_tvsum_manifest(args.root_dir))
-    
-    if "tvsum" in args.split_file.lower() and get_gt is not None:
-        tvsum_user_scores = get_gt('TVSum')
-    else:
-        tvsum_user_scores = None
-
-    summe_h5 = os.path.join(args.root_dir, "SumMe", "eccv16_dataset_summe_google_pool5.h5")
-    tvsum_h5 = os.path.join(args.root_dir, "TVSum", "eccv16_dataset_tvsum_google_pool5.h5")
-
-    # 2. Load VLM
-    vlm_vars = load_vlm(args.model_path, args.model_type, device)
-    model, processor, yes_id, no_id = vlm_vars[0], vlm_vars[2], vlm_vars[3], vlm_vars[4]
+def evaluate(model, val_loader, dataset_name, h5_paths, tvsum_user_scores=None, yes_id=9454, no_id=2753,
+             output_dir=None, model_type="minicpm"):
+    """
+    Evaluates the model using the ValBatchCollator and val_loader.
+    """
+    all_preds = []
+    split_results = []
+    h5_path = h5_paths.get(dataset_name.lower())
     model.eval()
 
-    # 3. Load Splits
-    splits = []
-    if args.split_file and os.path.exists(args.split_file):
-        with open(args.split_file, 'r') as f:
-            splits = json.load(f)
-        print(f"Loaded {len(splits)} splits from {args.split_file}")
+    torch.cuda.empty_cache()
 
-    all_split_results = []
-
-    for split_idx, split in enumerate(splits):
-        print(f"\n==================== SPLIT {split_idx+1}/{len(splits)} ====================")
-        test_set = split['test_keys']
-        split_results = []
-
-        for video_id in test_set:
-            # Match video from manifest
-            item = next((m for m in manifest if m['h5_key'] == video_id), None)
-            if not item: continue
+    with torch.inference_mode():
+        for step, batch_data in enumerate(tqdm(val_loader, desc=f"Evaluating {dataset_name}", leave=False)):
             
-            video_path, title, dataset_name = item["video_path"], item["title"], item["dataset"]
-            picks, h5_path = item["picks"], summe_h5 if dataset_name == "summe" else tvsum_h5
-            gtscore, n_frames = item["gtscore"], item["n_frames"]
+            video_name = batch_data.pop("video_name")[0]
+            titles = batch_data.pop("title")
+            gtscores = batch_data.pop("gtscore")
+            features = batch_data.pop("features")
             
-            print(f"\n[EVAL] {dataset_name}/{item['video_name']} | \"{title}\"")
+            n_frames = batch_data.pop("n_frames")[0]
+            n_frame_per_seg = batch_data.pop("n_frame_per_seg")[0]
+            picks = batch_data.pop("picks")[0]
+            change_points = batch_data.pop("change_points")[0]
+            gt_summary = batch_data.pop("gt_summary")[0]
 
-            # Run Inference
-            dataset = VideoSegmentDataset(video_path, segment_length=32, width=896, height=672, picks=picks)
-            loader = DataLoader(dataset, batch_size=None, shuffle=False, num_workers=2, prefetch_factor=1, persistent_workers=True)
+            title = titles[0] if isinstance(titles, (list, tuple)) else titles
+            gtscore = gtscores.squeeze().numpy() if hasattr(gtscores, 'numpy') else np.array(gtscores)
 
-            if args.model_type == "qwen":
-                cleaned_title, keywords = qwen_extract_title_and_keywords(title, model)
-            else:
-                cleaned_title, keywords = None, None
+            batch_data = batch_data.to(device)
+            outputs = model.base_model(batch_data)
 
-            all_p_yes, all_p_no = [], []
-            all_logits_yes, all_logits_no = [], []
+            logits = outputs.logits[:, -1, :]
+            yes_logits, no_logits = logits[:, yes_id], logits[:, no_id]
+            raw_preds = F.sigmoid(yes_logits - no_logits).cpu().float()
+
+            # Eagerly free up GPU memory
+            del outputs, logits, yes_logits, no_logits, batch_data
+            torch.cuda.empty_cache()
+
+            yes_scores = raw_preds.numpy()
+            all_preds.extend(yes_scores)
             
-            for frames in tqdm(loader, desc=f"VLM Inference: {title}"):
-                if args.model_type == "minicpm":
+            # Apply Min-Max Scaling
+            yes_scores = (yes_scores - yes_scores.min()) / (yes_scores.max() - yes_scores.min() + 1e-8)
 
-                    formatted_prompt = f"Does this image show a key highlight from the video titled '{title}'?"
-                    inputs = _process_clip(frames, formatted_prompt, processor)
+            res = compute_video_metrics(
+                yes_scores=yes_scores, 
+                no_scores=1-yes_scores, 
+                h5_path=h5_path, 
+                h5_key=video_name, 
+                video_name=video_name,
+                dataset_name=dataset_name,
+                user_scores=tvsum_user_scores,
+                use_advanced_scoring=False,
+            )
 
-                    with torch.inference_mode():
-                        outputs = model(inputs.to(device), attention_mask=inputs.get("attention_mask"))
-                        logits = outputs.logits[:, -1, :]
+            split_results.append(res)
 
-                        yes_logits, no_logits = logits[:, yes_id], logits[:, no_id]
-                        binary_probs = F.softmax(torch.stack([yes_logits, no_logits], dim=-1), dim=-1)
-                        p_yes, p_no = binary_probs[:, 0], binary_probs[:, 1]
+    all_preds = np.array(all_preds)
+    unique_preds = len(np.unique(all_preds))
+    return pd.DataFrame(split_results)
 
-                else:
-                    p_yes, p_no, yes_logits, no_logits, _ = qwen_inference(frames, cleaned_title, keywords, model, yes_id, no_id)
+def extract_all_features(args, model, processor, yes_id, no_id):
+    """
+    Extract VLM features for ALL videos (train + test) in one pass.
+    Collects the union of all train_keys and test_keys across every split,
+    deduplicates them, then runs chunked inference and saves an .npz per video.
+    No metric computation is performed here.
+    """
+    split_file = f"./dataset/{args.dataset}_splits.json"
+    if not os.path.exists(split_file):
+        print(f"[WARN] Split file not found: {split_file}. Skipping full extraction.")
+        return
 
-                all_p_yes.append(p_yes.detach().cpu().float().numpy())
-                all_p_no.append(p_no.detach().cpu().float().numpy())
-                all_logits_yes.append(yes_logits.detach().cpu().float().numpy())
-                all_logits_no.append(no_logits.detach().cpu().float().numpy())
+    with open(split_file, 'r') as f:
+        splits = json.load(f)
 
-            raw_p_yes = np.concatenate(all_p_yes)
-            raw_p_no = np.concatenate(all_p_no)
-            raw_logits_yes = np.concatenate(all_logits_yes)
-            raw_logits_no = np.concatenate(all_logits_no)
+    # Union of all train + test keys across all splits — deduplicated, sorted
+    all_keys_set = set()
+    for split in splits:
+        all_keys_set.update(split.get('train_keys', []))
+        all_keys_set.update(split.get('test_keys', []))
+    all_keys = sorted(all_keys_set)
+    print(f"\n[EXTRACT] {args.dataset.upper()}: {len(all_keys)} unique videos to process (train + test)")
 
+    if args.dataset == 'summe':
+        dataset = SumMeLLaMA_VideoDataset(
+            mode='test', split_idx=0, processor=processor,
+            load_test=True, override_keys=all_keys
+        )
+        h5_path = os.path.join(args.root_dir, "SumMe", "eccv16_dataset_summe_google_pool5.h5")
+    elif args.dataset == 'tvsum':
+        dataset = TVSumLLaMA_VideoDataset(
+            mode='test', split_idx=0, processor=processor,
+            load_test=True, override_keys=all_keys
+        )
+        h5_path = os.path.join(args.root_dir, "TVSum", "eccv16_dataset_tvsum_google_pool5.h5")
+    else:
+        raise NotImplementedError(f"Dataset {args.dataset} not supported.")
 
-            out_name = f"{args.model_type}/{item['dataset']}_features_v2_{item['video_name']}.npz"
+    collator = ValBatchCollator(processor=processor)
+    loader = DataLoader(dataset, batch_size=1, shuffle=False,
+                        collate_fn=collator, num_workers=0, pin_memory=True)
+
+    model.eval()
+    with torch.inference_mode():
+        for batch_data in tqdm(loader, desc=f"[EXTRACT] {args.dataset}"):
+            video_name = batch_data.pop("video_name")[0]
+            titles     = batch_data.pop("title")
+            gtscores   = batch_data.pop("gtscore")
+            batch_data.pop("features")
+            n_frames   = batch_data.pop("n_frames")[0]
+            batch_data.pop("n_frame_per_seg")
+            picks      = batch_data.pop("picks")[0]
+            batch_data.pop("change_points")
+            batch_data.pop("gt_summary")
+
+            title   = titles[0] if isinstance(titles, (list, tuple)) else titles
+            gtscore = gtscores.squeeze().numpy() if hasattr(gtscores, 'numpy') else np.array(gtscores)
+            picks_np = picks.numpy() if hasattr(picks, 'numpy') else np.array(picks)
+
+            # Check if already extracted — skip if .npz exists
+            out_name = f"{args.model_type}/{args.dataset}_features_{title}.npz"
             out_path = os.path.join(args.output_dir, out_name)
+            if os.path.exists(out_path):
+                print(f"  [SKIP] {title} — already extracted")
+                continue
+
+            batch_data = batch_data.to(device)
+            outputs = model.base_model(batch_data)
+                
+            logits = outputs.logits[:, -1, :]
+            yes_logits, no_logits = logits[:, yes_id], logits[:, no_id]
+            binary_probs = F.softmax(torch.stack([yes_logits, no_logits], dim=-1), dim=-1)
+            all_preds_tensor = binary_probs[:, 0].detach().cpu().float()
+
+            raw_p_yes      = all_preds_tensor.numpy()
+            raw_p_no       = (1 - all_preds_tensor).numpy()
+            raw_logits_yes = yes_logits.detach().cpu().float()
+            raw_logits_no  = no_logits.detach().cpu().float()
+
             os.makedirs(os.path.dirname(out_path), exist_ok=True)
             np.savez_compressed(
                 out_path,
@@ -171,44 +194,113 @@ def evaluate_splits(args):
                 logits_yes=raw_logits_yes,
                 logits_no=raw_logits_no,
                 gtscore=gtscore,
-                picks=picks,
+                picks=picks_np,
                 n_frames=np.array(n_frames),
-                title=np.array([title])
-                )
-
-            res = compute_video_metrics(
-                yes_scores=raw_p_yes, 
-                no_scores=raw_p_no, 
-                h5_path=h5_path, 
-                h5_key=video_id, 
-                video_name=item['video_name'],
-                dataset_name=dataset_name,
-                user_scores=tvsum_user_scores,
-                use_advanced_scoring=False
+                title=np.array([title]),
+                video_name=np.array([video_name]),
+                dataset=np.array([args.dataset]),
             )
-            
-            print(f"  --> F-Score: {res['f_score']:.4f} | Kendall: {res['kendall']:.4f} | Spearman: {res['spearman']:.4f}")
-            split_results.append(res)
+            print(f"  [SAVED] {title} → {out_path}")
+
+    print(f"[EXTRACT] Done. Features saved to {args.output_dir}/{args.model_type}/")
+
+
+def train_dpo(args):
+    # Load VLM
+    vlm_vars = load_vlm(args.model_path, args.model_type, device)
+    wrapper_or_model, tokenizer, processor, yes_id, no_id = vlm_vars
+    model = wrapper_or_model.model if args.model_type == "qwen" else wrapper_or_model
+    
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    h5_paths = {
+        "summe": os.path.join(args.root_dir, "SumMe", "eccv16_dataset_summe_google_pool5.h5"),
+        "tvsum": os.path.join(args.root_dir, "TVSum", "eccv16_dataset_tvsum_google_pool5.h5")
+    }
+
+    splits = []
+    split_file = f"./dataset/{args.dataset}_splits.json"
+    if os.path.exists(split_file):
+        with open(split_file, 'r') as f:
+            splits = json.load(f)
+        print(f"Loaded {len(splits)} splits from {split_file}")
+
+    eval_split_metrics = {}
+
+    if args.dataset == 'tvsum':
+        tvsum_user_scores = get_gt('TVSum')
+        print("TVSum GT Loaded")
+    else:
+        tvsum_user_scores = None
+
+    # ── Extract features for ALL videos (train + test) before split evaluation ──
+    # extract_all_features(args, model, processor, yes_id, no_id)
+
+    for split_idx, split in enumerate(splits):
+        print(f"\n==================== SPLIT {split_idx+1}/{len(splits)} ====================")
         
-        # Aggregate Split Metrics
-        split_df = pd.DataFrame(split_results)
-        print(f"\n--- SPLIT {split_idx+1} SUMMARY ---")
-        print(f"Mean F-Score: {split_df['f_score'].mean():.4f}")
-        print(f"Mean Kendall Tau: {split_df['kendall'].mean():.4f}")
-        print(f"Mean Spearman Rho: {split_df['spearman'].mean():.4f}")
-        all_split_results.append(split_df)
+        # --- Datasets and Dataloaders ---
+        if args.dataset == 'summe':
+            test_dataset = SumMeLLaMA_VideoDataset(mode='test', split_idx=split_idx, clip_length=args.clip_length * args.batch_size, processor=processor, load_test=True)
 
-    # 4. Final Aggregation
-    if all_split_results:
-        final_df = pd.concat(all_split_results)
-        print("\n" + "=" * 60)
-        print(f"FINAL BENCHMARK SUMMARY (SPLIT-BASED: {args.split_file})")
-        print("=" * 60)
-        print(f"Average F-Score: {final_df['f_score'].mean():.4f}")
-        print(f"Average Kendall Tau: {final_df['kendall'].mean():.4f}")
-        print(f"Average Spearman Rho: {final_df['spearman'].mean():.4f}")
+        elif args.dataset == 'tvsum':
+            test_dataset = TVSumLLaMA_VideoDataset(mode='test', split_idx=split_idx, clip_length=args.clip_length * args.batch_size, processor=processor, load_test=True)
 
-# ──────────────────────── CLI ────────────────────────
+        else:
+            raise NotImplementedError(f"Dataset {args.dataset} not implemented.")
+
+        val_collator = ValBatchCollator(processor=processor)
+
+        test_loader = DataLoader(
+            test_dataset,
+            batch_size=1, 
+            shuffle=False,
+            collate_fn=val_collator, 
+            num_workers=0,
+            pin_memory=True
+        )
+
+        best_corr = -float('inf')
+        save_path = None
+
+        # ================= FINAL TEST BLOCK =================
+        print(f"--> Running Final Test for Split {split_idx+1}...")
+
+        test_df = evaluate(
+            model=model,
+            val_loader=test_loader,
+            dataset_name=args.dataset,
+            h5_paths=h5_paths,
+            yes_id=yes_id,
+            no_id=no_id,
+            tvsum_user_scores=tvsum_user_scores,
+            output_dir=args.output_dir,
+            model_type=args.model_type
+        )
+
+        if not test_df.empty:
+            test_f1 = test_df['f_score'].mean()
+            test_tau = test_df['kendall'].mean()
+            test_rho = test_df['spearman'].mean()
+            print(f"\n[Split {split_idx+1}] Test | F-Score: {test_f1:.4f} | Tau: {test_tau:.4f} | Rho: {test_rho:.4f}\n")
+            
+            eval_split_metrics[split_idx] = {}
+            eval_split_metrics[split_idx]['f_score'] = test_f1
+            eval_split_metrics[split_idx]['kendall'] = test_tau
+            eval_split_metrics[split_idx]['spearman'] = test_rho
+
+    if eval_split_metrics:
+        print("\n" + "═"*60)
+        print(f"FINAL GLOBAL BENCHMARK SUMMARY ({len(splits)} SPLITS)")
+        print("═"*60)
+
+        # Calculate averages across all processed splits
+        avg_overall_f1 = np.mean([m['f_score'] for m in eval_split_metrics.values()])
+        avg_overall_tau = np.mean([m['kendall'] for m in eval_split_metrics.values()])
+        avg_overall_rho = np.mean([m['spearman'] for m in eval_split_metrics.values()])
+        
+        print(f"Global Avg | F1: {avg_overall_f1:.4f} | Kendall: {avg_overall_tau:.4f} | Spearman: {avg_overall_rho:.4f}")
+
 def resolve_model_path(mtype):
     if mtype == "qwen": return "Qwen/Qwen3.5-9B"
     candidates = ["./MiniCPM-V-2_6-int4", "/home/dexter/VideoRAG/.checkpoints/MiniCPM-V-2_6-int4"]
@@ -219,14 +311,17 @@ def resolve_model_path(mtype):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--model_type", type=str, default="minicpm", choices=["minicpm", "qwen"])
-    parser.add_argument("--dataset", type=str, default="both", choices=["summe", "tvsum", "both"])
+    parser.add_argument("--dataset", type=str, default="summe", choices=["summe", "tvsum"])
     parser.add_argument("--root_dir", type=str, default=".")
-    parser.add_argument("--output_dir", type=str, default="./vslice_features")
     parser.add_argument("--model_path", type=str, default=None)
-    parser.add_argument("--split_file", type=str, default="./dataset/summe_splits.json")
+    parser.add_argument("--output_dir", type=str, default="./vslice_features")
+
+    parser.add_argument('--batch_size', type=int, default=1, help='Batch size (number of videos per batch)')
+    parser.add_argument('--clip_length', type=int, default=4)
+    parser.add_argument("--use_advanced_scoring", action="store_true", help="Use action based ranking")
     args = parser.parse_args()
     
     if args.model_path is None:
         args.model_path = resolve_model_path(args.model_type)
     
-    evaluate_splits(args)
+    train_dpo(args)

@@ -1,6 +1,7 @@
 import sys
 import io
 import os
+import random
 import json
 import argparse
 import numpy as np
@@ -15,11 +16,10 @@ from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 import bitsandbytes as bnb
 from transformers import get_cosine_schedule_with_warmup
-from peft import LoraConfig, get_peft_model, PeftModel, prepare_model_for_kbit_training
+from peft import LoraConfig, get_peft_model, PeftModel, prepare_model_for_kbit_training, load_peft_weights, set_peft_model_state_dict
 from datetime import datetime
 
-from vslice_utils.models import load_vlm, minicpm_extract_title_and_keywords, qwen_extract_title_and_keywords, minicpm_inference, qwen_inference
-from vslice_utils.dataloader import build_summe_manifest, build_tvsum_manifest, VideoSegmentDataset
+from vslice_utils.models import load_vlm
 from vslice_utils.helpers import set_seed, compute_video_metrics
 
 from vslice_utils.llava_summe_video_dataset import SumMeLLaMA_VideoDataset, SumMeLLaMA_DPODataset, DPOTrainBatchCollator, ValBatchCollator
@@ -81,7 +81,7 @@ Average Spearman Rho across splits: 0.2532
 """
 
 def evaluate_graph(model, val_loader, dataset_name, h5_paths, tvsum_user_scores=None, yes_id=9454, no_id=2753,
-                   output_dir=None, model_type="minicpm", alpha=0.5):
+                   output_dir=None, model_type="minicpm", alpha=0.05, window_size=15, threshold=0.9, num_steps=2):
     """
     Evaluates the model using the ValBatchCollator and applies graph label propagation on full-video predictions.
     """
@@ -107,22 +107,52 @@ def evaluate_graph(model, val_loader, dataset_name, h5_paths, tvsum_user_scores=
             gt_summary = batch_data.pop("gt_summary")[0]
 
             title = titles[0] if isinstance(titles, (list, tuple)) else titles
-            gtscore = gtscores.squeeze().numpy() if hasattr(gtscores, 'numpy') else np.array(gtscores)
+            gtscore = gtscores.squeeze().numpy() if hasattr(gtscores, 'numpy') else np.array(gtscore) if not isinstance(gtscores, np.ndarray) else gtscores
 
             batch_data = batch_data.to(device)
             outputs = model.base_model(batch_data)
 
             logits = outputs.logits[:, -1, :].detach()
             yes_logits, no_logits = logits[:, yes_id], logits[:, no_id]
-            binary_probs = F.softmax(torch.stack([yes_logits, no_logits], dim=-1), dim=-1)
-            raw_preds = binary_probs[:, 0].cpu().float()
+            raw_preds = F.sigmoid(yes_logits - no_logits).cpu().float()
 
             # Eagerly free up GPU memory
-            del outputs, logits, yes_logits, no_logits, binary_probs, batch_data
+            del outputs, logits, yes_logits, no_logits, batch_data
             torch.cuda.empty_cache()
 
-            yes_scores = raw_preds.numpy()
+            # ── Apply Graph Label Propagation / Diffusion ──
+            if alpha > 0.0:
+                feat_t = features.clone() if isinstance(features, torch.Tensor) else torch.tensor(features, dtype=torch.float32)
+                pick_t = picks.clone() if isinstance(picks, torch.Tensor) else torch.tensor(picks, dtype=torch.long)
+                if feat_t.dim() > 2:
+                    feat_t = feat_t.squeeze()
+
+                W_base, backbone_mask = build_adjacency_matrix_pytorch(
+                    feat_t, pick_t, window_size=window_size, threshold=threshold, device="cpu"
+                )
+
+                # Connect visually similar frames + preserve anchor node self-identity
+                W = W_base.clone()
+                W = W + torch.eye(W.size(0), dtype=W.dtype)
+
+                # Row-normalize to get transition probability matrix
+                deg = W.sum(dim=1, keepdim=True) + 1e-8
+                A_norm = W / deg
+
+                # Iterative graph diffusion / label propagation (conserving peak contrast)
+                y = raw_preds.clone()
+                y_0 = raw_preds.clone()
+                for _ in range(num_steps):
+                    y = (1.0 - alpha) * y_0 + alpha * torch.matmul(A_norm, y)
+
+                yes_scores = y.numpy()
+            else:
+                yes_scores = raw_preds.numpy()
+
             all_preds.extend(yes_scores)
+
+            # Apply Min-Max Scaling across video
+            yes_scores = (yes_scores - yes_scores.min()) / (yes_scores.max() - yes_scores.min() + 1e-8)
 
             res = compute_video_metrics(
                 yes_scores=yes_scores, 
@@ -399,26 +429,22 @@ def train_graph_dpo(args):
 
         best_corr = -float('inf')
         save_path = None
+        global_step = 0
 
         for epoch in range(args.num_epochs):
             epoch_loss = 0.0
             num_batches = 0
 
+            if hasattr(train_dataset, "shuffle_preference_pools"):
+                train_dataset.shuffle_preference_pools()
+                
             # Diagnostic accumulators
             diag = {
-                'loss': [],
-                # Probability-space separation
-                'chosen_prob': [], 'rejected_prob': [], 'prob_gap': [],
-                'pairwise_acc': 0, 'total': 0,
-                # Batch-level correlation (direct eval proxy)
-                'batch_tau': [], 'batch_rho': [],
-                # Distribution health
-                'pred_std': [],
-                # Policy vs reference calibration
-                'policy_chosen_delta': [], 'policy_rejected_delta': [],
+                'pi_ratio': [], 'ref_ratio': [], 'logits': [], 'margin': [],
+                'correct': 0, 'total': 0, 'mse': [], 'loss': [],
             }
 
-            for step, batch_data in enumerate(tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.num_epochs}", leave=False)):
+            for step, batch_data in enumerate(tqdm(train_loader, desc=f"Graph Epoch {epoch+1}/{args.num_epochs}", leave=False)):
                 
                 titles = batch_data.pop("title")
                 video_names = batch_data.pop("video_name")
@@ -440,21 +466,24 @@ def train_graph_dpo(args):
                         ref_c_logits = peft_model.base_model(c_batch_data).logits[:, -1, :]
                         ref_r_logits = peft_model.base_model(r_batch_data).logits[:, -1, :]
                         
-                        ref_p_c = F.sigmoid(ref_c_logits[:, yes_id] - ref_c_logits[:, no_id])
-                        ref_p_r = F.sigmoid(ref_r_logits[:, yes_id] - ref_r_logits[:, no_id])
-
-                # ref_logp_c = ref_logp_c.detach()
-                # ref_logp_r = ref_logp_r.detach()
-                # del ref_c_logits, ref_r_logits
-                # torch.cuda.empty_cache()
+                        ref_c_diff = ref_c_logits[:, yes_id] - ref_c_logits[:, no_id]
+                        ref_r_diff = ref_r_logits[:, yes_id] - ref_r_logits[:, no_id]
+                        ref_logp_c = F.logsigmoid(ref_c_diff)
+                        ref_logp_r = F.logsigmoid(ref_r_diff)
+                        ref_p_c = F.sigmoid(ref_c_diff)
+                        ref_p_r = F.sigmoid(ref_r_diff)
 
                 # ── 2.  Policy Logps (LoRA Enabled)
                 peft_model.train()
                 c_logits = peft_model.base_model(c_batch_data).logits[:, -1, :]
                 r_logits = peft_model.base_model(r_batch_data).logits[:, -1, :]
 
-                pi_p_c = F.sigmoid(c_logits[:, yes_id] - c_logits[:, no_id])
-                pi_p_r = F.sigmoid(r_logits[:, yes_id] - r_logits[:, no_id])
+                c_diff = c_logits[:, yes_id] - c_logits[:, no_id]
+                r_diff = r_logits[:, yes_id] - r_logits[:, no_id]
+                pi_logp_c = F.logsigmoid(c_diff)
+                pi_logp_r = F.logsigmoid(r_diff)
+                pi_p_c = F.sigmoid(c_diff)
+                pi_p_r = F.sigmoid(r_diff)
 
                 # ── 3. Temporal Video Graph Importance Sampling Logic
                 c_pi_graph_list, r_pi_graph_list = [], []
@@ -506,9 +535,6 @@ def train_graph_dpo(args):
                     pi_graph_r = get_graph_policy(r_seed_pos, cur_pi_r, r_A_norm, S_r)
                     r_pi_graph_list.append(pi_graph_r)
                 
-                pi_logp_c, pi_logp_r  = torch.log(pi_p_c + 1e-8), torch.log(pi_p_r + 1e-8)
-                ref_logp_c, ref_logp_r = torch.log(ref_p_c + 1e-8), torch.log(ref_p_r + 1e-8)
-
                 pi_ratio = pi_logp_c - pi_logp_r
                 ref_ratio = ref_logp_c - ref_logp_r
                 logits = pi_ratio - ref_ratio
@@ -516,46 +542,35 @@ def train_graph_dpo(args):
                 batch_c_pi_graph = torch.cat(c_pi_graph_list)
                 batch_r_pi_graph = torch.cat(r_pi_graph_list)
 
-                importance_weights = batch_c_pi_graph/batch_r_pi_graph
+                importance_weights = batch_c_pi_graph / (batch_r_pi_graph + 1e-8)
                 importance_weights = torch.clamp(importance_weights, min=0.1, max=5.0)
 
-                loss = -F.logsigmoid(args.beta * (logits - log_margin.reshape(logits.shape) ))
-                # loss = (args.beta * logits - (log_margin.reshape(logits.shape) * importance_weights)).pow(2)
-                loss =  loss.mean()
-                track_loss = -F.logsigmoid((logits - log_margin.reshape(logits.shape))).mean().detach().cpu()
+                log_margin = log_margin.to(dtype=logits.dtype)
+                z = args.beta * (logits - log_margin.reshape(logits.shape))
 
+                if args.loss_type == "DPO":
+                    loss = - (importance_weights * F.logsigmoid(z)).mean()
+
+                elif args.loss_type == "IPO":
+                    loss = (importance_weights * z.pow(2)).mean()
+
+                elif args.loss_type == "MPO":
+                    loss = - (importance_weights * ((1.0 - F.sigmoid(z)).pow(2.0) * F.logsigmoid(z))).mean()
+
+                grad_scalar = torch.sigmoid(-z).mean().detach().cpu()
+                track_loss = -F.logsigmoid(z/args.beta).mean().detach().cpu()
                 preds = F.sigmoid(c_logits[:, yes_id] - c_logits[:, no_id])
                 mse_loss = F.mse_loss(preds, c_gtscore.reshape(preds.shape))
 
                 # Track diagnostics
                 diag['loss'].append(track_loss.item())
-
-                with torch.no_grad():
-                    # Cast to float32 — numpy does not support BFloat16
-                    pc = torch.exp(pi_logp_c).detach().cpu().float()
-                    pr = torch.exp(pi_logp_r).detach().cpu().float()
-                    rc = torch.exp(ref_logp_c).detach().cpu().float()
-                    rr = torch.exp(ref_logp_r).detach().cpu().float()
-                    gt_c = c_gtscore.reshape(pc.shape).detach().cpu().float()
-                    gt_r = r_gtscore.reshape(pr.shape).detach().cpu().float()
-
-                    diag['chosen_prob'].append(pc.mean().item())
-                    diag['rejected_prob'].append(pr.mean().item())
-                    diag['prob_gap'].append((pc - pr).mean().item())
-                    diag['pairwise_acc'] += (pc > pr).sum().item()
-                    diag['total'] += pc.size(0)
-                    diag['pred_std'].append(torch.cat([pc, pr]).std().item())
-                    diag['policy_chosen_delta'].append((pc - rc).mean().item())
-                    diag['policy_rejected_delta'].append((pr - rr).mean().item())
-
-                    # Batch-level Kendall τ / Spearman ρ — direct proxy for eval metric
-                    all_preds = torch.cat([pc, pr]).numpy()
-                    all_gt    = torch.cat([gt_c, gt_r]).numpy()
-                    if all_preds.std() > 1e-4:
-                        tau, _ = kendalltau(all_preds, all_gt)
-                        rho, _ = spearmanr(all_preds, all_gt)
-                        diag['batch_tau'].append(float(tau))
-                        diag['batch_rho'].append(float(rho))
+                diag['pi_ratio'].append(pi_ratio.mean().item())
+                diag['ref_ratio'].append(ref_ratio.mean().item())
+                diag['logits'].append(logits.mean().item())
+                diag['margin'].append(log_margin.mean().item())                
+                diag['correct'] += (logits > log_margin.reshape(logits.shape)).sum().item()
+                diag['mse'].append(mse_loss.item())
+                diag['total'] += logits.size(0)
 
                 optimizer.zero_grad()
                 loss.backward()
@@ -565,53 +580,38 @@ def train_graph_dpo(args):
                 epoch_loss += track_loss.item()
                 num_batches += 1
 
-            pair_acc = diag['pairwise_acc'] / max(1, diag['total']) * 100
+                # Log per global step across epochs
+                writer.add_scalar("Train/step_loss", track_loss, global_step)
+                writer.add_scalar("Train/step_learning_rate", scheduler.get_last_lr()[0], global_step)
+                writer.add_scalar("Train/step_gradient_scalar", grad_scalar.mean().item(), global_step)
+                writer.add_scalar("Train/step_pref_accuracy", (logits > log_margin.reshape(logits.shape)).sum().item(), global_step)
+                writer.add_scalar("Train/step_pi_ratio", pi_ratio.mean().item(), global_step)
+                global_step += 1
+
+            acc = diag['correct'] / diag['total'] * 100
             print(f"\n{'═'*70}")
             print(f"EPOCH {epoch+1} DIAGNOSTICS:")
             print(f"{'═'*70}")
-            print(f"  Loss              : {np.mean(diag['loss']):.4f}")
-            print(f"")
-            print(f"  ── Separation (prob space) ──────────────────────────────────")
-            print(f"  Chosen  prob mean : {np.mean(diag['chosen_prob']):.4f}  (↑ good)")
-            print(f"  Rejected prob mean: {np.mean(diag['rejected_prob']):.4f}  (↓ good)")
-            print(f"  Prob gap (c-r)    : {np.mean(diag['prob_gap']):.4f} ± {np.std(diag['prob_gap']):.4f}  (↑ good)")
-            print(f"  Pairwise Acc      : {diag['pairwise_acc']}/{diag['total']} ({pair_acc:.1f}%)  (target >50%)")
-            print(f"")
-            print(f"  ── Batch Correlation (eval proxy) ──────────────────────────")
-            if diag['batch_tau']:
-                print(f"  Batch Kendall τ   : {np.mean(diag['batch_tau']):.4f} ± {np.std(diag['batch_tau']):.4f}")
-                print(f"  Batch Spearman ρ  : {np.mean(diag['batch_rho']):.4f} ± {np.std(diag['batch_rho']):.4f}")
-            else:
-                print(f"  Batch τ/ρ         : N/A (predictions collapsed — pred_std too low)")
-            print(f"")
-            print(f"  ── Distribution Health ─────────────────────────────────────")
-            print(f"  Pred std          : {np.mean(diag['pred_std']):.4f}  (<0.01 = collapsed)")
-            print(f"  Policy Δ chosen   : {np.mean(diag['policy_chosen_delta']):+.4f}  (+ = improved over ref)")
-            print(f"  Policy Δ rejected : {np.mean(diag['policy_rejected_delta']):+.4f}  (- = suppressed vs ref)")
+            print(f"  Total Loss: {sum(diag['loss'])/len(diag['loss'])}")
+            print(f"  DPO Preference Accuracy (logits > margin): {diag['correct']}/{diag['total']} ({acc:.1f}%)")
+            print(f"  π(c)-π(r)  (pi_ratio): {np.mean(diag['pi_ratio']):.4f} ± {np.std(diag['pi_ratio']):.4f}")
+            print(f"  μ(c)-μ(r) (ref_ratio): {np.mean(diag['ref_ratio']):.4f} ± {np.std(diag['ref_ratio']):.4f}")
+            print(f"  DPO logits (pi-ref)  : {np.mean(diag['logits']):.4f} ± {np.std(diag['logits']):.4f}")
+            print(f"  GT margin (target)   : {np.mean(diag['margin']):.4f} ± {np.std(diag['margin']):.4f}")
+            print(f"  MSE   : {np.mean(diag['mse']):.4f} ± {np.std(diag['mse']):.4f}")
             print(f"{'═'*70}")
 
-            # Log metrics to tensorboard
+            # Log average training loss for the epoch
             avg_epoch_loss = epoch_loss / num_batches
             writer.add_scalar("Train/loss", avg_epoch_loss, epoch)
             writer.add_scalar("Train/learning_rate", scheduler.get_last_lr()[0], epoch)
-            writer.add_scalar("Train/chosen_prob", np.mean(diag['chosen_prob']), epoch)
-            writer.add_scalar("Train/rejected_prob", np.mean(diag['rejected_prob']), epoch)
-            writer.add_scalar("Train/prob_gap", np.mean(diag['prob_gap']), epoch)
-            writer.add_scalar("Train/pairwise_acc", pair_acc, epoch)
-            writer.add_scalar("Train/pred_std", np.mean(diag['pred_std']), epoch)
-            writer.add_scalar("Train/policy_chosen_delta", np.mean(diag['policy_chosen_delta']), epoch)
-            writer.add_scalar("Train/policy_rejected_delta", np.mean(diag['policy_rejected_delta']), epoch)
-            if diag['batch_tau']:
-                writer.add_scalar("Train/batch_kendall_tau", np.mean(diag['batch_tau']), epoch)
-                writer.add_scalar("Train/batch_spearman_rho", np.mean(diag['batch_rho']), epoch)
+            writer.add_scalar("Train/pref_accuracy", acc, epoch)
+            writer.add_scalar("Train/pi_ratio", np.mean(diag['pi_ratio']), epoch)
 
             # ================= VALIDATION BLOCK =================
             # Evaluate every epochs, or on the final epoch
             if (epoch + 1) % 1 == 0 or epoch == args.num_epochs - 1:
                 print("--> Running Validation...")
-
-                # Clear training gradients and cached allocations before eval
-                optimizer.zero_grad(set_to_none=True)
 
                 val_df = evaluate_graph(
                     model=peft_model, 
@@ -620,7 +620,10 @@ def train_graph_dpo(args):
                     h5_paths=h5_paths,
                     yes_id=yes_id,
                     no_id=no_id,
-                    tvsum_user_scores=tvsum_user_scores
+                    tvsum_user_scores=tvsum_user_scores,
+                    alpha=args.eval_alpha,
+                    window_size=args.eval_window_size,
+                    threshold=args.eval_threshold
                 )
                 
                 if not val_df.empty:
@@ -646,9 +649,10 @@ def train_graph_dpo(args):
         # ================= FINAL TEST BLOCK =================
         print(f"--> Running Final Test for Split {split_idx+1}...")
 
-        # Load the best saved model for testing
+        # Load the best saved model weights for testing without re-wrapping
         if save_path and os.path.exists(save_path):
-            peft_model = PeftModel.from_pretrained(model, save_path)
+            best_weights = load_peft_weights(save_path)
+            set_peft_model_state_dict(peft_model, best_weights)
             peft_model.to(device)
             print(f"Loaded best LORA checkpoint from {save_path}")
 
@@ -659,7 +663,10 @@ def train_graph_dpo(args):
             h5_paths=h5_paths,
             yes_id=yes_id,
             no_id=no_id,
-            tvsum_user_scores=tvsum_user_scores
+            tvsum_user_scores=tvsum_user_scores,
+            alpha=args.eval_alpha,
+            window_size=args.eval_window_size,
+            threshold=args.eval_threshold
         )
 
         if not test_df.empty:
@@ -717,6 +724,9 @@ if __name__ == "__main__":
     parser.add_argument("--warmup_ratio", type=float, default=0.1, help="Ratio of total training steps for linear LR warmup")
     parser.add_argument("--use_advanced_scoring", action="store_true", help="Use action based ranking")
     parser.add_argument("--loss_type", type=str, default="DPO")
+    parser.add_argument("--eval_alpha", type=float, default=0.05, help="Graph diffusion weight during evaluation (0.0 to disable graph)")
+    parser.add_argument("--eval_window_size", type=int, default=15, help="Temporal window size for graph connectivity in evaluation")
+    parser.add_argument("--eval_threshold", type=float, default=0.9, help="Visual similarity quantile threshold for evaluation graph")
     args = parser.parse_args()
     
     if args.model_path is None:

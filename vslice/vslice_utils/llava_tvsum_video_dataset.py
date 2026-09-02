@@ -292,7 +292,7 @@ class TVSumLLaMA_DPODataset(Dataset):
                  frame_stride=1,
                  load_test=False,
                  random_sampling=True,
-                 min_margin=0.25):
+                 min_margin=0.2):
         """
         TVSum Video Dataset strictly for Direct Preference Optimization (DPO) Training.
         Generates pairs of Chosen (Peak) and Rejected (Valley) frames.
@@ -321,28 +321,37 @@ class TVSumLLaMA_DPODataset(Dataset):
         self.system_prompt = "You are an expert video editor. Strictly answer only Yes or No."
 
         # Build sub-clips per video
-        self.preference_pools = []
+        self.video_pools = []
         for video_name in self.train_keys:
             gtscore = np.array(self.video_data[video_name + '/gtscore'])
             vid_len = len(gtscore)
             sub_clips = []
-
             for start_idx in range(0, vid_len - self.clip_length, self.clip_length):
                 end_idx = start_idx + self.clip_length
                 sub_scores = np.mean(gtscore[start_idx:end_idx])
                 sub_clips.append((video_name, start_idx, end_idx, sub_scores))
-
             sub_clips.sort(key=lambda x: x[3], reverse=True)
             k = max(1, int(len(sub_clips) * self.quantile))
-            chosen = sub_clips[:k] # peaks
+            chosen = sub_clips[:k]   # peaks
             rejected = sub_clips[-k:] # valleys
-            valid_chosen = [c for c in chosen if c[3] - rejected[0][3] >= self.min_margin] # filter
+            valid_chosen = [c for c in chosen if c[3] - rejected[0][3] >= self.min_margin]
+            if valid_chosen:
+                self.video_pools.append((valid_chosen, rejected))
+        # Build initial paired pool
+        self.preference_pools = []
+        self.shuffle_preference_pools()
 
-            if not valid_chosen:
-                continue
-
-            for c, r in zip(valid_chosen, rejected):
-                self.preference_pools.append((c, r)) # Flatten
+    def shuffle_preference_pools(self):
+        """Re-pairs chosen and rejected clips randomly for a new epoch."""
+        self.preference_pools = []
+        for valid_chosen, rejected in self.video_pools:
+            # Shuffle rejected candidate order to create new pairings
+            shuffled_rejected = list(rejected)
+            random.shuffle(shuffled_rejected)
+            
+            for c in valid_chosen:
+                r = random.choice(shuffled_rejected)
+                self.preference_pools.append((c, r))
 
     def __len__(self):
         return len(self.preference_pools)

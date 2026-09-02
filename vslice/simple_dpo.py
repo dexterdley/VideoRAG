@@ -1,6 +1,7 @@
 import sys
 import io
 import os
+import random
 import json
 import argparse
 import numpy as np
@@ -14,11 +15,10 @@ from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 import bitsandbytes as bnb
 from transformers import get_cosine_schedule_with_warmup
-from peft import LoraConfig, get_peft_model, PeftModel, prepare_model_for_kbit_training
+from peft import LoraConfig, get_peft_model, PeftModel, prepare_model_for_kbit_training, load_peft_weights, set_peft_model_state_dict
 from datetime import datetime
 
-from vslice_utils.models import load_vlm, minicpm_extract_title_and_keywords, qwen_extract_title_and_keywords, minicpm_inference, qwen_inference
-from vslice_utils.dataloader import build_summe_manifest, build_tvsum_manifest, VideoSegmentDataset
+from vslice_utils.models import load_vlm
 from vslice_utils.helpers import set_seed, compute_video_metrics
 
 from vslice_utils.llava_summe_video_dataset import SumMeLLaMA_VideoDataset, SumMeLLaMA_DPODataset, DPOTrainBatchCollator, ValBatchCollator
@@ -184,13 +184,29 @@ def train_dpo(args):
             bias="none",
             task_type="CAUSAL_LM"
     )
+    peft_model = get_peft_model(model, lora_config)
+    peft_model.print_trainable_parameters()
+    initial_lora_state = {k: v.cpu().clone() for k, v in peft_model.state_dict().items() if "lora_" in k}
+
+    # Store RNG state 
+    initial_py_rng = random.getstate()
+    initial_np_rng = np.random.get_state()
+    initial_torch_rng = torch.get_rng_state()
+    initial_cuda_rng = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
 
     for split_idx, split in enumerate(splits):
         print(f"\n==================== SPLIT {split_idx+1}/{len(splits)} ====================")
+
+        # 1. Set RNG state for every split
+        random.setstate(initial_py_rng)
+        np.random.set_state(initial_np_rng)
+        torch.set_rng_state(initial_torch_rng)
         
-        peft_model = get_peft_model(model, lora_config)
-        peft_model.print_trainable_parameters()
-        
+        if initial_cuda_rng is not None:
+            torch.cuda.set_rng_state_all(initial_cuda_rng)
+
+        # 2. Restore exact pristine initial LoRA parameters
+        peft_model.load_state_dict(initial_lora_state, strict=False)        
         optimizer = bnb.optim.AdamW8bit(peft_model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
         
         # --- Datasets and Dataloaders ---
@@ -409,9 +425,10 @@ def train_dpo(args):
         # ================= FINAL TEST BLOCK =================
         print(f"--> Running Final Test for Split {split_idx+1}...")
 
-        # Load the best saved model for testing
+        # Load the best saved model weights for testing without re-wrapping
         if save_path and os.path.exists(save_path):
-            peft_model = PeftModel.from_pretrained(model, save_path)
+            best_weights = load_peft_weights(save_path)
+            set_peft_model_state_dict(peft_model, best_weights)
             peft_model.to(device)
             print(f"Loaded best LORA checkpoint from {save_path}")
 
@@ -431,13 +448,22 @@ def train_dpo(args):
             test_rho = test_df['spearman'].mean()
             print(f"\n[Split {split_idx+1}] Test | F-Score: {test_f1:.4f} | Tau: {test_tau:.4f} | Rho: {test_rho:.4f}")
             
-            baselines = {
-                0: {"f_score": 0.5086, "kendall": 0.2293, "spearman": 0.2561},
-                1: {"f_score": 0.5368, "kendall": 0.2460, "spearman": 0.2738},
-                2: {"f_score": 0.7210, "kendall": 0.3915, "spearman": 0.4349},
-                3: {"f_score": 0.4544, "kendall": 0.1869, "spearman": 0.2100},
-                4: {"f_score": 0.5321, "kendall": 0.2294, "spearman": 0.2541},
-            }
+            if args.dataset == 'summe':
+                baselines = {
+                    0: {"f_score": 0.4600, "kendall": 0.2379, "spearman": 0.2652},
+                    1: {"f_score": 0.5475, "kendall": 0.2793, "spearman": 0.3109},
+                    2: {"f_score": 0.5193, "kendall": 0.2429, "spearman": 0.2687},
+                    3: {"f_score": 0.5311, "kendall": 0.2160, "spearman": 0.2430},
+                    4: {"f_score": 0.5052, "kendall": 0.2333, "spearman": 0.2591},
+                }
+            else:
+                baselines = {
+                    0: {"f_score": 0.5086, "kendall": 0.2293, "spearman": 0.2561},
+                    1: {"f_score": 0.5368, "kendall": 0.2460, "spearman": 0.2738},
+                    2: {"f_score": 0.7210, "kendall": 0.3915, "spearman": 0.4349},
+                    3: {"f_score": 0.4544, "kendall": 0.1869, "spearman": 0.2100},
+                    4: {"f_score": 0.5321, "kendall": 0.2294, "spearman": 0.2541},
+                }
             if split_idx in baselines:
                 b = baselines[split_idx]
                 f1_status = f"BEAT ({test_f1 - b['f_score']:+.4f})" if test_f1 > b['f_score'] else f"BELOW ({test_f1 - b['f_score']:+.4f})"
@@ -485,6 +511,7 @@ if __name__ == "__main__":
     parser.add_argument("--output_dir", type=str, default="./checkpoints")
     parser.add_argument("--num_epochs", type=int, default=5)
     parser.add_argument("--learning_rate", type=float, default=1e-5)
+    parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--weight_decay", type=float, default=1e-5)
 
     parser.add_argument('--batch_size', type=int, default=2, help='Batch size (number of videos per batch)')
