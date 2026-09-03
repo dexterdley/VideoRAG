@@ -309,10 +309,10 @@ class TVSumLLaMA_DPODataset(Dataset):
         self.video_folder = './TVSum/tvsum50_ver_1_1/ydata-tvsum50-v1_1/video/'
         self.video_data = h5py.File(self.dataset, 'r')
         self.epsilon = 1e-5
-        self.quantile = 0.4
+        self.quantile = 0.25
 
-        self.info_file = './TVSum/tvsum50_ver_1_1/ydata-tvsum50-v1_1/data/ydata-tvsum50-info.tsv'
-        self.info_file = pd.read_csv(self.info_file, sep='\t')
+        info_file = './TVSum/tvsum50_ver_1_1/ydata-tvsum50-v1_1/data/ydata-tvsum50-info.tsv'
+        self.info_file = pd.read_csv(info_file, sep='\t')
 
         with open(self.split_file, 'r') as f:
             data = json.loads(f.read())
@@ -407,6 +407,7 @@ class TVSumLLaMA_DPODataset(Dataset):
         video_id = self.info_file.iloc[video_num - 1]['video_id']
         video_path = self.video_folder + video_id + ".mp4"
         title = str(self.info_file.iloc[video_num - 1]['title'])
+        title = " ".join(title.split()[:5]) # truncate due to GPU constraints
 
         video_frames = load_video_from_picks(video_path, picks)
         total_frames = len(video_frames)

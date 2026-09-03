@@ -20,7 +20,6 @@ from datetime import datetime
 
 from vslice_utils.models import load_vlm
 from vslice_utils.helpers import set_seed, compute_video_metrics
-
 from vslice_utils.llava_summe_video_dataset import SumMeLLaMA_VideoDataset, SumMeLLaMA_DPODataset, DPOTrainBatchCollator, ValBatchCollator
 from vslice_utils.llava_tvsum_video_dataset import TVSumLLaMA_VideoDataset, TVSumLLaMA_DPODataset, DPOTrainBatchCollator, ValBatchCollator
 
@@ -109,7 +108,6 @@ def evaluate(model, val_loader, dataset_name, h5_paths, tvsum_user_scores=None, 
             change_points = batch_data.pop("change_points")[0]
             gt_summary = batch_data.pop("gt_summary")[0]
 
-            title = titles[0] if isinstance(titles, (list, tuple)) else titles
             gtscore = gtscores.squeeze().numpy() if hasattr(gtscores, 'numpy') else np.array(gtscores)
 
             batch_data = batch_data.to(device)
@@ -185,10 +183,9 @@ def train_dpo(args):
             task_type="CAUSAL_LM"
     )
     peft_model = get_peft_model(model, lora_config)
-    peft_model.print_trainable_parameters()
-    initial_lora_state = {k: v.cpu().clone() for k, v in peft_model.state_dict().items() if "lora_" in k}
 
     # Store RNG state 
+    initial_lora_state = {k: v.cpu().clone() for k, v in peft_model.state_dict().items() if "lora_" in k}
     initial_py_rng = random.getstate()
     initial_np_rng = np.random.get_state()
     initial_torch_rng = torch.get_rng_state()
@@ -288,8 +285,6 @@ def train_dpo(args):
 
             for step, batch_data in enumerate(tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.num_epochs}", leave=False)):
 
-                titles = batch_data.pop("title")
-                video_names = batch_data.pop("video_name")
                 c_gtscore = batch_data.pop("chosen_gt").to(device)
                 r_gtscore = batch_data.pop("rejected_gt").to(device)
                 c_batch_data = batch_data.pop("chosen_inputs").to(device)
@@ -306,10 +301,10 @@ def train_dpo(args):
                         ref_logp_c = F.logsigmoid(ref_c_logits[:, yes_id] - ref_c_logits[:, no_id])
                         ref_logp_r = F.logsigmoid(ref_r_logits[:, yes_id] - ref_r_logits[:, no_id])
 
-                #ref_logp_c = ref_logp_c.detach()
-                #ref_logp_r = ref_logp_r.detach()
-                #del ref_c_logits, ref_r_logits
-                #torch.cuda.empty_cache()
+                ref_logp_c = ref_logp_c.detach()
+                ref_logp_r = ref_logp_r.detach()
+                del ref_c_logits, ref_r_logits
+                torch.cuda.empty_cache()
 
                 # Policy Logps (LoRA Enabled)
                 peft_model.train()
@@ -334,7 +329,7 @@ def train_dpo(args):
                     loss = z.pow(2).mean() # IPO
 
                 elif args.loss_type == "MPO":
-                    loss = - ((1.0 - F.sigmoid(z)).pow(2.0) * F.logsigmoid(z)).mean() # MPO
+                    loss = - ((1.0 - torch.sigmoid(z)).pow(2).detach() * F.logsigmoid(z)).mean() # MPO
                 
                 grad_scalar = torch.sigmoid(-z).mean().detach().cpu()
                 track_loss = -F.logsigmoid(z/args.beta).mean().detach().cpu()
@@ -448,29 +443,6 @@ def train_dpo(args):
             test_rho = test_df['spearman'].mean()
             print(f"\n[Split {split_idx+1}] Test | F-Score: {test_f1:.4f} | Tau: {test_tau:.4f} | Rho: {test_rho:.4f}")
             
-            if args.dataset == 'summe':
-                baselines = {
-                    0: {"f_score": 0.4600, "kendall": 0.2379, "spearman": 0.2652},
-                    1: {"f_score": 0.5475, "kendall": 0.2793, "spearman": 0.3109},
-                    2: {"f_score": 0.5193, "kendall": 0.2429, "spearman": 0.2687},
-                    3: {"f_score": 0.5311, "kendall": 0.2160, "spearman": 0.2430},
-                    4: {"f_score": 0.5052, "kendall": 0.2333, "spearman": 0.2591},
-                }
-            else:
-                baselines = {
-                    0: {"f_score": 0.5086, "kendall": 0.2293, "spearman": 0.2561},
-                    1: {"f_score": 0.5368, "kendall": 0.2460, "spearman": 0.2738},
-                    2: {"f_score": 0.7210, "kendall": 0.3915, "spearman": 0.4349},
-                    3: {"f_score": 0.4544, "kendall": 0.1869, "spearman": 0.2100},
-                    4: {"f_score": 0.5321, "kendall": 0.2294, "spearman": 0.2541},
-                }
-            if split_idx in baselines:
-                b = baselines[split_idx]
-                f1_status = f"BEAT ({test_f1 - b['f_score']:+.4f})" if test_f1 > b['f_score'] else f"BELOW ({test_f1 - b['f_score']:+.4f})"
-                tau_status = f"BEAT ({test_tau - b['kendall']:+.4f})" if test_tau > b['kendall'] else f"BELOW ({test_tau - b['kendall']:+.4f})"
-                rho_status = f"BEAT ({test_rho - b['spearman']:+.4f})" if test_rho > b['spearman'] else f"BELOW ({test_rho - b['spearman']:+.4f})"
-                print(f"  >>> Final Baseline Check | F-Score: {f1_status} | Tau: {tau_status} | Rho: {rho_status}\n")
-
             # Log test scores to tensorboard (logged at step = split_idx so you can see across splits)
             writer.add_scalar("Test/F-Score", test_f1, split_idx)
             writer.add_scalar("Test/Kendall_Tau", test_tau, split_idx)
@@ -491,6 +463,9 @@ def train_dpo(args):
         avg_overall_tau = np.mean([m['kendall'] for m in eval_split_metrics.values()])
         avg_overall_rho = np.mean([m['spearman'] for m in eval_split_metrics.values()])
         print(f"Global Avg | F1: {avg_overall_f1:.4f} | Kendall: {avg_overall_tau:.4f} | Spearman: {avg_overall_rho:.4f}")
+        writer.add_scalar("Test/Global_F-Score", avg_overall_f1)
+        writer.add_scalar("Test/Global_Kendall_Tau", avg_overall_tau)
+        writer.add_scalar("Test/Global_Spearman_Rho", avg_overall_rho)
 
     writer.close()
 
