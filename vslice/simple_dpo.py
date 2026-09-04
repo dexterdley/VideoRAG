@@ -144,6 +144,21 @@ def evaluate(model, val_loader, dataset_name, h5_paths, tvsum_user_scores=None, 
     unique_preds = len(np.unique(all_preds))
     return pd.DataFrame(split_results)
 
+def diff_attn_boost(logits_yes, logits_no):
+    """
+    Applies Tanh boost.
+    Mathematically isomorphic to: Residual + (softmax(A1) - softmax(A2)) * V
+    """
+    # 1. Base logit difference
+    diff = logits_yes - logits_no
+    
+    # 2. Differential Gate: softmax(yes) - softmax(no) simplifies exactly to tanh(diff / 2)
+    diff_gate = torch.tanh(diff / 2.0)
+
+    # 3. Boosted Output: Residual + Gate * Magnitude
+    # return diff + diff_gate * torch.abs(diff)
+    return diff_gate * torch.abs(diff)
+
 def train_dpo(args):
     # Load VLM
     vlm_vars = load_vlm(args.model_path, args.model_type, device)
@@ -191,7 +206,7 @@ def train_dpo(args):
     initial_torch_rng = torch.get_rng_state()
     initial_cuda_rng = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
 
-    for split_idx, split in enumerate(splits):
+    for split_idx, split in enumerate(splits[:1]):
         print(f"\n==================== SPLIT {split_idx+1}/{len(splits)} ====================")
 
         # 1. Set RNG state for every split
@@ -281,6 +296,9 @@ def train_dpo(args):
             diag = {
                 'pi_ratio': [], 'ref_ratio': [], 'logits': [], 'margin': [],
                 'correct': 0, 'total': 0, 'mse': [], 'loss': [],
+                'kl_drift': [],
+                'grad_share_easy': [], 'grad_share_border': [], 'grad_share_hard': [],
+                'pct_easy': [], 'pct_border': [], 'pct_hard': []
             }
 
             for step, batch_data in enumerate(tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.num_epochs}", leave=False)):
@@ -298,13 +316,15 @@ def train_dpo(args):
                         ref_c_logits = peft_model.base_model(c_batch_data).logits[:, -1, :]
                         ref_r_logits = peft_model.base_model(r_batch_data).logits[:, -1, :]
 
-                        ref_logp_c = F.logsigmoid(ref_c_logits[:, yes_id] - ref_c_logits[:, no_id])
-                        ref_logp_r = F.logsigmoid(ref_r_logits[:, yes_id] - ref_r_logits[:, no_id])
+                        #ref_logp_c = F.logsigmoid(ref_c_logits[:, yes_id] - ref_c_logits[:, no_id])
+                        #ref_logp_r = F.logsigmoid(ref_r_logits[:, yes_id] - ref_r_logits[:, no_id])
+                        ref_logp_c = F.logsigmoid(diff_attn_boost(ref_c_logits[:, yes_id], ref_c_logits[:, no_id]))
+                        ref_logp_r = F.logsigmoid(diff_attn_boost(ref_r_logits[:, yes_id], ref_r_logits[:, no_id]))
 
-                ref_logp_c = ref_logp_c.detach()
-                ref_logp_r = ref_logp_r.detach()
-                del ref_c_logits, ref_r_logits
-                torch.cuda.empty_cache()
+                #ref_logp_c = ref_logp_c.detach()
+                #ref_logp_r = ref_logp_r.detach()
+                #del ref_c_logits, ref_r_logits
+                #torch.cuda.empty_cache()
 
                 # Policy Logps (LoRA Enabled)
                 peft_model.train()
@@ -312,13 +332,13 @@ def train_dpo(args):
                 r_logits = peft_model.base_model(r_batch_data).logits[:, -1, :]
 
                 # Compute binary log policy
-                pi_logp_c = F.logsigmoid(c_logits[:, yes_id] - c_logits[:, no_id])
-                pi_logp_r = F.logsigmoid(r_logits[:, yes_id] - r_logits[:, no_id])
+                pi_logp_c = F.logsigmoid(diff_attn_boost(c_logits[:, yes_id], c_logits[:, no_id]))
+                pi_logp_r = F.logsigmoid(diff_attn_boost(r_logits[:, yes_id], r_logits[:, no_id]))
 
                 pi_ratio = pi_logp_c - pi_logp_r
                 ref_ratio = ref_logp_c - ref_logp_r
                 logits = pi_ratio - ref_ratio
-
+                
                 log_margin = log_margin.to(dtype=logits.dtype)
                 z = args.beta * (logits - log_margin.reshape(logits.shape))
 
@@ -336,6 +356,31 @@ def train_dpo(args):
                 preds = F.sigmoid(c_logits[:, yes_id] - c_logits[:, no_id])
                 mse_loss = F.mse_loss(preds, c_gtscore.reshape(preds.shape))
 
+                # ── Diagnostic Metrics (Metric A & Metric B) ──
+                with torch.no_grad():
+                    prob_z = torch.sigmoid(z).detach()
+                    # Focal / MPO weights: (1 - sigma(z))^2
+                    mod_weights = (1.0 - prob_z).pow(2)
+                    
+                    easy_mask = prob_z >= 0.7
+                    border_mask = (prob_z >= 0.3) & (prob_z < 0.7)
+                    hard_mask = prob_z < 0.3
+                    
+                    total_samples = prob_z.numel()
+                    pct_easy = (easy_mask.sum().float() / total_samples).item() * 100
+                    pct_border = (border_mask.sum().float() / total_samples).item() * 100
+                    pct_hard = (hard_mask.sum().float() / total_samples).item() * 100
+                    
+                    total_w = mod_weights.sum().item() + 1e-8
+                    grad_share_easy = (mod_weights[easy_mask].sum().item() / total_w) * 100
+                    grad_share_border = (mod_weights[border_mask].sum().item() / total_w) * 100
+                    grad_share_hard = (mod_weights[hard_mask].sum().item() / total_w) * 100
+
+                    # Metric B: KL Drift from Reference Policy
+                    kl_c = (pi_logp_c - ref_logp_c).abs().mean().item()
+                    kl_r = (pi_logp_r - ref_logp_r).abs().mean().item()
+                    kl_drift = kl_c + kl_r
+
                 # Track diagnostics
                 diag['loss'].append(track_loss.item())
                 diag['pi_ratio'].append(pi_ratio.mean().item())
@@ -345,6 +390,13 @@ def train_dpo(args):
                 diag['correct'] += (logits > log_margin.reshape(logits.shape)).sum().item()
                 diag['mse'].append(mse_loss.item())
                 diag['total'] += logits.size(0)
+                diag['kl_drift'].append(kl_drift)
+                diag['grad_share_easy'].append(grad_share_easy)
+                diag['grad_share_border'].append(grad_share_border)
+                diag['grad_share_hard'].append(grad_share_hard)
+                diag['pct_easy'].append(pct_easy)
+                diag['pct_border'].append(pct_border)
+                diag['pct_hard'].append(pct_hard)
 
                 optimizer.zero_grad()
                 loss.backward()
@@ -360,27 +412,24 @@ def train_dpo(args):
                 writer.add_scalar("Train/step_gradient_scalar", grad_scalar.mean().item(), global_step)
                 writer.add_scalar("Train/step_pref_accuracy", (logits > log_margin.reshape(logits.shape)).sum().item(), global_step)
                 writer.add_scalar("Train/step_pi_ratio", pi_ratio.mean().item(), global_step)
+                writer.add_scalar("Train/step_kl_drift", kl_drift, global_step)
+                writer.add_scalar("Train/step_grad_share_easy", grad_share_easy, global_step)
+                writer.add_scalar("Train/step_grad_share_borderline", grad_share_border, global_step)
+                writer.add_scalar("Train/step_grad_share_hard", grad_share_hard, global_step)
                 global_step += 1
 
             acc = diag['correct'] / diag['total'] * 100
             print(f"\n{'═'*70}")
             print(f"EPOCH {epoch+1} DIAGNOSTICS:")
             print(f"{'═'*70}")
-            print(f"  Total Loss: {sum(diag['loss'])/len(diag['loss'])}")
+            print(f"  Total Loss: {sum(diag['loss'])/len(diag['loss']):.4f}")
             print(f"  DPO Preference Accuracy (logits > margin): {diag['correct']}/{diag['total']} ({acc:.1f}%)")
             print(f"  π(c)-π(r)  (pi_ratio): {np.mean(diag['pi_ratio']):.4f} ± {np.std(diag['pi_ratio']):.4f}")
             print(f"  μ(c)-μ(r) (ref_ratio): {np.mean(diag['ref_ratio']):.4f} ± {np.std(diag['ref_ratio']):.4f}")
             print(f"  DPO logits (pi-ref)  : {np.mean(diag['logits']):.4f} ± {np.std(diag['logits']):.4f}")
             print(f"  GT margin (target)   : {np.mean(diag['margin']):.4f} ± {np.std(diag['margin']):.4f}")
-            print(f"  MSE   : {np.mean(diag['mse']):.4f} ± {np.std(diag['mse']):.4f}")
+            print(f"  MSE                  : {np.mean(diag['mse']):.4f} ± {np.std(diag['mse']):.4f}")
             print(f"{'═'*70}")
-
-            # Log average training loss for the epoch
-            avg_epoch_loss = epoch_loss / num_batches
-            writer.add_scalar("Train/loss", avg_epoch_loss, epoch)
-            writer.add_scalar("Train/learning_rate", scheduler.get_last_lr()[0], epoch)
-            writer.add_scalar("Train/pref_accuracy", acc, epoch)
-            writer.add_scalar("Train/pi_ratio", np.mean(diag['pi_ratio']), epoch)
 
             # ================= VALIDATION BLOCK =================
             # Evaluate every epochs, or on the final epoch
@@ -444,9 +493,9 @@ def train_dpo(args):
             print(f"\n[Split {split_idx+1}] Test | F-Score: {test_f1:.4f} | Tau: {test_tau:.4f} | Rho: {test_rho:.4f}")
             
             # Log test scores to tensorboard (logged at step = split_idx so you can see across splits)
-            writer.add_scalar("Test/F-Score", test_f1, split_idx)
-            writer.add_scalar("Test/Kendall_Tau", test_tau, split_idx)
-            writer.add_scalar("Test/Spearman_Rho", test_rho, split_idx)
+            writer.add_scalar("Global/F-Score", test_f1, split_idx)
+            writer.add_scalar("Global/Kendall_Tau", test_tau, split_idx)
+            writer.add_scalar("Global/Spearman_Rho", test_rho, split_idx)
 
             eval_split_metrics[split_idx] = {}
             eval_split_metrics[split_idx]['f_score'] = test_f1
@@ -467,6 +516,7 @@ def train_dpo(args):
         writer.add_scalar("Test/Global_Kendall_Tau", avg_overall_tau)
         writer.add_scalar("Test/Global_Spearman_Rho", avg_overall_rho)
 
+    writer.flush()
     writer.close()
 
 def resolve_model_path(mtype):
