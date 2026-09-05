@@ -19,7 +19,7 @@ from peft import LoraConfig, get_peft_model, PeftModel, prepare_model_for_kbit_t
 from datetime import datetime
 
 from vslice_utils.models import load_vlm
-from vslice_utils.helpers import set_seed, compute_video_metrics
+from vslice_utils.helpers import set_seed, compute_video_metrics, str_to_bool
 from vslice_utils.llava_summe_video_dataset import SumMeLLaMA_VideoDataset, SumMeLLaMA_DPODataset, DPOTrainBatchCollator, ValBatchCollator
 from vslice_utils.llava_tvsum_video_dataset import TVSumLLaMA_VideoDataset, TVSumLLaMA_DPODataset, DPOTrainBatchCollator, ValBatchCollator
 
@@ -142,7 +142,6 @@ def evaluate(model, val_loader, dataset_name, h5_paths, tvsum_user_scores=None, 
                 video_name=video_name,
                 dataset_name=dataset_name,
                 user_scores=tvsum_user_scores,
-                use_advanced_scoring=False,
             )
 
             split_results.append(res)
@@ -537,7 +536,7 @@ if __name__ == "__main__":
     parser.add_argument("--accumulation_steps", type=int, default=8)
     parser.add_argument("--beta", type=float, default=0.1)
     parser.add_argument("--warmup_ratio", type=float, default=0.1, help="Ratio of total training steps for linear LR warmup")
-    parser.add_argument("--use_advanced_scoring", action="store_true", help="Use action based ranking")
+    parser.add_argument('--use_boost', type=str_to_bool, default=False, help='Enable tanh boost')
     parser.add_argument("--loss_type", type=str, default="DPO")
     args = parser.parse_args()
     

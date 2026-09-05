@@ -12,7 +12,7 @@ FREE_GPUS=($(nvidia-smi --query-gpu=index,memory.used --format=csv,noheader,noun
 # GPU_B=${FREE_GPUS[1]}
 GPU_A=1
 GPU_B=2
-DATASET="tvsum"
+DATASET="summe"
 
 echo "Starting ${DATASET} on least-used GPU: $GPU_A"
 CUDA_VISIBLE_DEVICES=$GPU_A python vslice/simple_dpo.py \
@@ -24,7 +24,8 @@ CUDA_VISIBLE_DEVICES=$GPU_A python vslice/simple_dpo.py \
     --num_epochs=5 \
     --beta=0.1 \
     --learning_rate=5e-5 \
-    --loss_type="DPO" > "log_${DATASET}_dpo_shuffle.txt" &
+    --use_boost=False\
+    --loss_type="DPO" > "log_${DATASET}_dpo.txt" &
 
 echo "Starting ${DATASET} on second least-used GPU: $GPU_B"
 CUDA_VISIBLE_DEVICES=$GPU_B python vslice/simple_dpo.py \
@@ -36,8 +37,39 @@ CUDA_VISIBLE_DEVICES=$GPU_B python vslice/simple_dpo.py \
     --num_epochs=5 \
     --beta=0.1 \
     --learning_rate=5e-5 \
-    --loss_type="IPO" > "log_${DATASET}_ipo_shuffle.txt" &
+    --use_boost=False\
+    --loss_type="MPO" > "log_${DATASET}_mpo.txt" &
 
-# Wait for jobs to finish
 wait
-echo "Both training jobs completed!"
+echo "First two jobs completed!"
+
+# Run next two jobs (with boost)
+echo "Starting ${DATASET} on least-used GPU: $GPU_A"
+CUDA_VISIBLE_DEVICES=$GPU_A python vslice/simple_dpo.py \
+    --dataset "$DATASET" \
+    --split_file "./dataset/${DATASET}_splits.json" \
+    --model_type minicpm \
+    --batch_size=2 \
+    --clip_length=4 \
+    --num_epochs=5 \
+    --beta=0.1 \
+    --learning_rate=5e-5 \
+    --use_boost=True \
+    --loss_type="DPO" > "log_${DATASET}_dpo_boost.txt" &
+
+echo "Starting ${DATASET} on second least-used GPU: $GPU_B"
+CUDA_VISIBLE_DEVICES=$GPU_B python vslice/simple_dpo.py \
+    --dataset "$DATASET" \
+    --split_file "./dataset/${DATASET}_splits.json" \
+    --model_type minicpm \
+    --batch_size=2 \
+    --clip_length=4 \
+    --num_epochs=5 \
+    --beta=0.1 \
+    --learning_rate=5e-5 \
+    --use_boost=True \
+    --loss_type="MPO" > "log_${DATASET}_mpo_boost.txt" &
+
+# Wait for second two jobs to complete
+wait
+echo "All training jobs completed!"

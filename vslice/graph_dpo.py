@@ -20,7 +20,7 @@ from peft import LoraConfig, get_peft_model, PeftModel, prepare_model_for_kbit_t
 from datetime import datetime
 
 from vslice_utils.models import load_vlm
-from vslice_utils.helpers import set_seed, compute_video_metrics
+from vslice_utils.helpers import set_seed, compute_video_metrics, str_to_bool
 
 from vslice_utils.llava_summe_video_dataset import SumMeLLaMA_VideoDataset, SumMeLLaMA_DPODataset, DPOTrainBatchCollator, ValBatchCollator
 from vslice_utils.llava_tvsum_video_dataset import TVSumLLaMA_VideoDataset, TVSumLLaMA_DPODataset#, DPOTrainBatchCollator, ValBatchCollator
@@ -162,7 +162,6 @@ def evaluate_graph(model, val_loader, dataset_name, h5_paths, tvsum_user_scores=
                 video_name=video_name,
                 dataset_name=dataset_name,
                 user_scores=tvsum_user_scores,
-                use_advanced_scoring=False,
             )
 
             split_results.append(res)
@@ -727,6 +726,8 @@ if __name__ == "__main__":
     parser.add_argument("--eval_alpha", type=float, default=0.05, help="Graph diffusion weight during evaluation (0.0 to disable graph)")
     parser.add_argument("--eval_window_size", type=int, default=15, help="Temporal window size for graph connectivity in evaluation")
     parser.add_argument("--eval_threshold", type=float, default=0.9, help="Visual similarity quantile threshold for evaluation graph")
+    parser.add_argument('--use_boost', type=str_to_bool, default=False, help='Enable tanh boost')
+
     args = parser.parse_args()
     
     if args.model_path is None:

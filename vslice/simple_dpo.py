@@ -19,7 +19,7 @@ from peft import LoraConfig, get_peft_model, PeftModel, prepare_model_for_kbit_t
 from datetime import datetime
 
 from vslice_utils.models import load_vlm
-from vslice_utils.helpers import set_seed, compute_video_metrics
+from vslice_utils.helpers import set_seed, compute_video_metrics, str_to_bool
 from vslice_utils.llava_summe_video_dataset import SumMeLLaMA_VideoDataset, SumMeLLaMA_DPODataset, DPOTrainBatchCollator, ValBatchCollator
 from vslice_utils.llava_tvsum_video_dataset import TVSumLLaMA_VideoDataset, TVSumLLaMA_DPODataset, DPOTrainBatchCollator, ValBatchCollator
 
@@ -135,7 +135,6 @@ def evaluate(model, val_loader, dataset_name, h5_paths, tvsum_user_scores=None, 
                 video_name=video_name,
                 dataset_name=dataset_name,
                 user_scores=tvsum_user_scores,
-                use_advanced_scoring=False,
             )
 
             split_results.append(res)
@@ -144,7 +143,7 @@ def evaluate(model, val_loader, dataset_name, h5_paths, tvsum_user_scores=None, 
     unique_preds = len(np.unique(all_preds))
     return pd.DataFrame(split_results)
 
-def diff_attn_boost(logits_yes, logits_no):
+def diff_attn_boost(logits_yes, logits_no, boost=False):
     """
     Applies Tanh boost.
     Mathematically isomorphic to: Residual + (softmax(A1) - softmax(A2)) * V
@@ -156,8 +155,10 @@ def diff_attn_boost(logits_yes, logits_no):
     diff_gate = torch.tanh(diff / 2.0)
 
     # 3. Boosted Output: Residual + Gate * Magnitude
-    # return diff + diff_gate * torch.abs(diff)
-    return diff_gate * torch.abs(diff)
+    if boost:
+        return diff + diff_gate
+    else:
+        return diff
 
 def train_dpo(args):
     # Load VLM
@@ -316,10 +317,8 @@ def train_dpo(args):
                         ref_c_logits = peft_model.base_model(c_batch_data).logits[:, -1, :]
                         ref_r_logits = peft_model.base_model(r_batch_data).logits[:, -1, :]
 
-                        #ref_logp_c = F.logsigmoid(ref_c_logits[:, yes_id] - ref_c_logits[:, no_id])
-                        #ref_logp_r = F.logsigmoid(ref_r_logits[:, yes_id] - ref_r_logits[:, no_id])
-                        ref_logp_c = F.logsigmoid(diff_attn_boost(ref_c_logits[:, yes_id], ref_c_logits[:, no_id]))
-                        ref_logp_r = F.logsigmoid(diff_attn_boost(ref_r_logits[:, yes_id], ref_r_logits[:, no_id]))
+                        ref_logp_c = F.logsigmoid(diff_attn_boost(ref_c_logits[:, yes_id], ref_c_logits[:, no_id], args.use_boost))
+                        ref_logp_r = F.logsigmoid(diff_attn_boost(ref_r_logits[:, yes_id], ref_r_logits[:, no_id], args.use_boost))
 
                 #ref_logp_c = ref_logp_c.detach()
                 #ref_logp_r = ref_logp_r.detach()
@@ -332,8 +331,8 @@ def train_dpo(args):
                 r_logits = peft_model.base_model(r_batch_data).logits[:, -1, :]
 
                 # Compute binary log policy
-                pi_logp_c = F.logsigmoid(diff_attn_boost(c_logits[:, yes_id], c_logits[:, no_id]))
-                pi_logp_r = F.logsigmoid(diff_attn_boost(r_logits[:, yes_id], r_logits[:, no_id]))
+                pi_logp_c = F.logsigmoid(diff_attn_boost(c_logits[:, yes_id], c_logits[:, no_id], args.use_boost))
+                pi_logp_r = F.logsigmoid(diff_attn_boost(r_logits[:, yes_id], r_logits[:, no_id], args.use_boost))
 
                 pi_ratio = pi_logp_c - pi_logp_r
                 ref_ratio = ref_logp_c - ref_logp_r
@@ -390,10 +389,6 @@ def train_dpo(args):
                 diag['correct'] += (logits > log_margin.reshape(logits.shape)).sum().item()
                 diag['mse'].append(mse_loss.item())
                 diag['total'] += logits.size(0)
-                diag['kl_drift'].append(kl_drift)
-                diag['grad_share_easy'].append(grad_share_easy)
-                diag['grad_share_border'].append(grad_share_border)
-                diag['grad_share_hard'].append(grad_share_hard)
                 diag['pct_easy'].append(pct_easy)
                 diag['pct_border'].append(pct_border)
                 diag['pct_hard'].append(pct_hard)
@@ -544,7 +539,7 @@ if __name__ == "__main__":
     parser.add_argument("--accumulation_steps", type=int, default=8)
     parser.add_argument("--beta", type=float, default=0.1)
     parser.add_argument("--warmup_ratio", type=float, default=0.1, help="Ratio of total training steps for linear LR warmup")
-    parser.add_argument("--use_advanced_scoring", action="store_true", help="Use action based ranking")
+    parser.add_argument('--use_boost', type=str_to_bool, default=False, help='Enable tanh boost')
     parser.add_argument("--loss_type", type=str, default="DPO")
     args = parser.parse_args()
     

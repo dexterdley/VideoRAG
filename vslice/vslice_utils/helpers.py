@@ -30,6 +30,18 @@ def set_seed(seed):
 
 set_seed(42)
 
+def str_to_bool(value):
+    """Convert string to boolean."""
+    if isinstance(value, bool):
+        return value
+    value = value.lower().strip()
+    if value in ('true', '1', 't', 'y', 'yes', 'on'):
+        return True
+    elif value in ('false', '0', 'f', 'n', 'no', 'off'):
+        return False
+    else:
+        raise argparse.ArgumentTypeError(f'Expected True/False, got "{value}"')
+
 def temporal_process_features(features, window_size=15):
     """
     Calculates sliding window motion using back, forward, and net deltas.
@@ -62,7 +74,7 @@ def temporal_process_features(features, window_size=15):
     return combined_motion.numpy()
 
 # ──────────────────────── EVALUATION ────────────────────────
-def compute_video_metrics(yes_scores, no_scores, h5_path, h5_key, video_name, dataset_name, user_scores=None, use_advanced_scoring=False, epsilon=1e-8):
+def compute_video_metrics(yes_scores, no_scores, h5_path, h5_key, video_name, dataset_name, user_scores=None, epsilon=1e-8):
     """
     Calculates F-score, correlations, and ECE using VLM probabilities.
     """
@@ -75,16 +87,7 @@ def compute_video_metrics(yes_scores, no_scores, h5_path, h5_key, video_name, da
         gt_scores = grp['gtscore'][...]      
         user_summaries = grp['user_summary'][...] if 'user_summary' in grp else [grp['gtsummary'][...]]
 
-    if use_advanced_scoring:
-        # Motion processing
-        motion_features = temporal_process_features(features)
-        smoothed_motion = gaussian_filter1d(motion_features, sigma=2.0)
-        motion_weight = smoothed_motion / (np.mean(smoothed_motion) + epsilon)
-
-        final_scores = yes_scores * motion_weight
-        scores = (final_scores - np.min(final_scores)) /(np.max(final_scores) - np.min(final_scores))
-    else:
-        scores = yes_scores
+    scores = yes_scores
 
     scores_list = np.squeeze(scores).tolist()
     summary = generate_summary([cps], [scores_list], [n_frames], [picks])[0]
@@ -209,87 +212,4 @@ def build_dpo_dataset(manifest_data):
                     "margin": float(gap),
                     "log_margin": float(log_gap),
                 })
-    return dpo_entries
-
-def build_quadrant_dpo_dataset(manifest_data):
-    """
-    Build DPO preference pairs from quadrant-classified frames.
-    
-    Design principles:
-    1. Only one target per pair type to avoid conflicting gradients
-    2. All pairs target "Yes" — we always ask "should chosen have HIGHER p(Yes)?"
-       This directly optimizes rank correlation (Spearman/Kendall).
-    3. GT-weighted sampling: pairs with larger GT gaps are prioritized
-    4. Deduplicated pairs to avoid wasting training steps
-    
-    manifest_data: {video_id: {tp_mask, fp_mask, tn_mask, fn_mask, frame_paths, gtscore, p_yes, ...}}
-    """
-    dpo_entries = []
-    system_prompt = "You are an expert video editor. Strictly answer only Yes or No."
-    
-    for vid_id, data in manifest_data.items():
-        frames = data['frame_paths']
-        gt = data.get('gtscore', np.zeros(len(frames)))
-        p_yes = data.get('p_yes', np.zeros(len(frames)))
-
-        tp_idx = np.where(data['tp_mask'])[0]
-        fp_idx = np.where(data['fp_mask'])[0]
-        tn_idx = np.where(data['tn_mask'])[0]
-        fn_idx = np.where(data['fn_mask'])[0]
-
-        prompt = f"{system_prompt}\nDoes this image represent the core message of {data['keywords']} in the video context of '{data['title']}'?"
-        
-        seen_pairs = set()
-
-        def _add_pairs(chosen_pool, rejected_pool, max_pairs, label="Yes"):
-            """GT-weighted hard-negative mining: sort by GT gap, take top-k."""
-            if len(chosen_pool) == 0 or len(rejected_pool) == 0:
-                return
-            # import pdb; pdb.set_trace()
-            # Generate candidate pairs with GT gaps
-            candidates = []
-            n_samples = min(max_pairs * 3, len(chosen_pool) * len(rejected_pool))
-            for _ in range(n_samples):
-                c = random.choice(chosen_pool)
-                r = random.choice(rejected_pool)
-                if (c, r) in seen_pairs or frames[c] is None or frames[r] is None:
-                    continue
-                gap = abs(float(gt[c]) - float(gt[r]))
-                candidates.append((c, r, gap))
-            
-            # Sort by GT gap descending — largest disagreements first
-            candidates.sort(key=lambda x: x[2], reverse=True)
-            
-            for c_idx, r_idx, gap in candidates[:max_pairs]:
-                if (c_idx, r_idx) in seen_pairs:
-                    continue
-                seen_pairs.add((c_idx, r_idx))
-                dpo_entries.append({
-                    "prompt": prompt,
-                    "chosen_image": frames[c_idx],
-                    "rejected_image": frames[r_idx],
-                    "output": label,
-                    "margin": gap
-                })
-
-        # --- 1. ERROR CORRECTION: FN > FP (Target: "Yes") ---
-        # Most impactful for Spearman: missed highlights should rank above false alarms.
-        # Both are model errors — this pair directly fixes rank inversions.
-        _add_pairs(fn_idx, fp_idx, max_pairs=150)
-
-        # --- 2. PRECISION FIX: TP > FP (Target: "Yes") ---
-        # Correct highlights should produce higher p(Yes) than hallucinated ones.
-        # Teaches the model to discriminate real vs fake highlights.
-        _add_pairs(tp_idx, fp_idx, max_pairs=150)
-
-        # --- 3. RECALL FIX: FN > TN (Target: "Yes") ---
-        # Missed highlights should still rank above boring frames.
-        # Pushes up the score of underscored highlights.
-        _add_pairs(fn_idx, tn_idx, max_pairs=100)
-
-        # --- 4. CALIBRATION: TP > TN (Target: "Yes") ---
-        # Baseline anchor: confirmed highlights vs confirmed non-highlights.
-        # Reinforces the overall separation of the score distribution.
-        _add_pairs(tp_idx, tn_idx, max_pairs=100)
-
     return dpo_entries
