@@ -533,7 +533,6 @@ if __name__ == "__main__":
 
     parser.add_argument('--batch_size', type=int, default=2, help='Batch size (number of videos per batch)')
     parser.add_argument('--clip_length', type=int, default=4)
-    parser.add_argument("--accumulation_steps", type=int, default=8)
     parser.add_argument("--beta", type=float, default=0.1)
     parser.add_argument("--warmup_ratio", type=float, default=0.1, help="Ratio of total training steps for linear LR warmup")
     parser.add_argument('--use_boost', type=str_to_bool, default=False, help='Enable tanh boost')

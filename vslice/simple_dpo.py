@@ -156,7 +156,7 @@ def diff_attn_boost(logits_yes, logits_no, boost=False):
 
     # 3. Boosted Output: Residual + Gate * Magnitude
     if boost:
-        return diff + diff_gate
+        return diff * (1.0 + diff_gate.abs())
     else:
         return diff
 
@@ -207,7 +207,7 @@ def train_dpo(args):
     initial_torch_rng = torch.get_rng_state()
     initial_cuda_rng = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
 
-    for split_idx, split in enumerate(splits[:1]):
+    for split_idx, split in enumerate(splits):
         print(f"\n==================== SPLIT {split_idx+1}/{len(splits)} ====================")
 
         # 1. Set RNG state for every split
@@ -218,8 +218,8 @@ def train_dpo(args):
         if initial_cuda_rng is not None:
             torch.cuda.set_rng_state_all(initial_cuda_rng)
 
-        # 2. Restore exact pristine initial LoRA parameters
-        peft_model.load_state_dict(initial_lora_state, strict=False)        
+        # 2. Restore initial LoRA parameters
+        peft_model.load_state_dict(initial_lora_state, strict=False)
         optimizer = bnb.optim.AdamW8bit(peft_model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
         
         # --- Datasets and Dataloaders ---
@@ -536,7 +536,6 @@ if __name__ == "__main__":
 
     parser.add_argument('--batch_size', type=int, default=2, help='Batch size (number of videos per batch)')
     parser.add_argument('--clip_length', type=int, default=4)
-    parser.add_argument("--accumulation_steps", type=int, default=8)
     parser.add_argument("--beta", type=float, default=0.1)
     parser.add_argument("--warmup_ratio", type=float, default=0.1, help="Ratio of total training steps for linear LR warmup")
     parser.add_argument('--use_boost', type=str_to_bool, default=False, help='Enable tanh boost')
