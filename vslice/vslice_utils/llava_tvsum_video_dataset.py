@@ -79,6 +79,67 @@ class TVSumLLaMA_VideoDataset(Dataset):
         frame_indices = np.minimum(frame_indices, total_frames - 1)
         return frame_indices.tolist()
 
+    def _process_clip(self, frames, formatted_prompt):
+        """Helper function to run the VLM processor over a list of PIL frames"""
+        is_minicpm = "minicpm" in self.processor.__class__.__name__.lower()
+
+        prompts_lists = []
+        input_images_lists = []
+        if is_minicpm:
+            for img in frames:
+                msgs = [
+                    {'role': 'system', 'content': self.system_prompt},
+                    {'role': 'user', 'content': f"(<image>./</image>)\n{formatted_prompt}"}
+                ]
+                prompt_str = self.processor.tokenizer.apply_chat_template(
+                    msgs, tokenize=False, add_generation_prompt=True
+                )
+                prompts_lists.append(prompt_str)
+                input_images_lists.append([img])
+
+            inputs = self.processor(
+                prompts_lists,
+                input_images_lists,
+                max_slice_nums=1,
+                use_image_id=False,
+                return_tensors="pt",
+                max_length=2048
+            )
+
+            if "position_ids" not in inputs:
+                batch_size, seq_len = inputs["input_ids"].shape
+                inputs["position_ids"] = torch.arange(seq_len, dtype=torch.long).unsqueeze(0).expand(batch_size, -1)
+            if "image_sizes" in inputs:
+                inputs.pop("image_sizes")
+        else:
+            for img in frames:  # QWEN branch
+                msgs = [
+                    {'role': 'system', 'content': self.system_prompt},
+                    {'role': 'user', 'content': [
+                        {'type': 'image', 'image': img},
+                        {'type': 'text', 'text': formatted_prompt}
+                    ]}
+                ]
+                apply_fn = getattr(self.processor, 'apply_chat_template', getattr(self.processor.tokenizer, 'apply_chat_template', None))
+                has_chat_template = getattr(self.processor, 'chat_template', None) or getattr(self.processor.tokenizer, 'chat_template', None)
+                
+                if apply_fn and has_chat_template:
+                    prompt_str = apply_fn(msgs, tokenize=False, add_generation_prompt=True)
+                else:
+                    # Fallback for models without chat templates like PaliGemma
+                    prompt_str = formatted_prompt if "<image>" in formatted_prompt else f"<image>{formatted_prompt}"
+                    
+                prompts_lists.append(prompt_str)
+                input_images_lists.append(img)
+
+            inputs = self.processor(
+                text=prompts_lists,
+                images=input_images_lists,
+                padding=True,
+                return_tensors="pt"
+            )
+        return inputs
+
     def __getitem__(self, index):
         video_name = self._keys[index]
         full_features = torch.as_tensor(self.video_data[video_name + '/features'])
@@ -109,36 +170,7 @@ class TVSumLLaMA_VideoDataset(Dataset):
             features = full_features.unsqueeze(1)
 
         # --- PROCESSOR LOGIC ---
-        prompts_lists = []
-        input_images_lists = []
-
-        for img in frames:
-            msgs = [
-                {'role': 'system', 'content': self.system_prompt},
-                {'role': 'user', 'content': f"(<image>./</image>)\n{formatted_prompt}"}
-            ]
-            prompt_str = self.processor.tokenizer.apply_chat_template(
-                msgs, tokenize=False, add_generation_prompt=True
-            )
-            prompts_lists.append(prompt_str)
-            input_images_lists.append([img]) # List of lists: 1 image per prompt
-
-        # Run processor for the whole clip
-        inputs = self.processor(
-            prompts_lists,
-            input_images_lists,
-            max_slice_nums=1,
-            use_image_id=False,
-            return_tensors="pt",
-            max_length=2048
-        )
-
-        if "position_ids" not in inputs:
-            batch_size, seq_len = inputs["input_ids"].shape
-            inputs["position_ids"] = torch.arange(seq_len, dtype=torch.long).unsqueeze(0).expand(batch_size, -1)
-
-        if "image_sizes" in inputs:
-            inputs.pop("image_sizes")
+        inputs = self._process_clip(frames, formatted_prompt)
 
         sample = {
             'video_name': video_name,
@@ -225,7 +257,37 @@ class ValBatchCollator:
     def __init__(self, processor):
         self.processor = processor
         self.pad_token_id = self.processor.tokenizer.pad_token_id
-
+        self.is_minicpm = "minicpm" in str(type(processor)).lower()
+        
+    def _collate_general_vlm_inputs(self, hf_inputs):
+        """Collator for other VLMs (Qwen2-VL, Qwen2.5-VL, LLaVA, etc.)"""
+        max_len = max(x['input_ids'].size(-1) for x in hf_inputs)
+        
+        padded_input_ids = [
+            F.pad(x['input_ids'], (0, max_len - x['input_ids'].size(-1)), value=self.pad_token_id) 
+            for x in hf_inputs
+        ]
+        padded_attention_masks = [
+            F.pad(x['attention_mask'], (0, max_len - x['attention_mask'].size(-1)), value=0) 
+            for x in hf_inputs
+        ]
+        batch = {
+            'input_ids': torch.cat(padded_input_ids, dim=0),
+            'attention_mask': torch.cat(padded_attention_masks, dim=0),
+        }
+        # 1. pixel_values: Tensor concatenation along dim=0
+        if any('pixel_values' in x for x in hf_inputs):
+            batch['pixel_values'] = torch.cat([x['pixel_values'] for x in hf_inputs if 'pixel_values' in x], dim=0)
+        # 2. Qwen-specific: 3D patch grid tensor
+        if any('image_grid_thw' in x for x in hf_inputs):
+            batch['image_grid_thw'] = torch.cat([x['image_grid_thw'] for x in hf_inputs if 'image_grid_thw' in x], dim=0)
+        # 3. Optional position_ids (only if the model explicitly generated them)
+        if all('position_ids' in x for x in hf_inputs):
+            padded_pos = [F.pad(x['position_ids'], (0, max_len - x['position_ids'].size(-1)), value=0) for x in hf_inputs]
+            batch['position_ids'] = torch.cat(padded_pos, dim=0)
+        BatchClass = type(hf_inputs[0])
+        return BatchClass(batch)
+        
     def __call__(self, batch):
         video_names = [data['video_name'] for data in batch]
         titles = [data['title'] for data in batch]
@@ -236,46 +298,42 @@ class ValBatchCollator:
         hf_inputs = [data['inputs'] for data in batch]
         max_len = max(x['input_ids'].size(-1) for x in hf_inputs)
 
-        padded_input_ids = [
-            F.pad(x['input_ids'], (0, max_len - x['input_ids'].size(-1)), value=self.pad_token_id)
-            for x in hf_inputs
-        ]
-        padded_position_ids = [
-            F.pad(x['position_ids'], (0, max_len - x['position_ids'].size(-1)), value=0)
-            for x in hf_inputs
-        ]
-        padded_attention_masks = [
-            F.pad(x['attention_mask'], (0, max_len - x['attention_mask'].size(-1)), value=0)
-            for x in hf_inputs
-        ]
-
-        input_ids = torch.cat(padded_input_ids, dim=0)
-        position_ids = torch.cat(padded_position_ids, dim=0)
-        attention_mask = torch.cat(padded_attention_masks, dim=0)
-
-        pixel_values, image_bound, tgt_sizes = [], [], []
-        for x in hf_inputs:
-            if 'pixel_values' in x:
-                pixel_values.extend(x['pixel_values'])
-            if 'image_bound' in x:
-                image_bound.extend(x['image_bound'])
-            if 'tgt_sizes' in x:
-                 tgt_sizes.extend(x['tgt_sizes'])
-
-        MiniCPMClass = type(hf_inputs[0])
-
-        collated_inputs = MiniCPMClass({
-            'input_ids': input_ids,
-            'attention_mask': attention_mask,
-            'position_ids': position_ids,
-            'pixel_values': pixel_values,
-            'image_bound': image_bound,
-            'tgt_sizes': tgt_sizes,
-            'gtscore': gtscore_padded,
-            'features': frame_feat,
-            'video_name': video_names,
-            'title': titles
-        })
+        if self.is_minicpm:
+            max_len = max(x['input_ids'].size(-1) for x in hf_inputs)
+            padded_input_ids = [
+                F.pad(x['input_ids'], (0, max_len - x['input_ids'].size(-1)), value=self.pad_token_id)
+                for x in hf_inputs
+            ]
+            padded_position_ids = [
+                F.pad(x['position_ids'], (0, max_len - x['position_ids'].size(-1)), value=0)
+                for x in hf_inputs
+            ]
+            padded_attention_masks = [
+                F.pad(x['attention_mask'], (0, max_len - x['attention_mask'].size(-1)), value=0)
+                for x in hf_inputs
+            ]
+            input_ids = torch.cat(padded_input_ids, dim=0)
+            position_ids = torch.cat(padded_position_ids, dim=0)
+            attention_mask = torch.cat(padded_attention_masks, dim=0)
+            pixel_values, image_bound, tgt_sizes = [], [], []
+            for x in hf_inputs:
+                if 'pixel_values' in x:
+                    pixel_values.extend(x['pixel_values'])
+                if 'image_bound' in x:
+                    image_bound.extend(x['image_bound'])
+                if 'tgt_sizes' in x:
+                    tgt_sizes.extend(x['tgt_sizes'])
+            MiniCPMClass = type(hf_inputs[0])
+            collated_inputs = MiniCPMClass({
+                'input_ids': input_ids,
+                'attention_mask': attention_mask,
+                'position_ids': position_ids,
+                'pixel_values': pixel_values,
+                'image_bound': image_bound,
+                'tgt_sizes': tgt_sizes,
+            })
+        else:
+            collated_inputs = self._collate_general_vlm_inputs(hf_inputs)
 
         collated_inputs['n_frames'] = [data['n_frames'] for data in batch]
         collated_inputs['n_frame_per_seg'] = [data['n_frame_per_seg'] for data in batch]
@@ -358,35 +416,63 @@ class TVSumLLaMA_DPODataset(Dataset):
 
     def _process_clip(self, frames, formatted_prompt):
         """Helper function to run the VLM processor over a list of PIL frames"""
+        is_minicpm = "minicpm" in self.processor.__class__.__name__.lower()
+
         prompts_lists = []
         input_images_lists = []
+        if is_minicpm:
+            for img in frames:
+                msgs = [
+                    {'role': 'system', 'content': self.system_prompt},
+                    {'role': 'user', 'content': f"(<image>./</image>)\n{formatted_prompt}"}
+                ]
+                prompt_str = self.processor.tokenizer.apply_chat_template(
+                    msgs, tokenize=False, add_generation_prompt=True
+                )
+                prompts_lists.append(prompt_str)
+                input_images_lists.append([img])
 
-        for img in frames:
-            msgs = [
-                {'role': 'system', 'content': self.system_prompt},
-                {'role': 'user', 'content': f"(<image>./</image>)\n{formatted_prompt}"}
-            ]
-            prompt_str = self.processor.tokenizer.apply_chat_template(
-                msgs, tokenize=False, add_generation_prompt=True
+            inputs = self.processor(
+                prompts_lists,
+                input_images_lists,
+                max_slice_nums=1,
+                use_image_id=False,
+                return_tensors="pt",
+                max_length=2048
             )
-            prompts_lists.append(prompt_str)
-            input_images_lists.append([img])
 
-        inputs = self.processor(
-            prompts_lists,
-            input_images_lists,
-            max_slice_nums=1,
-            use_image_id=False,
-            return_tensors="pt",
-            max_length=2048
-        )
+            if "position_ids" not in inputs:
+                batch_size, seq_len = inputs["input_ids"].shape
+                inputs["position_ids"] = torch.arange(seq_len, dtype=torch.long).unsqueeze(0).expand(batch_size, -1)
+            if "image_sizes" in inputs:
+                inputs.pop("image_sizes")
+        else:
+            for img in frames:  # QWEN branch
+                msgs = [
+                    {'role': 'system', 'content': self.system_prompt},
+                    {'role': 'user', 'content': [
+                        {'type': 'image', 'image': img},
+                        {'type': 'text', 'text': formatted_prompt}
+                    ]}
+                ]
+                apply_fn = getattr(self.processor, 'apply_chat_template', getattr(self.processor.tokenizer, 'apply_chat_template', None))
+                has_chat_template = getattr(self.processor, 'chat_template', None) or getattr(self.processor.tokenizer, 'chat_template', None)
+                
+                if apply_fn and has_chat_template:
+                    prompt_str = apply_fn(msgs, tokenize=False, add_generation_prompt=True)
+                else:
+                    # Fallback for models without chat templates like PaliGemma
+                    prompt_str = formatted_prompt if "<image>" in formatted_prompt else f"<image>{formatted_prompt}"
+                    
+                prompts_lists.append(prompt_str)
+                input_images_lists.append(img)
 
-        if "position_ids" not in inputs:
-            batch_size, seq_len = inputs["input_ids"].shape
-            inputs["position_ids"] = torch.arange(seq_len, dtype=torch.long).unsqueeze(0).expand(batch_size, -1)
-        if "image_sizes" in inputs:
-            inputs.pop("image_sizes")
-
+            inputs = self.processor(
+                text=prompts_lists,
+                images=input_images_lists,
+                padding=True,
+                return_tensors="pt"
+            )
         return inputs
 
     def __getitem__(self, index):
@@ -436,21 +522,24 @@ class TVSumLLaMA_DPODataset(Dataset):
             'picks': torch.tensor(picks, dtype=torch.long)
         }
 
+        
 class DPOTrainBatchCollator:
     def __init__(self, processor):
         self.processor = processor
         self.pad_token_id = self.processor.tokenizer.pad_token_id
-
+        self.is_minicpm = "minicpm" in self.processor.__class__.__name__.lower()
+        
     def _collate_hf_inputs(self, hf_inputs):
         """Helper to pad and stack MiniCPM input dictionaries"""
         max_len = max(x['input_ids'].size(-1) for x in hf_inputs)
-
         padded_input_ids = [F.pad(x['input_ids'], (0, max_len - x['input_ids'].size(-1)), value=self.pad_token_id) for x in hf_inputs]
-        padded_position_ids = [F.pad(x['position_ids'], (0, max_len - x['position_ids'].size(-1)), value=0) for x in hf_inputs]
         padded_attention_masks = [F.pad(x['attention_mask'], (0, max_len - x['attention_mask'].size(-1)), value=0) for x in hf_inputs]
 
+        if all('position_ids' in x for x in hf_inputs):
+            padded_position_ids = [F.pad(x['position_ids'], (0, max_len - x['position_ids'].size(-1)), value=0) for x in hf_inputs]
+            position_ids = torch.cat(padded_position_ids, dim=0)
+
         input_ids = torch.cat(padded_input_ids, dim=0)
-        position_ids = torch.cat(padded_position_ids, dim=0)
         attention_mask = torch.cat(padded_attention_masks, dim=0)
 
         pixel_values, image_bound, tgt_sizes = [], [], []
@@ -468,6 +557,35 @@ class DPOTrainBatchCollator:
             'image_bound': image_bound,
             'tgt_sizes': tgt_sizes,
         })
+    
+    def _collate_general_vlm_inputs(self, hf_inputs):
+        """Collator for other VLMs (Qwen2-VL, Qwen2.5-VL, LLaVA, etc.)"""
+        max_len = max(x['input_ids'].size(-1) for x in hf_inputs)
+        
+        padded_input_ids = [
+            F.pad(x['input_ids'], (0, max_len - x['input_ids'].size(-1)), value=self.pad_token_id) 
+            for x in hf_inputs
+        ]
+        padded_attention_masks = [
+            F.pad(x['attention_mask'], (0, max_len - x['attention_mask'].size(-1)), value=0) 
+            for x in hf_inputs
+        ]
+        batch = {
+            'input_ids': torch.cat(padded_input_ids, dim=0),
+            'attention_mask': torch.cat(padded_attention_masks, dim=0),
+        }
+        # 1. pixel_values: Tensor concatenation along dim=0
+        if any('pixel_values' in x for x in hf_inputs):
+            batch['pixel_values'] = torch.cat([x['pixel_values'] for x in hf_inputs if 'pixel_values' in x], dim=0)
+        # 2. Qwen-specific: 3D patch grid tensor
+        if any('image_grid_thw' in x for x in hf_inputs):
+            batch['image_grid_thw'] = torch.cat([x['image_grid_thw'] for x in hf_inputs if 'image_grid_thw' in x], dim=0)
+        # 3. Optional position_ids (only if the model explicitly generated them)
+        if all('position_ids' in x for x in hf_inputs):
+            padded_pos = [F.pad(x['position_ids'], (0, max_len - x['position_ids'].size(-1)), value=0) for x in hf_inputs]
+            batch['position_ids'] = torch.cat(padded_pos, dim=0)
+        BatchClass = type(hf_inputs[0])
+        return BatchClass(batch)
 
     def __call__(self, batch):
         video_names = [data['video_name'] for data in batch]
@@ -482,8 +600,10 @@ class DPOTrainBatchCollator:
         picks = [data['picks'] for data in batch]
 
         # Collate chosen and rejected separately so your DPO loop can handle them cleanly
-        chosen_inputs = self._collate_hf_inputs([data['chosen_inputs'] for data in batch])
-        rejected_inputs = self._collate_hf_inputs([data['rejected_inputs'] for data in batch])
+        collate_fn = self._collate_hf_inputs if self.is_minicpm else self._collate_general_vlm_inputs
+
+        chosen_inputs = collate_fn([data['chosen_inputs'] for data in batch])
+        rejected_inputs = collate_fn([data['rejected_inputs'] for data in batch])
 
         return {
             'video_name': video_names,

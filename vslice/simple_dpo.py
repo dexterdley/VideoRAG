@@ -21,7 +21,7 @@ from datetime import datetime
 from vslice_utils.models import load_vlm
 from vslice_utils.helpers import set_seed, compute_video_metrics, str_to_bool
 from vslice_utils.llava_summe_video_dataset import SumMeLLaMA_VideoDataset, SumMeLLaMA_DPODataset, DPOTrainBatchCollator, ValBatchCollator
-from vslice_utils.llava_tvsum_video_dataset import TVSumLLaMA_VideoDataset, TVSumLLaMA_DPODataset, DPOTrainBatchCollator, ValBatchCollator
+from vslice_utils.llava_tvsum_video_dataset import TVSumLLaMA_VideoDataset, TVSumLLaMA_DPODataset#, DPOTrainBatchCollator, ValBatchCollator
 
 # Evaluation dependencies
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'csta'))
@@ -111,7 +111,10 @@ def evaluate(model, val_loader, dataset_name, h5_paths, tvsum_user_scores=None, 
             gtscore = gtscores.squeeze().numpy() if hasattr(gtscores, 'numpy') else np.array(gtscores)
 
             batch_data = batch_data.to(device)
-            outputs = model.base_model(batch_data)
+            if model_type == "minicpm":
+                outputs = model.base_model(batch_data)
+            else:
+                outputs = model(**batch_data)
 
             logits = outputs.logits[:, -1, :].detach()
             yes_logits, no_logits = logits[:, yes_id], logits[:, no_id]
@@ -196,7 +199,7 @@ def train_dpo(args):
             target_modules=["q_proj", "v_proj", "k_proj", "o_proj"],
             lora_dropout=0.05,
             bias="none",
-            task_type="CAUSAL_LM"
+            task_type=None,
     )
     peft_model = get_peft_model(model, lora_config)
 
@@ -274,7 +277,7 @@ def train_dpo(args):
             num_training_steps=total_training_steps
         )
        
-        writer = SummaryWriter(f"runs/vslice_{args.loss_type}_{args.dataset}_{split_idx}_{timestamp}")
+        writer = SummaryWriter(f"runs/vslice_{args.model_type}_{args.loss_type}_{args.dataset}_{split_idx}_{timestamp}")
         writer.add_text(
             "hyperparameters",
             "|param|value|\n|-|-|\n%s" % ("\n".join([f"|{key}|{value}|" for key, value in vars(args).items()])),
@@ -303,7 +306,7 @@ def train_dpo(args):
             }
 
             for step, batch_data in enumerate(tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.num_epochs}", leave=False)):
-
+                
                 c_gtscore = batch_data.pop("chosen_gt").to(device)
                 r_gtscore = batch_data.pop("rejected_gt").to(device)
                 c_batch_data = batch_data.pop("chosen_inputs").to(device)
@@ -314,8 +317,12 @@ def train_dpo(args):
                 peft_model.eval()
                 with peft_model.disable_adapter():
                     with torch.no_grad():
-                        ref_c_logits = peft_model.base_model(c_batch_data).logits[:, -1, :]
-                        ref_r_logits = peft_model.base_model(r_batch_data).logits[:, -1, :]
+                        if args.model_type == "minicpm":
+                            ref_c_logits = peft_model.base_model(c_batch_data).logits[:, -1, :]
+                            ref_r_logits = peft_model.base_model(r_batch_data).logits[:, -1, :]
+                        else:
+                            ref_c_logits = peft_model(**c_batch_data).logits[:, -1, :]
+                            ref_r_logits = peft_model(**r_batch_data).logits[:, -1, :]
 
                         ref_logp_c = F.logsigmoid(diff_attn_boost(ref_c_logits[:, yes_id], ref_c_logits[:, no_id], args.use_boost))
                         ref_logp_r = F.logsigmoid(diff_attn_boost(ref_r_logits[:, yes_id], ref_r_logits[:, no_id], args.use_boost))
@@ -327,8 +334,12 @@ def train_dpo(args):
 
                 # Policy Logps (LoRA Enabled)
                 peft_model.train()
-                c_logits = peft_model.base_model(c_batch_data).logits[:, -1, :]
-                r_logits = peft_model.base_model(r_batch_data).logits[:, -1, :]
+                if args.model_type == "minicpm":
+                    c_logits = peft_model.base_model(c_batch_data).logits[:, -1, :]
+                    r_logits = peft_model.base_model(r_batch_data).logits[:, -1, :]
+                else:
+                    c_logits = peft_model.base_model(**c_batch_data).logits[:, -1, :]
+                    r_logits = peft_model.base_model(**r_batch_data).logits[:, -1, :]
 
                 # Compute binary log policy
                 pi_logp_c = F.logsigmoid(diff_attn_boost(c_logits[:, yes_id], c_logits[:, no_id], args.use_boost))
@@ -438,7 +449,8 @@ def train_dpo(args):
                     h5_paths=h5_paths,
                     yes_id=yes_id,
                     no_id=no_id,
-                    tvsum_user_scores=tvsum_user_scores
+                    tvsum_user_scores=tvsum_user_scores,
+                    model_type=args.model_type,
                 )
                 
                 if not val_df.empty:
@@ -478,7 +490,8 @@ def train_dpo(args):
             h5_paths=h5_paths,
             yes_id=yes_id,
             no_id=no_id,
-            tvsum_user_scores=tvsum_user_scores
+            tvsum_user_scores=tvsum_user_scores,
+            model_type=args.model_type,
         )
 
         if not test_df.empty:
@@ -507,7 +520,7 @@ def train_dpo(args):
         avg_overall_tau = np.mean([m['kendall'] for m in eval_split_metrics.values()])
         avg_overall_rho = np.mean([m['spearman'] for m in eval_split_metrics.values()])
         print(f"Global Avg | F1: {avg_overall_f1:.4f} | Kendall: {avg_overall_tau:.4f} | Spearman: {avg_overall_rho:.4f}")
-        writer.add_scalar("Test/Global_F-Score", avg_overall_f1)
+        writer.add_scalar("Test/Global_F-Score", avg_overall_f1) # Overall
         writer.add_scalar("Test/Global_Kendall_Tau", avg_overall_tau)
         writer.add_scalar("Test/Global_Spearman_Rho", avg_overall_rho)
 
@@ -515,7 +528,12 @@ def train_dpo(args):
     writer.close()
 
 def resolve_model_path(mtype):
-    if mtype == "qwen": return "Qwen/Qwen3.5-9B"
+    if mtype in ["qwen", "qwen2_vl"]:
+        return "Qwen/Qwen2.5-VL-3B-Instruct"
+    elif mtype == "smolvlm":
+        return "HuggingFaceTB/SmolVLM-Instruct"
+    elif mtype == "paligemma":
+        return "google/paligemma2-3b-pt-224"
     candidates = ["./MiniCPM-V-2_6-int4", "/home/dexter/VideoRAG/.checkpoints/MiniCPM-V-2_6-int4"]
     for p in candidates:
         if os.path.exists(p): return p
@@ -523,7 +541,7 @@ def resolve_model_path(mtype):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model_type", type=str, default="minicpm", choices=["minicpm", "qwen"])
+    parser.add_argument("--model_type", type=str, default="minicpm", choices=["minicpm", "qwen", "qwen2_vl", "smolvlm", "paligemma"])
     parser.add_argument("--dataset", type=str, default="both", choices=["summe", "tvsum"])
     parser.add_argument("--root_dir", type=str, default=".")
     parser.add_argument("--model_path", type=str, default=None)

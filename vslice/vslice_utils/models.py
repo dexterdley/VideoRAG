@@ -55,34 +55,82 @@ def load_vlm(model_path, model_type, device, load_in_4bit=False):
         print(f"[{device}] [OK] MiniCPM Loaded (Yes={yes_id}, No={no_id})")
         return model, tokenizer, processor, yes_id, no_id
 
-    elif model_type == "qwen":
+    elif model_type in ["qwen", "qwen2_vl"]:
         kwargs = {
             "trust_remote_code": True,
-            "device_map": "auto",
-            "_attn_implementation": "flash_attention_2" if torch.cuda.is_available() else "eager"
+            "device_map": device,
+            "attn_implementation": "sdpa" if load_in_4bit else "eager",
         }
+
         if load_in_4bit:
             kwargs["quantization_config"] = bnb_config
         else:
-            kwargs["dtype"] = dtype
+            kwargs["torch_dtype"] = dtype
             
         model = AutoModelForImageTextToText.from_pretrained(model_path, **kwargs)
         if not load_in_4bit:
             model = model.eval()
             
-        processor = AutoProcessor.from_pretrained(model_path, pad_token='<|endoftext|>')
+        processor = AutoProcessor.from_pretrained(model_path, trust_remote_code=True)
+        if processor.tokenizer.pad_token_id is None:
+            processor.tokenizer.pad_token = processor.tokenizer.eos_token
         
         # In Qwen, 'Yes' and 'No' IDs
         temp_ids = processor.tokenizer(["Yes", "No"], add_special_tokens=False).input_ids
         yes_id = temp_ids[0][0]
         no_id = temp_ids[1][0]
         
-        print(f"[{device}] [OK] Qwen3.5 Loaded (Yes={yes_id}, No={no_id})")
-        # Reuse same structure for convenience
-        return QwenVLWrapper(model, processor), processor.tokenizer, processor, yes_id, no_id
+        print(f"[{device}] [OK] Qwen VL Loaded (Yes={yes_id}, No={no_id})")
+        return model, processor.tokenizer, processor, yes_id, no_id
 
+    elif model_type == "smolvlm":
+        kwargs = {
+            "trust_remote_code": True,
+            "device_map": device,
+            "attn_implementation": "sdpa" if load_in_4bit else "eager",
+        }
+        if load_in_4bit:
+            kwargs["quantization_config"] = bnb_config
+        else:
+            kwargs["torch_dtype"] = dtype
 
+        model = AutoModelForImageTextToText.from_pretrained(model_path, **kwargs)
+        if not load_in_4bit:
+            model = model.eval()
 
+        processor = AutoProcessor.from_pretrained(model_path, trust_remote_code=True)
+        if processor.tokenizer.pad_token_id is None:
+            processor.tokenizer.pad_token = processor.tokenizer.eos_token
+
+        temp_ids = processor.tokenizer(["Yes", "No"], add_special_tokens=False).input_ids
+        yes_id = temp_ids[0][0]
+        no_id = temp_ids[1][0]
+
+        print(f"[{device}] [OK] SmolVLM Loaded (Yes={yes_id}, No={no_id})")
+        return model, processor.tokenizer, processor, yes_id, no_id
+    
+    elif model_type == "paligemma":
+        kwargs = {
+            "trust_remote_code": True,
+            "device_map": device,
+            "attn_implementation": "sdpa" if load_in_4bit else "eager",
+        }
+        if load_in_4bit:
+            kwargs["quantization_config"] = bnb_config
+        else:
+            kwargs["torch_dtype"] = dtype
+        model = AutoModelForImageTextToText.from_pretrained(model_path, **kwargs)
+        if not load_in_4bit:
+            model = model.eval()
+        processor = AutoProcessor.from_pretrained(model_path, trust_remote_code=True)
+        
+        # Token IDs for "Yes" and "No" in Gemma tokenizer
+        temp_ids = processor.tokenizer(["Yes", "No"], add_special_tokens=False).input_ids
+        yes_id = temp_ids[0][0]
+        no_id = temp_ids[1][0]
+        print(f"[{device}] [OK] PaliGemma Loaded (Yes={yes_id}, No={no_id})")
+        return model, processor.tokenizer, processor, yes_id, no_id
+        
 # ─────────────────────── VLM INFERENCE ───────────────────────
 
 def minicpm_extract_title_and_keywords(raw_title, model, processor):

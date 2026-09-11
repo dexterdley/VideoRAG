@@ -24,28 +24,28 @@ def moving_average(data, smoothing_weight=0.99, start=0):
 
 # File paths
 file_paths_kl = {
-    'DPO': root + "run-vslice_DPO_summe_0_20260905_104913-tag-Train_step_kl_drift.csv",
-    'DPO (DiffAttn)': root + "run-vslice_DPO_summe_0_20260905_105131-tag-Train_step_kl_drift.csv",
-    'Focal': root + "run-vslice_MPO_summe_0_20260904_230053-tag-Train_step_kl_drift.csv",
+    'DPO': root + "run-vslice_DPO_no_margin_summe_0_20260909_163954-tag-Train_step_kl_drift.csv",
+    'DPO + Margin': root + "run-vslice_DPO_summe_0_20260905_104913-tag-Train_step_kl_drift.csv",
+    'Focal DPO + Margin': root + "run-vslice_MPO_summe_0_20260904_230053-tag-Train_step_kl_drift.csv",
 }
 
 file_paths_loss = {
-    'DPO': root + "run-vslice_DPO_summe_0_20260905_104913-tag-Train_step_loss.csv",
-    'DPO (DiffAttn)': root + "run-vslice_DPO_summe_0_20260909_135311-tag-Train_step_loss.csv",
-    'Focal': root + "run-vslice_MPO_summe_0_20260904_230053-tag-Train_step_loss.csv",
+    'DPO': root + "run-vslice_DPO_no_margin_summe_0_20260909_163954-tag-Train_step_loss.csv",
+    'DPO + Margin': root + "run-vslice_DPO_summe_0_20260905_104913-tag-Train_step_loss.csv",
+    'Focal DPO + Margin': root + "run-vslice_MPO_summe_0_20260904_230053-tag-Train_step_loss.csv",
 }
 
 file_paths_pi_ratio = {
-    'DPO': root + "run-vslice_DPO_summe_0_20260905_104913-tag-Train_step_pi_ratio.csv",
-    'DPO (DiffAttn)': root + "run-vslice_DPO_summe_0_20260909_135311-tag-Train_step_pi_ratio.csv",
-    'Focal': root + "run-vslice_MPO_summe_0_20260904_230053-tag-Train_step_pi_ratio.csv",
+    'DPO': root + "run-vslice_DPO_no_margin_summe_0_20260909_163954-tag-Train_step_pi_ratio.csv",
+    'DPO + Margin': root + "run-vslice_DPO_summe_0_20260905_104913-tag-Train_step_pi_ratio.csv",
+    'Focal DPO + Margin': root + "run-vslice_MPO_summe_0_20260904_230053-tag-Train_step_pi_ratio.csv",
 }
 
-plt.rcParams.update({'font.size': 20})
+plt.rcParams.update({'font.size': 18})
 
 # Curated colour palette – distinct, publication-friendly
-_COLORS = ['#2E86AB', '#E84855', '#3BB273']   # steel-blue, crimson, emerald
-_STYLES = ['-', '--', '-.']
+_COLORS = ['#2E86AB', '#E84855', 'g']   # steel-blue, crimson, emerald
+_STYLES = ['-', '-', '-']
 
 def _plot_metric_on_ax(ax, file_paths, ylabel, smoothing_weight, start,
                        legend_loc='upper right', show_legend=False):
@@ -75,9 +75,9 @@ def plot_combined(save_file="vslice_combined.pdf"):
     fig, axes = plt.subplots(1, 3, figsize=(15, 4))
 
     configs = [
-        (file_paths_loss,     'Loss',           0.95, 7,  'upper right', True),
-        (file_paths_kl,       'KL Divergence', 0.98, 7,  'lower right', False),
-        (file_paths_pi_ratio, 'Margin',         0.98, 7,  'lower right', False),
+        (file_paths_loss,     'Loss',           0.9, 7,  'upper right', True),
+        (file_paths_kl,       'KL Divergence', 0.9, 7,  'lower right', False),
+        (file_paths_pi_ratio, 'Separation Margin',         0.9, 7,  'lower right', False),
     ]
 
     for ax, (fps, ylabel, sw, st, lloc, show_leg) in zip(axes, configs):
