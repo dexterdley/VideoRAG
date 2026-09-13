@@ -13,7 +13,7 @@ from decord import VideoReader, cpu
 device = "cuda" if torch.cuda.is_available() else "cpu"
 random.seed(42)
 
-def load_video_from_picks(video_path, picks, width=896, height=672):
+def load_video_from_picks(video_path, picks, width=224, height=224):
     """
     Directly load the picked frames as PIL Images
     """
@@ -76,6 +76,7 @@ class SumMeLLaMA_VideoDataset(Dataset):
     def _process_clip(self, frames, formatted_prompt):
         """Helper function to run the VLM processor over a list of PIL frames"""
         is_minicpm = "minicpm" in self.processor.__class__.__name__.lower()
+        is_paligemma = "paligemma" in self.processor.__class__.__name__.lower()
 
         prompts_lists = []
         input_images_lists = []
@@ -105,6 +106,22 @@ class SumMeLLaMA_VideoDataset(Dataset):
                 inputs["position_ids"] = torch.arange(seq_len, dtype=torch.long).unsqueeze(0).expand(batch_size, -1)
             if "image_sizes" in inputs:
                 inputs.pop("image_sizes")
+
+        elif is_paligemma:
+            for img in frames:
+                # PaliGemma 2 strictly expects a flat string starting with <image>
+                # It does not support dictionary-based chat templates.
+                prompt_str = f"<image>{self.system_prompt} {formatted_prompt}\n"
+                prompts_lists.append(prompt_str)
+                input_images_lists.append(img)
+
+            inputs = self.processor(
+                text=prompts_lists,
+                images=input_images_lists,
+                padding=True,
+                return_tensors="pt"
+            )
+            
         else:
             for img in frames:  # QWEN branch
                 msgs = [
@@ -121,8 +138,9 @@ class SumMeLLaMA_VideoDataset(Dataset):
                     prompt_str = apply_fn(msgs, tokenize=False, add_generation_prompt=True)
                 else:
                     # Fallback for models without chat templates like PaliGemma
-                    prompt_str = formatted_prompt if "<image>" in formatted_prompt else f"<image>{formatted_prompt}"
-                    
+                    # prompt_str = formatted_prompt if "<image>" in formatted_prompt else f"<image>{formatted_prompt}"
+                    prompt_str = f"<image>{self.system_prompt} {formatted_prompt}\n"
+
                 prompts_lists.append(prompt_str)
                 input_images_lists.append(img)
 
@@ -418,6 +436,7 @@ class SumMeLLaMA_DPODataset(Dataset):
     def _process_clip(self, frames, formatted_prompt):
         """Helper function to run the VLM processor over a list of PIL frames"""
         is_minicpm = "minicpm" in self.processor.__class__.__name__.lower()
+        is_paligemma = "paligemma" in self.processor.__class__.__name__.lower()
 
         prompts_lists = []
         input_images_lists = []
@@ -447,6 +466,22 @@ class SumMeLLaMA_DPODataset(Dataset):
                 inputs["position_ids"] = torch.arange(seq_len, dtype=torch.long).unsqueeze(0).expand(batch_size, -1)
             if "image_sizes" in inputs:
                 inputs.pop("image_sizes")
+
+        elif is_paligemma:
+            for img in frames:
+                # PaliGemma 2 strictly expects a flat string starting with <image>
+                # It does not support dictionary-based chat templates.
+                prompt_str = f"<image>{self.system_prompt} {formatted_prompt}\n"
+                prompts_lists.append(prompt_str)
+                input_images_lists.append(img)
+
+            inputs = self.processor(
+                text=prompts_lists,
+                images=input_images_lists,
+                padding=True,
+                return_tensors="pt"
+            )
+            
         else:
             for img in frames:  # QWEN branch
                 msgs = [
@@ -463,8 +498,9 @@ class SumMeLLaMA_DPODataset(Dataset):
                     prompt_str = apply_fn(msgs, tokenize=False, add_generation_prompt=True)
                 else:
                     # Fallback for models without chat templates like PaliGemma
-                    prompt_str = formatted_prompt if "<image>" in formatted_prompt else f"<image>{formatted_prompt}"
-                    
+                    # prompt_str = formatted_prompt if "<image>" in formatted_prompt else f"<image>{formatted_prompt}"
+                    prompt_str = f"<image>{self.system_prompt} {formatted_prompt}\n"
+
                 prompts_lists.append(prompt_str)
                 input_images_lists.append(img)
 

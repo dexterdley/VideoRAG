@@ -125,7 +125,7 @@ def load_vlm(model_path, model_type, device, load_in_4bit=False):
         processor = AutoProcessor.from_pretrained(model_path, trust_remote_code=True)
         
         # Token IDs for "Yes" and "No" in Gemma tokenizer
-        temp_ids = processor.tokenizer(["Yes", "No"], add_special_tokens=False).input_ids
+        temp_ids = processor.tokenizer(["yes", "no"], add_special_tokens=False).input_ids
         yes_id = temp_ids[0][0]
         no_id = temp_ids[1][0]
         print(f"[{device}] [OK] PaliGemma Loaded (Yes={yes_id}, No={no_id})")

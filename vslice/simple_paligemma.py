@@ -44,48 +44,11 @@ if sys.platform == "win32":
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
     sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
 
-"""
-TBD FIX TVSUM EVALUATION BUG
-SUMME: TO BEAT 0.256 0.285, TVSUM: 0.195 0.255
-==================== SPLIT 1/5 ====================
-[Split 1] Test | F-Score: 0.4464 | Tau: 0.1548 | Rho: 0.1723
-[Split 1] Test | F-Score: 0.4600 | Tau: 0.2379 | Rho: 0.2652
-==================== SPLIT 2/5 ====================
-[Split 2] Test | F-Score: 0.5475 | Tau: 0.2793 | Rho: 0.3109
-==================== SPLIT 3/5 ====================
-[Split 3] Test | F-Score: 0.5193 | Tau: 0.2429 | Rho: 0.2687
-==================== SPLIT 4/5 ====================
-[Split 4] Test | F-Score: 0.5311 | Tau: 0.2160 | Rho: 0.2430
-==================== SPLIT 5/5 ====================
-[Split 5] Test | F-Score: 0.5052 | Tau: 0.2333 | Rho: 0.2591
-════════════════════════════════════════════════════════════
-FINAL GLOBAL BENCHMARK SUMMARY (5 SPLITS)
-════════════════════════════════════════════════════════════
-Global Avg | F1: 0.5099 | Kendall: 0.2253 | Spearman: 0.2508 # Base
-Global Avg | F1: 0.5198 | Kendall: 0.2470 | Spearman: 0.2750 # w DPO
-TVSum:
-Global Avg | F1: 0.4788 | Kendall: 0.2438 | Spearman: 0.3118
-
-### CSTA
-# Summe
-Average F-score across 5 splits: 0.5515
-Average Kendall Tau across splits: 0.2532
-Average Spearman Rho across splits: 0.2819
-# TVSum
-Average F-score across 5 splits: 0.5437
-Average Kendall Tau across splits: 0.1925
-Average Spearman Rho across splits: 0.2532
-[Split 1] Test | F-Score: 0.5086 | Tau: 0.2293 | Rho: 0.2561
-[Split 2] Test | F-Score: 0.5368 | Tau: 0.2460 | Rho: 0.2738
-[Split 3] Test | F-Score: 0.7210 | Tau: 0.3915 | Rho: 0.4349
-[Split 4] Test | F-Score: 0.4544 | Tau: 0.1869 | Rho: 0.2100
-[Split 5] Test | F-Score: 0.5321 | Tau: 0.2294 | Rho: 0.2541
-"""
-
 def evaluate(model, val_loader, dataset_name, h5_paths, tvsum_user_scores=None, yes_id=9454, no_id=2753,
-             output_dir=None, model_type="minicpm"):
+             output_dir=None, model_type="paligemma", chunk_size=8):
     """
     Evaluates the model using the ValBatchCollator and val_loader.
+    Chunking is applied during inference to avoid OOM errors on long videos.
     """
     all_preds = []
     split_results = []
@@ -110,26 +73,45 @@ def evaluate(model, val_loader, dataset_name, h5_paths, tvsum_user_scores=None, 
 
             gtscore = gtscores.squeeze().numpy() if hasattr(gtscores, 'numpy') else np.array(gtscores)
 
-            batch_data = batch_data.to(device)
-            if model_type == "minicpm":
-                outputs = model.base_model(batch_data)
-            else:
-                outputs = model(**batch_data)
-
-            logits = outputs.logits[:, -1, :].detach()
-            yes_logits, no_logits = logits[:, yes_id], logits[:, no_id]
-            raw_preds = F.sigmoid(yes_logits - no_logits).cpu().float()
+            # Determine total number of segments (batch dimension length) for this video
+            # Assumes all batched tensor values in batch_data have the same 0-th dimension
+            num_segments = list(batch_data.values())[0].shape[0]
             
-            # Eagerly free up GPU memory
-            del outputs, logits, yes_logits, no_logits, batch_data
-            torch.cuda.empty_cache()
+            all_yes_logits = []
+            all_no_logits = []
+
+            # Process the video in chunks to avoid OOM
+            for i in range(0, num_segments, chunk_size):
+                # Slice tensors for the current chunk and move to device
+                chunk_data = {
+                    k: (v[i:i + chunk_size].to(device) if isinstance(v, torch.Tensor) else v) 
+                    for k, v in batch_data.items()
+                }
+                
+                outputs = model(**chunk_data)
+                
+                chunk_logits_capped = outputs.logits[:, -1, :].detach().cpu().to(torch.float32)
+    
+                chunk_logits = 30.0 * torch.atanh(
+                    torch.clamp(chunk_logits_capped /30.0, min=-1.0 + 1e-6, max=1.0 - 1e-6)
+                )
+                
+                all_yes_logits.append(chunk_logits[:, yes_id])
+                all_no_logits.append(chunk_logits[:, no_id])
+                
+                # Eagerly free up GPU memory after every chunk
+                del outputs, chunk_logits, chunk_data
+                torch.cuda.empty_cache()
+
+            # Reconstruct the full sequence of logits
+            yes_logits = torch.cat(all_yes_logits, dim=0)
+            no_logits = torch.cat(all_no_logits, dim=0)
+            
+            raw_preds = F.sigmoid(yes_logits - no_logits).float()
 
             yes_scores = raw_preds.numpy()
             all_preds.extend(yes_scores)
             
-            # Apply Min-Max Scaling
-            #yes_scores = (yes_scores - yes_scores.min()) / (yes_scores.max() - yes_scores.min() + 1e-8)
-
             res = compute_video_metrics(
                 yes_scores=yes_scores, 
                 no_scores=1-yes_scores, 
@@ -139,7 +121,7 @@ def evaluate(model, val_loader, dataset_name, h5_paths, tvsum_user_scores=None, 
                 dataset_name=dataset_name,
                 user_scores=tvsum_user_scores,
             )
-
+            # import pdb; pdb.set_trace()
             split_results.append(res)
 
     all_preds = np.array(all_preds)
@@ -164,11 +146,22 @@ def diff_attn_boost(logits_yes, logits_no, boost=False):
         return diff
 
 def train_dpo(args):
-    # Load VLM
+    # Load VLM (Policy Model)
     vlm_vars = load_vlm(args.model_path, args.model_type, device)
     wrapper_or_model, tokenizer, processor, yes_id, no_id = vlm_vars
     model = wrapper_or_model.model if args.model_type == "qwen" else wrapper_or_model
+    model.train()
     
+    # Load Reference Model for DPO (Frozen)
+    ref_vlm_vars = load_vlm(args.model_path, args.model_type, device)
+    ref_wrapper = ref_vlm_vars[0]
+    ref_model = ref_wrapper.model if args.model_type == "qwen" else ref_wrapper
+    ref_model.eval()
+    ref_model.requires_grad_(False)
+    
+    soft_cap = getattr(model.config.text_config, "final_logit_softcapping", 30.0)
+    epsilon = 1e-5
+
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
     h5_paths = {
@@ -190,40 +183,13 @@ def train_dpo(args):
     else:
         tvsum_user_scores = None
 
-    print("Freezing base model & use LoRA for fine-tuning ...")
-    model.requires_grad_(False)
+    print("Running full fine-tuning (No LoRA) ...")
+    model.requires_grad_(True)
 
-    lora_config = LoraConfig(
-            r=8,
-            lora_alpha=16,
-            target_modules=["q_proj", "v_proj", "k_proj", "o_proj"],
-            lora_dropout=0.05,
-            bias="none",
-            task_type=None,
-    )
-    peft_model = get_peft_model(model, lora_config)
-
-    # Store RNG state 
-    initial_lora_state = {k: v.cpu().clone() for k, v in peft_model.state_dict().items() if "lora_" in k}
-    initial_py_rng = random.getstate()
-    initial_np_rng = np.random.get_state()
-    initial_torch_rng = torch.get_rng_state()
-    initial_cuda_rng = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
-
-    for split_idx, split in enumerate(splits):
+    for split_idx, split in enumerate(splits[:1]):
         print(f"\n==================== SPLIT {split_idx+1}/{len(splits)} ====================")
 
-        # 1. Set RNG state for every split
-        random.setstate(initial_py_rng)
-        np.random.set_state(initial_np_rng)
-        torch.set_rng_state(initial_torch_rng)
-        
-        if initial_cuda_rng is not None:
-            torch.cuda.set_rng_state_all(initial_cuda_rng)
-
-        # 2. Restore initial LoRA parameters
-        peft_model.load_state_dict(initial_lora_state, strict=False)
-        optimizer = bnb.optim.AdamW8bit(peft_model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
+        optimizer = bnb.optim.AdamW8bit(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
         
         # --- Datasets and Dataloaders ---
         if args.dataset == 'summe':
@@ -244,7 +210,7 @@ def train_dpo(args):
 
         train_loader = DataLoader(
             train_dataset,
-            batch_size=args.batch_size, # Number of videos per batch
+            batch_size=args.batch_size, 
             shuffle=True,
             collate_fn=train_collator,
             num_workers=0,
@@ -276,7 +242,7 @@ def train_dpo(args):
             num_warmup_steps=warmup_steps,
             num_training_steps=total_training_steps
         )
-       
+        
         writer = SummaryWriter(f"runs/vslice_{args.model_type}_{args.loss_type}_{args.dataset}_{split_idx}_{timestamp}")
         writer.add_text(
             "hyperparameters",
@@ -290,6 +256,7 @@ def train_dpo(args):
         print(f"Dataset length:{train_dataset.__len__()}")
 
         for epoch in range(args.num_epochs):
+            
             epoch_loss = 0.0
             num_batches = 0
 
@@ -306,44 +273,42 @@ def train_dpo(args):
             }
 
             for step, batch_data in enumerate(tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.num_epochs}", leave=False)):
-                
+
                 c_gtscore = batch_data.pop("chosen_gt").to(device)
                 r_gtscore = batch_data.pop("rejected_gt").to(device)
                 c_batch_data = batch_data.pop("chosen_inputs").to(device)
                 r_batch_data = batch_data.pop("rejected_inputs").to(device)
                 log_margin = batch_data.pop("log_margin").to(device)
 
-                # ── 1. Reference Logps (LoRA Disabled) ──
-                peft_model.eval()
-                with peft_model.disable_adapter():
-                    with torch.no_grad():
-                        if args.model_type == "minicpm":
-                            ref_c_logits = peft_model.base_model(c_batch_data).logits[:, -1, :]
-                            ref_r_logits = peft_model.base_model(r_batch_data).logits[:, -1, :]
-                        else:
-                            ref_c_logits = peft_model(**c_batch_data).logits[:, -1, :]
-                            ref_r_logits = peft_model(**r_batch_data).logits[:, -1, :]
+                # ── 1. Reference Logps (Frozen Model) ──
+                with torch.no_grad():
+                    ref_c_logits_capped = ref_model(**c_batch_data).logits[:, -1, :].to(torch.float32)
+                    ref_r_logits_capped = ref_model(**r_batch_data).logits[:, -1, :].to(torch.float32)
 
-                        ref_logp_c = F.logsigmoid(diff_attn_boost(ref_c_logits[:, yes_id], ref_c_logits[:, no_id], args.use_boost))
-                        ref_logp_r = F.logsigmoid(diff_attn_boost(ref_r_logits[:, yes_id], ref_r_logits[:, no_id], args.use_boost))
+                    ref_c_logits = soft_cap * torch.atanh(
+                        torch.clamp(ref_c_logits_capped / soft_cap, min=-1.0 + epsilon, max=1.0 - epsilon)
+                    )
+                    ref_r_logits = soft_cap * torch.atanh(
+                        torch.clamp(ref_r_logits_capped / soft_cap, min=-1.0 + epsilon, max=1.0 - epsilon)
+                    )
 
-                #ref_logp_c = ref_logp_c.detach()
-                #ref_logp_r = ref_logp_r.detach()
-                #del ref_c_logits, ref_r_logits
-                #torch.cuda.empty_cache()
+                    ref_logp_c = F.logsigmoid(ref_c_logits[:, yes_id] - ref_c_logits[:, no_id])
+                    ref_logp_r = F.logsigmoid(ref_r_logits[:, yes_id] - ref_r_logits[:, no_id])
 
-                # Policy Logps (LoRA Enabled)
-                peft_model.train()
-                if args.model_type == "minicpm":
-                    c_logits = peft_model.base_model(c_batch_data).logits[:, -1, :]
-                    r_logits = peft_model.base_model(r_batch_data).logits[:, -1, :]
-                else:
-                    c_logits = peft_model(**c_batch_data).logits[:, -1, :]
-                    r_logits = peft_model(**r_batch_data).logits[:, -1, :]
+                # Policy Logps (Full Training Model)
+                c_logits_capped = model(**c_batch_data).logits[:, -1, :].to(torch.float32)
+                r_logits_capped = model(**r_batch_data).logits[:, -1, :].to(torch.float32)
+
+                c_logits = soft_cap * torch.atanh(
+                    torch.clamp(c_logits_capped / soft_cap, min=-1.0 + epsilon, max=1.0 - epsilon)
+                )
+                r_logits = soft_cap * torch.atanh(
+                    torch.clamp(r_logits_capped / soft_cap, min=-1.0 + epsilon, max=1.0 - epsilon)
+                )
 
                 # Compute binary log policy
-                pi_logp_c = F.logsigmoid(diff_attn_boost(c_logits[:, yes_id], c_logits[:, no_id], args.use_boost))
-                pi_logp_r = F.logsigmoid(diff_attn_boost(r_logits[:, yes_id], r_logits[:, no_id], args.use_boost))
+                pi_logp_c = F.logsigmoid(c_logits[:, yes_id] - c_logits[:, no_id])
+                pi_logp_r = F.logsigmoid(r_logits[:, yes_id] - r_logits[:, no_id])
 
                 pi_ratio = pi_logp_c - pi_logp_r
                 ref_ratio = ref_logp_c - ref_logp_r
@@ -354,10 +319,8 @@ def train_dpo(args):
 
                 if args.loss_type == "DPO":
                     loss = -F.logsigmoid(z).mean() # DPO
-
                 elif args.loss_type == "IPO":
                     loss = z.pow(2).mean() # IPO
-
                 elif args.loss_type == "MPO":
                     loss = - ((1.0 - torch.sigmoid(z)).pow(2).detach() * F.logsigmoid(z)).mean() # MPO
                 
@@ -368,24 +331,6 @@ def train_dpo(args):
 
                 # ── Diagnostic Metrics (Metric A & Metric B) ──
                 with torch.no_grad():
-                    prob_z = torch.sigmoid(z).detach()
-                    # Focal / MPO weights: (1 - sigma(z))^2
-                    mod_weights = (1.0 - prob_z).pow(2)
-                    
-                    easy_mask = prob_z >= 0.7
-                    border_mask = (prob_z >= 0.3) & (prob_z < 0.7)
-                    hard_mask = prob_z < 0.3
-                    
-                    total_samples = prob_z.numel()
-                    pct_easy = (easy_mask.sum().float() / total_samples).item() * 100
-                    pct_border = (border_mask.sum().float() / total_samples).item() * 100
-                    pct_hard = (hard_mask.sum().float() / total_samples).item() * 100
-                    
-                    total_w = mod_weights.sum().item() + 1e-8
-                    grad_share_easy = (mod_weights[easy_mask].sum().item() / total_w) * 100
-                    grad_share_border = (mod_weights[border_mask].sum().item() / total_w) * 100
-                    grad_share_hard = (mod_weights[hard_mask].sum().item() / total_w) * 100
-
                     # Metric B: KL Drift from Reference Policy
                     kl_c = (pi_logp_c - ref_logp_c).abs().mean().item()
                     kl_r = (pi_logp_r - ref_logp_r).abs().mean().item()
@@ -400,9 +345,6 @@ def train_dpo(args):
                 diag['correct'] += (logits > log_margin.reshape(logits.shape)).sum().item()
                 diag['mse'].append(mse_loss.item())
                 diag['total'] += logits.size(0)
-                diag['pct_easy'].append(pct_easy)
-                diag['pct_border'].append(pct_border)
-                diag['pct_hard'].append(pct_hard)
 
                 optimizer.zero_grad()
                 loss.backward()
@@ -419,9 +361,6 @@ def train_dpo(args):
                 writer.add_scalar("Train/step_pref_accuracy", (logits > log_margin.reshape(logits.shape)).sum().item(), global_step)
                 writer.add_scalar("Train/step_pi_ratio", pi_ratio.mean().item(), global_step)
                 writer.add_scalar("Train/step_kl_drift", kl_drift, global_step)
-                writer.add_scalar("Train/step_grad_share_easy", grad_share_easy, global_step)
-                writer.add_scalar("Train/step_grad_share_borderline", grad_share_border, global_step)
-                writer.add_scalar("Train/step_grad_share_hard", grad_share_hard, global_step)
                 global_step += 1
 
             acc = diag['correct'] / diag['total'] * 100
@@ -436,14 +375,14 @@ def train_dpo(args):
             print(f"  GT margin (target)   : {np.mean(diag['margin']):.4f} ± {np.std(diag['margin']):.4f}")
             print(f"  MSE                  : {np.mean(diag['mse']):.4f} ± {np.std(diag['mse']):.4f}")
             print(f"{'═'*70}")
-
+            
             # ================= VALIDATION BLOCK =================
-            # Evaluate every epochs, or on the final epoch
             if (epoch + 1) % 1 == 0 or epoch == args.num_epochs - 1:
                 print("--> Running Validation...")
+                model.eval()
 
                 val_df = evaluate(
-                    model=peft_model, 
+                    model=model, 
                     val_loader=test_loader, 
                     dataset_name=args.dataset, 
                     h5_paths=h5_paths,
@@ -468,23 +407,25 @@ def train_dpo(args):
                         best_corr = current_corr
                         save_path = os.path.join(args.output_dir, f"{args.dataset}_{timestamp}_best_{args.loss_type}_split{split_idx}.pth")
                         os.makedirs(args.output_dir, exist_ok=True)
-                        peft_model.save_pretrained(save_path)
-                        print(f"Saved LoRA weights to {save_path}")
+                        torch.save(model.state_dict(), save_path)
+                        print(f"Saved best model weights to {save_path}")
+                
+                model.train()
 
         print(f"Finished Split {split_idx+1}. Best Correlation: {best_corr:.4f}\n")
 
         # ================= FINAL TEST BLOCK =================
         print(f"--> Running Final Test for Split {split_idx+1}...")
 
-        # Load the best saved model weights for testing without re-wrapping
+        # Load the best saved model weights for testing
         if save_path and os.path.exists(save_path):
-            best_weights = load_peft_weights(save_path)
-            set_peft_model_state_dict(peft_model, best_weights)
-            peft_model.to(device)
-            print(f"Loaded best LORA checkpoint from {save_path}")
+            model.load_state_dict(torch.load(save_path, map_location=device))
+            model.to(device)
+            print(f"Loaded best checkpoint from {save_path}")
 
+        model.eval()
         test_df = evaluate(
-            model=peft_model,
+            model=model,
             val_loader=test_loader,
             dataset_name=args.dataset,
             h5_paths=h5_paths,
@@ -500,7 +441,6 @@ def train_dpo(args):
             test_rho = test_df['spearman'].mean()
             print(f"\n[Split {split_idx+1}] Test | F-Score: {test_f1:.4f} | Tau: {test_tau:.4f} | Rho: {test_rho:.4f}")
             
-            # Log test scores to tensorboard (logged at step = split_idx so you can see across splits)
             writer.add_scalar("Global/F-Score", test_f1, split_idx)
             writer.add_scalar("Global/Kendall_Tau", test_tau, split_idx)
             writer.add_scalar("Global/Spearman_Rho", test_rho, split_idx)
@@ -520,7 +460,7 @@ def train_dpo(args):
         avg_overall_tau = np.mean([m['kendall'] for m in eval_split_metrics.values()])
         avg_overall_rho = np.mean([m['spearman'] for m in eval_split_metrics.values()])
         print(f"Global Avg | F1: {avg_overall_f1:.4f} | Kendall: {avg_overall_tau:.4f} | Spearman: {avg_overall_rho:.4f}")
-        writer.add_scalar("Test/Global_F-Score", avg_overall_f1) # Overall
+        writer.add_scalar("Test/Global_F-Score", avg_overall_f1)
         writer.add_scalar("Test/Global_Kendall_Tau", avg_overall_tau)
         writer.add_scalar("Test/Global_Spearman_Rho", avg_overall_rho)
 
