@@ -45,7 +45,6 @@ if sys.platform == "win32":
     sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
 
 """
-TBD FIX TVSUM EVALUATION BUG
 SUMME: TO BEAT 0.256 0.285, TVSUM: 0.195 0.255
 ==================== SPLIT 1/5 ====================
 [Split 1] Test | F-Score: 0.4464 | Tau: 0.1548 | Rho: 0.1723
@@ -128,7 +127,7 @@ def evaluate(model, val_loader, dataset_name, h5_paths, tvsum_user_scores=None, 
             all_preds.extend(yes_scores)
             
             # Apply Min-Max Scaling
-            #yes_scores = (yes_scores - yes_scores.min()) / (yes_scores.max() - yes_scores.min() + 1e-8)
+            # yes_scores = (yes_scores - yes_scores.min()) / (yes_scores.max() - yes_scores.min() + 1e-8)
 
             res = compute_video_metrics(
                 yes_scores=yes_scores, 
@@ -193,10 +192,11 @@ def train_dpo(args):
     print("Freezing base model & use LoRA for fine-tuning ...")
     model.requires_grad_(False)
 
+    target_modules = ["Wqkv", "out_proj"] if args.model_type == "moondream" else ["q_proj", "v_proj", "k_proj", "o_proj"]
     lora_config = LoraConfig(
             r=8,
             lora_alpha=16,
-            target_modules=["q_proj", "v_proj", "k_proj", "o_proj"],
+            target_modules=target_modules,
             lora_dropout=0.05,
             bias="none",
             task_type=None,
@@ -528,12 +528,12 @@ def train_dpo(args):
     writer.close()
 
 def resolve_model_path(mtype):
-    if mtype in ["qwen", "qwen2_vl"]:
+    if mtype in ["qwen2_vl_3b"]:
         return "Qwen/Qwen2.5-VL-3B-Instruct"
-    elif mtype == "smolvlm":
-        return "HuggingFaceTB/SmolVLM-Instruct"
-    elif mtype == "paligemma":
-        return "google/paligemma2-3b-pt-224"
+    elif mtype in ["qwen2_vl_7b"]:
+        return "Qwen/Qwen2.5-VL-7B-Instruct"
+    elif mtype == "moondream":
+        return "vikhyatk/moondream2"
     candidates = ["./MiniCPM-V-2_6-int4", "/home/dexter/VideoRAG/.checkpoints/MiniCPM-V-2_6-int4"]
     for p in candidates:
         if os.path.exists(p): return p
@@ -541,7 +541,7 @@ def resolve_model_path(mtype):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model_type", type=str, default="minicpm", choices=["minicpm", "qwen", "qwen2_vl", "smolvlm", "paligemma"])
+    parser.add_argument("--model_type", type=str, default="minicpm", choices=["minicpm", "qwen2_vl_3b", "qwen2_vl_7b", "moondream"])
     parser.add_argument("--dataset", type=str, default="both", choices=["summe", "tvsum"])
     parser.add_argument("--root_dir", type=str, default=".")
     parser.add_argument("--model_path", type=str, default=None)

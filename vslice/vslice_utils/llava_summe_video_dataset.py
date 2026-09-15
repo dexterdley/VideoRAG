@@ -9,9 +9,16 @@ import torch.nn.functional as F
 from PIL import Image
 from torch.utils.data import Dataset
 from decord import VideoReader, cpu
+import torchvision.transforms as transforms
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 random.seed(42)
+
+MOONDREAM_TRANSFORM = transforms.Compose([
+    transforms.Resize((378, 378), interpolation=transforms.InterpolationMode.BICUBIC),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
+])
 
 def load_video_from_picks(video_path, picks, width=224, height=224):
     """
@@ -76,7 +83,12 @@ class SumMeLLaMA_VideoDataset(Dataset):
     def _process_clip(self, frames, formatted_prompt):
         """Helper function to run the VLM processor over a list of PIL frames"""
         is_minicpm = "minicpm" in self.processor.__class__.__name__.lower()
-        is_paligemma = "paligemma" in self.processor.__class__.__name__.lower()
+        is_moondream = (
+            "moondream" in getattr(self.processor, "name_or_path", "").lower()
+            or "moondream" in self.processor.__class__.__name__.lower()
+            or "codegen" in self.processor.__class__.__name__.lower()
+            or getattr(self.processor, "model_type", "") == "moondream"
+        )
 
         prompts_lists = []
         input_images_lists = []
@@ -107,21 +119,17 @@ class SumMeLLaMA_VideoDataset(Dataset):
             if "image_sizes" in inputs:
                 inputs.pop("image_sizes")
 
-        elif is_paligemma:
-            for img in frames:
-                # PaliGemma 2 strictly expects a flat string starting with <image>
-                # It does not support dictionary-based chat templates.
-                prompt_str = f"<image>{self.system_prompt} {formatted_prompt}\n"
-                prompts_lists.append(prompt_str)
-                input_images_lists.append(img)
-
+        elif is_moondream:
+            prompt_str = f"<image>\n\nQuestion: {formatted_prompt}\n\nAnswer:"
+            prompts = [prompt_str] * len(frames)
             inputs = self.processor(
-                text=prompts_lists,
-                images=input_images_lists,
+                prompts,
                 padding=True,
                 return_tensors="pt"
             )
-            
+            pixel_values = torch.stack([MOONDREAM_TRANSFORM(im.convert("RGB")) for im in frames])
+            inputs["pixel_values"] = pixel_values
+
         else:
             for img in frames:  # QWEN branch
                 msgs = [
@@ -136,11 +144,7 @@ class SumMeLLaMA_VideoDataset(Dataset):
                 
                 if apply_fn and has_chat_template:
                     prompt_str = apply_fn(msgs, tokenize=False, add_generation_prompt=True)
-                else:
-                    # Fallback for models without chat templates like PaliGemma
-                    # prompt_str = formatted_prompt if "<image>" in formatted_prompt else f"<image>{formatted_prompt}"
-                    prompt_str = f"<image>{self.system_prompt} {formatted_prompt}\n"
-
+                
                 prompts_lists.append(prompt_str)
                 input_images_lists.append(img)
 
@@ -293,7 +297,7 @@ class ValBatchCollator:
             'input_ids': torch.cat(padded_input_ids, dim=0),
             'attention_mask': torch.cat(padded_attention_masks, dim=0),
         }
-        # 1. pixel_values: Tensor concatenation along dim=0
+        # 1. pixel_values: Tensor concatenation along dim=0 (Qwen, etc.)
         if any('pixel_values' in x for x in hf_inputs):
             batch['pixel_values'] = torch.cat([x['pixel_values'] for x in hf_inputs if 'pixel_values' in x], dim=0)
         # 2. Qwen-specific: 3D patch grid tensor
@@ -303,6 +307,7 @@ class ValBatchCollator:
         if all('position_ids' in x for x in hf_inputs):
             padded_pos = [F.pad(x['position_ids'], (0, max_len - x['position_ids'].size(-1)), value=0) for x in hf_inputs]
             batch['position_ids'] = torch.cat(padded_pos, dim=0)
+
         BatchClass = type(hf_inputs[0])
         return BatchClass(batch)
         
@@ -436,7 +441,12 @@ class SumMeLLaMA_DPODataset(Dataset):
     def _process_clip(self, frames, formatted_prompt):
         """Helper function to run the VLM processor over a list of PIL frames"""
         is_minicpm = "minicpm" in self.processor.__class__.__name__.lower()
-        is_paligemma = "paligemma" in self.processor.__class__.__name__.lower()
+        is_moondream = (
+            "moondream" in getattr(self.processor, "name_or_path", "").lower()
+            or "moondream" in self.processor.__class__.__name__.lower()
+            or "codegen" in self.processor.__class__.__name__.lower()
+            or getattr(self.processor, "model_type", "") == "moondream"
+        )
 
         prompts_lists = []
         input_images_lists = []
@@ -467,21 +477,17 @@ class SumMeLLaMA_DPODataset(Dataset):
             if "image_sizes" in inputs:
                 inputs.pop("image_sizes")
 
-        elif is_paligemma:
-            for img in frames:
-                # PaliGemma 2 strictly expects a flat string starting with <image>
-                # It does not support dictionary-based chat templates.
-                prompt_str = f"<image>{self.system_prompt} {formatted_prompt}\n"
-                prompts_lists.append(prompt_str)
-                input_images_lists.append(img)
-
+        elif is_moondream:
+            prompt_str = f"<image>\n\nQuestion: {formatted_prompt}\n\nAnswer:"
+            prompts = [prompt_str] * len(frames)
             inputs = self.processor(
-                text=prompts_lists,
-                images=input_images_lists,
+                prompts,
                 padding=True,
                 return_tensors="pt"
             )
-            
+            pixel_values = torch.stack([MOONDREAM_TRANSFORM(im.convert("RGB")) for im in frames])
+            inputs["pixel_values"] = pixel_values
+
         else:
             for img in frames:  # QWEN branch
                 msgs = [
@@ -496,10 +502,6 @@ class SumMeLLaMA_DPODataset(Dataset):
                 
                 if apply_fn and has_chat_template:
                     prompt_str = apply_fn(msgs, tokenize=False, add_generation_prompt=True)
-                else:
-                    # Fallback for models without chat templates like PaliGemma
-                    # prompt_str = formatted_prompt if "<image>" in formatted_prompt else f"<image>{formatted_prompt}"
-                    prompt_str = f"<image>{self.system_prompt} {formatted_prompt}\n"
 
                 prompts_lists.append(prompt_str)
                 input_images_lists.append(img)
@@ -625,6 +627,7 @@ class DPOTrainBatchCollator:
         if all('position_ids' in x for x in hf_inputs):
             padded_pos = [F.pad(x['position_ids'], (0, max_len - x['position_ids'].size(-1)), value=0) for x in hf_inputs]
             batch['position_ids'] = torch.cat(padded_pos, dim=0)
+        
         BatchClass = type(hf_inputs[0])
         return BatchClass(batch)
 

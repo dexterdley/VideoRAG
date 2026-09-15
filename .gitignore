@@ -24,3 +24,4 @@ dpo_data
 vslice/test_graph_dpo.py
 *.npz
 *.tar.gz
+*boy.png

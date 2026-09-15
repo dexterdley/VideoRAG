@@ -1,10 +1,19 @@
 import torch
 import torch.nn.functional as F
 from PIL import Image
-from transformers import AutoModel, AutoTokenizer, AutoProcessor, AutoModelForImageTextToText
+from transformers import (
+    AutoModel,
+    AutoTokenizer,
+    AutoProcessor,
+    AutoModelForImageTextToText,
+    AutoModelForCausalLM,
+    GenerationMixin,
+    GenerationConfig,
+    BitsAndBytesConfig,
+)
+import transformers.cache_utils as cache_utils
 from qwen_vl_utils import process_vision_info
 from peft import PeftModel
-from transformers import BitsAndBytesConfig
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -55,7 +64,7 @@ def load_vlm(model_path, model_type, device, load_in_4bit=False):
         print(f"[{device}] [OK] MiniCPM Loaded (Yes={yes_id}, No={no_id})")
         return model, tokenizer, processor, yes_id, no_id
 
-    elif model_type in ["qwen", "qwen2_vl"]:
+    elif model_type == "qwen3":
         kwargs = {
             "trust_remote_code": True,
             "device_map": device,
@@ -83,54 +92,122 @@ def load_vlm(model_path, model_type, device, load_in_4bit=False):
         print(f"[{device}] [OK] Qwen VL Loaded (Yes={yes_id}, No={no_id})")
         return model, processor.tokenizer, processor, yes_id, no_id
 
-    elif model_type == "smolvlm":
+    elif "qwen2" in model_type:
         kwargs = {
             "trust_remote_code": True,
             "device_map": device,
-            "attn_implementation": "sdpa" if load_in_4bit else "eager",
+            "attn_implementation": "sdpa",
         }
+
         if load_in_4bit:
             kwargs["quantization_config"] = bnb_config
         else:
             kwargs["torch_dtype"] = dtype
-
+            
         model = AutoModelForImageTextToText.from_pretrained(model_path, **kwargs)
         if not load_in_4bit:
             model = model.eval()
-
-        processor = AutoProcessor.from_pretrained(model_path, trust_remote_code=True)
-        if processor.tokenizer.pad_token_id is None:
-            processor.tokenizer.pad_token = processor.tokenizer.eos_token
-
+            
+        processor = AutoProcessor.from_pretrained(
+            model_path,
+            min_pixels=128 * 28 * 28,
+            max_pixels=256 * 28 * 28,
+            trust_remote_code=True
+        )
         temp_ids = processor.tokenizer(["Yes", "No"], add_special_tokens=False).input_ids
         yes_id = temp_ids[0][0]
         no_id = temp_ids[1][0]
-
-        print(f"[{device}] [OK] SmolVLM Loaded (Yes={yes_id}, No={no_id})")
+        
+        print(f"[{device}] [OK] Qwen2.5-VL Loaded (Yes={yes_id}, No={no_id})")
         return model, processor.tokenizer, processor, yes_id, no_id
-    
-    elif model_type == "paligemma":
+
+    elif model_type == "moondream":
         kwargs = {
             "trust_remote_code": True,
             "device_map": device,
-            "attn_implementation": "sdpa" if load_in_4bit else "eager",
         }
+        revision = "2024-08-26" if model_path == "vikhyatk/moondream2" else None
+        if revision:
+            kwargs["revision"] = revision
+
         if load_in_4bit:
             kwargs["quantization_config"] = bnb_config
+            kwargs["device_map"] = "auto"
         else:
             kwargs["torch_dtype"] = dtype
-        model = AutoModelForImageTextToText.from_pretrained(model_path, **kwargs)
+
+        # Compatibility shims for Moondream in transformers >= 4.50
+        if hasattr(cache_utils, "DynamicCache") and not hasattr(cache_utils.DynamicCache, "get_usable_length"):
+            cache_utils.DynamicCache.get_usable_length = lambda self, seq_len=None, layer_idx=0: self.get_seq_length(layer_idx)
+
+        model = AutoModelForCausalLM.from_pretrained(model_path, **kwargs)
         if not load_in_4bit:
             model = model.eval()
-        processor = AutoProcessor.from_pretrained(model_path, trust_remote_code=True)
-        
-        # Token IDs for "Yes" and "No" in Gemma tokenizer
-        temp_ids = processor.tokenizer(["yes", "no"], add_special_tokens=False).input_ids
-        yes_id = temp_ids[0][0]
-        no_id = temp_ids[1][0]
-        print(f"[{device}] [OK] PaliGemma Loaded (Yes={yes_id}, No={no_id})")
-        return model, processor.tokenizer, processor, yes_id, no_id
-        
+
+        # In transformers >= 4.50, PreTrainedModel no longer inherits from GenerationMixin.
+        # Restore generative capabilities to model.text_model if missing.
+        if hasattr(model, "text_model"):
+            if not hasattr(model.text_model, "generate"):
+                cls = model.text_model.__class__
+                model.text_model.__class__ = type(cls.__name__, (cls, GenerationMixin), {})
+            if getattr(model.text_model, "generation_config", None) is None:
+                model.text_model.generation_config = GenerationConfig.from_model_config(model.text_model.config)
+
+        tokenizer = AutoTokenizer.from_pretrained(model_path, revision=revision, trust_remote_code=True)
+        if tokenizer.pad_token_id is None:
+            tokenizer.pad_token = tokenizer.eos_token
+
+        processor = tokenizer
+        if not hasattr(processor, "tokenizer"):
+            processor.tokenizer = tokenizer
+        processor.model_type = "moondream"
+
+        # Attach forward method to Moondream so peft_model(**batch) and model(**batch) work seamlessly
+        def moondream_forward(self, input_ids=None, attention_mask=None, pixel_values=None, output_hidden_states=False, **kwargs):
+            text_emb = self.text_model.get_input_embeddings()
+            B = input_ids.shape[0] if input_ids is not None else pixel_values.shape[0]
+
+            if pixel_values is not None:
+                # If input_ids begins with <image> tokens ([27, 9060, 29]), strip them so text_embeds starts after <image>
+                if input_ids is not None and input_ids.shape[1] >= 3 and (input_ids[:, :3] == torch.tensor([27, 9060, 29], device=input_ids.device)).all():
+                    text_tokens = input_ids[:, 3:]
+                    text_mask = attention_mask[:, 3:] if attention_mask is not None else None
+                else:
+                    text_tokens = input_ids
+                    text_mask = attention_mask
+
+                bos_id = getattr(self.config, "bos_token_id", None) or 50256
+                bos = torch.full((B, 1), bos_id, dtype=torch.long, device=pixel_values.device)
+                bos_embeds = text_emb(bos)
+                image_embeds = self.vision_encoder(pixel_values)
+                text_embeds = text_emb(text_tokens) if text_tokens is not None else None
+
+                embeds = [bos_embeds, image_embeds]
+                if text_embeds is not None:
+                    embeds.append(text_embeds)
+                inputs_embeds = torch.cat(embeds, dim=1)
+
+                if text_mask is not None:
+                    img_mask = torch.ones((B, 1 + image_embeds.shape[1]), dtype=text_mask.dtype, device=text_mask.device)
+                    full_mask = torch.cat([img_mask, text_mask], dim=1)
+                else:
+                    full_mask = None
+
+                return self.text_model(inputs_embeds=inputs_embeds, attention_mask=full_mask, output_hidden_states=output_hidden_states, **kwargs)
+            else:
+                return self.text_model(input_ids=input_ids, attention_mask=attention_mask, output_hidden_states=output_hidden_states, **kwargs)
+
+        import types
+        model.forward = types.MethodType(moondream_forward, model)
+
+        # Moondream (Phi tokenizer) BPE produces words after "Answer:" with leading space:
+        # " Yes" -> 3363, " No" -> 1400
+        yes_id = tokenizer.encode(" Yes", add_special_tokens=False)[0]
+        no_id  = tokenizer.encode(" No", add_special_tokens=False)[0]
+
+        print(f"[{device}] [OK] Moondream Loaded (Yes={yes_id}, No={no_id})")
+        return model, tokenizer, processor, yes_id, no_id
+
 # ─────────────────────── VLM INFERENCE ───────────────────────
 
 def minicpm_extract_title_and_keywords(raw_title, model, processor):
