@@ -10,9 +10,16 @@ from PIL import Image
 from torch.utils.data import Dataset
 from decord import VideoReader, cpu
 import pandas as pd
+import torchvision.transforms as transforms
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 random.seed(42)
+
+MOONDREAM_TRANSFORM = transforms.Compose([
+    transforms.Resize((378, 378), interpolation=transforms.InterpolationMode.BICUBIC),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
+])
 
 def load_video_from_picks(video_path, picks, width=896, height=672):
     """
@@ -82,6 +89,12 @@ class TVSumLLaMA_VideoDataset(Dataset):
     def _process_clip(self, frames, formatted_prompt):
         """Helper function to run the VLM processor over a list of PIL frames"""
         is_minicpm = "minicpm" in self.processor.__class__.__name__.lower()
+        is_moondream = (
+            "moondream" in getattr(self.processor, "name_or_path", "").lower()
+            or "moondream" in self.processor.__class__.__name__.lower()
+            or "codegen" in self.processor.__class__.__name__.lower()
+            or getattr(self.processor, "model_type", "") == "moondream"
+        )
 
         prompts_lists = []
         input_images_lists = []
@@ -112,31 +125,16 @@ class TVSumLLaMA_VideoDataset(Dataset):
             if "image_sizes" in inputs:
                 inputs.pop("image_sizes")
 
-        elif "mllama" in self.processor.__class__.__name__.lower():
-            # Llama-3.2-Vision (MllamaProcessor) requirements:
-            # 1. Message dict uses {"type": "image"} placeholder — no image embedded.
-            # 2. Images must be a nested list: [[img], [img], ...] — one sub-list per
-            #    batch item. Passing a flat list raises ValueError from processing_mllama.
-            for img in frames:
-                msgs = [
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "image"},   # placeholder; image passed to processor separately
-                            {"type": "text", "text": formatted_prompt},
-                        ],
-                    }
-                ]
-                prompt_str = self.processor.apply_chat_template(msgs, add_generation_prompt=True)
-                prompts_lists.append(prompt_str)
-                input_images_lists.append([img])  # nested: one sub-list per batch item
-
+        elif is_moondream:
+            prompt_str = f"<image>\n\nQuestion: {formatted_prompt}\n\nAnswer:"
+            prompts = [prompt_str] * len(frames)
             inputs = self.processor(
-                text=prompts_lists,
-                images=input_images_lists,  # [[img], [img], ...]
+                prompts,
                 padding=True,
-                return_tensors="pt",
+                return_tensors="pt"
             )
+            pixel_values = torch.stack([MOONDREAM_TRANSFORM(im.convert("RGB")) for im in frames])
+            inputs["pixel_values"] = pixel_values
 
         else:
             for img in frames:  # QWEN branch
@@ -211,7 +209,6 @@ class TVSumLLaMA_VideoDataset(Dataset):
             sample['change_points'] = torch.as_tensor(np.array(self.video_data[video_name + '/change_points']))
             sample['n_frame_per_seg'] = torch.as_tensor(np.array(self.video_data[video_name + '/n_frame_per_seg']))
             sample['gt_summary'] = torch.as_tensor(np.array(self.video_data[video_name + '/user_summary']))
-
         return sample
 
 class TrainBatchCollator:
@@ -274,7 +271,6 @@ class TrainBatchCollator:
             'video_name': video_names,
             'title': titles
         })
-
         return collated_inputs
 
 class ValBatchCollator:
@@ -309,26 +305,7 @@ class ValBatchCollator:
         if all('position_ids' in x for x in hf_inputs):
             padded_pos = [F.pad(x['position_ids'], (0, max_len - x['position_ids'].size(-1)), value=0) for x in hf_inputs]
             batch['position_ids'] = torch.cat(padded_pos, dim=0)
-        # 4. Mllama-specific keys: aspect_ratio_ids, aspect_ratio_mask, cross_attention_mask
-        if any('cross_attention_mask' in x for x in hf_inputs):
-            padded_cam = []
-            for x in hf_inputs:
-                if 'cross_attention_mask' in x:
-                    cam = x['cross_attention_mask']
-                    curr_len = cam.shape[1]
-                    if curr_len < max_len:
-                        new_shape = list(cam.shape)
-                        new_shape[1] = max_len
-                        padded = torch.zeros(new_shape, dtype=cam.dtype, device=cam.device)
-                        padded[:, :curr_len] = cam
-                        padded_cam.append(padded)
-                    else:
-                        padded_cam.append(cam)
-            batch['cross_attention_mask'] = torch.cat(padded_cam, dim=0)
 
-        for mllama_key in ('aspect_ratio_ids', 'aspect_ratio_mask'):
-            if any(mllama_key in x for x in hf_inputs):
-                batch[mllama_key] = torch.cat([x[mllama_key] for x in hf_inputs if mllama_key in x], dim=0)
         BatchClass = type(hf_inputs[0])
         return BatchClass(batch)
         
@@ -379,6 +356,10 @@ class ValBatchCollator:
         else:
             collated_inputs = self._collate_general_vlm_inputs(hf_inputs)
 
+        collated_inputs['video_name'] = video_names
+        collated_inputs['title'] = titles
+        collated_inputs['gtscore'] = gtscore_padded
+        collated_inputs['features'] = frame_feat
         collated_inputs['n_frames'] = [data['n_frames'] for data in batch]
         collated_inputs['n_frame_per_seg'] = [data['n_frame_per_seg'] for data in batch]
         collated_inputs['picks'] = [data['picks'] for data in batch]
@@ -461,6 +442,12 @@ class TVSumLLaMA_DPODataset(Dataset):
     def _process_clip(self, frames, formatted_prompt):
         """Helper function to run the VLM processor over a list of PIL frames"""
         is_minicpm = "minicpm" in self.processor.__class__.__name__.lower()
+        is_moondream = (
+            "moondream" in getattr(self.processor, "name_or_path", "").lower()
+            or "moondream" in self.processor.__class__.__name__.lower()
+            or "codegen" in self.processor.__class__.__name__.lower()
+            or getattr(self.processor, "model_type", "") == "moondream"
+        )
 
         prompts_lists = []
         input_images_lists = []
@@ -491,31 +478,16 @@ class TVSumLLaMA_DPODataset(Dataset):
             if "image_sizes" in inputs:
                 inputs.pop("image_sizes")
 
-        elif "mllama" in self.processor.__class__.__name__.lower():
-            # Llama-3.2-Vision (MllamaProcessor) requirements:
-            # 1. Message dict uses {"type": "image"} placeholder — no image embedded.
-            # 2. Images must be a nested list: [[img], [img], ...] — one sub-list per
-            #    batch item. Passing a flat list raises ValueError from processing_mllama.
-            for img in frames:
-                msgs = [
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "image"},   # placeholder; image passed to processor separately
-                            {"type": "text", "text": formatted_prompt},
-                        ],
-                    }
-                ]
-                prompt_str = self.processor.apply_chat_template(msgs, add_generation_prompt=True)
-                prompts_lists.append(prompt_str)
-                input_images_lists.append([img])  # nested: one sub-list per batch item
-
+        elif is_moondream:
+            prompt_str = f"<image>\n\nQuestion: {formatted_prompt}\n\nAnswer:"
+            prompts = [prompt_str] * len(frames)
             inputs = self.processor(
-                text=prompts_lists,
-                images=input_images_lists,  # [[img], [img], ...]
+                prompts,
                 padding=True,
-                return_tensors="pt",
+                return_tensors="pt"
             )
+            pixel_values = torch.stack([MOONDREAM_TRANSFORM(im.convert("RGB")) for im in frames])
+            inputs["pixel_values"] = pixel_values
 
         else:
             for img in frames:  # QWEN branch
@@ -652,26 +624,7 @@ class DPOTrainBatchCollator:
         if all('position_ids' in x for x in hf_inputs):
             padded_pos = [F.pad(x['position_ids'], (0, max_len - x['position_ids'].size(-1)), value=0) for x in hf_inputs]
             batch['position_ids'] = torch.cat(padded_pos, dim=0)
-        # 4. Mllama-specific keys: aspect_ratio_ids, aspect_ratio_mask, cross_attention_mask
-        if any('cross_attention_mask' in x for x in hf_inputs):
-            padded_cam = []
-            for x in hf_inputs:
-                if 'cross_attention_mask' in x:
-                    cam = x['cross_attention_mask']
-                    curr_len = cam.shape[1]
-                    if curr_len < max_len:
-                        new_shape = list(cam.shape)
-                        new_shape[1] = max_len
-                        padded = torch.zeros(new_shape, dtype=cam.dtype, device=cam.device)
-                        padded[:, :curr_len] = cam
-                        padded_cam.append(padded)
-                    else:
-                        padded_cam.append(cam)
-            batch['cross_attention_mask'] = torch.cat(padded_cam, dim=0)
-
-        for mllama_key in ('aspect_ratio_ids', 'aspect_ratio_mask'):
-            if any(mllama_key in x for x in hf_inputs):
-                batch[mllama_key] = torch.cat([x[mllama_key] for x in hf_inputs if mllama_key in x], dim=0)
+        
         BatchClass = type(hf_inputs[0])
         return BatchClass(batch)
 

@@ -209,7 +209,6 @@ class SumMeLLaMA_VideoDataset(Dataset):
             sample['change_points'] = torch.as_tensor(np.array(self.video_data[video_name + '/change_points']))
             sample['n_frame_per_seg'] = torch.as_tensor(np.array(self.video_data[video_name + '/n_frame_per_seg']))
             sample['gt_summary'] = torch.as_tensor(np.array(self.video_data[video_name + '/user_summary']))
-
         return sample
 
 class TrainBatchCollator:
@@ -272,7 +271,6 @@ class TrainBatchCollator:
             'video_name': video_names,
             'title': titles
         })
-
         return collated_inputs
 
 class ValBatchCollator:

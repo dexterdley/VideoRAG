@@ -15,8 +15,18 @@ from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 import bitsandbytes as bnb
 from transformers import get_cosine_schedule_with_warmup
-from peft import LoraConfig, get_peft_model, PeftModel, prepare_model_for_kbit_training, load_peft_weights, set_peft_model_state_dict
+import transformers.cache_utils as cache_utils
+import transformers.utils as transformers_utils
+from peft import LoraConfig, get_peft_model, PeftModel, load_peft_weights, set_peft_model_state_dict
 from datetime import datetime
+
+# Compatibility shims for environments with newer or older transformers versions
+if not hasattr(cache_utils, "StaticCache"):
+    cache_utils.StaticCache = getattr(cache_utils, "DynamicCache", type("StaticCache", (), {}))
+if not hasattr(transformers_utils, "is_torchdynamo_compiling"):
+    transformers_utils.is_torchdynamo_compiling = getattr(transformers_utils, "is_torchdynamo_compiling", lambda: False)
+if hasattr(cache_utils, "DynamicCache") and not hasattr(cache_utils.DynamicCache, "get_usable_length"):
+    cache_utils.DynamicCache.get_usable_length = lambda self, seq_len=None, layer_idx=0: self.get_seq_length(layer_idx)
 
 from vslice_utils.models import load_vlm
 from vslice_utils.helpers import set_seed, compute_video_metrics, str_to_bool
@@ -44,47 +54,11 @@ if sys.platform == "win32":
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
     sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
 
-"""
-SUMME: TO BEAT 0.256 0.285, TVSUM: 0.195 0.255
-==================== SPLIT 1/5 ====================
-[Split 1] Test | F-Score: 0.4464 | Tau: 0.1548 | Rho: 0.1723
-[Split 1] Test | F-Score: 0.4600 | Tau: 0.2379 | Rho: 0.2652
-==================== SPLIT 2/5 ====================
-[Split 2] Test | F-Score: 0.5475 | Tau: 0.2793 | Rho: 0.3109
-==================== SPLIT 3/5 ====================
-[Split 3] Test | F-Score: 0.5193 | Tau: 0.2429 | Rho: 0.2687
-==================== SPLIT 4/5 ====================
-[Split 4] Test | F-Score: 0.5311 | Tau: 0.2160 | Rho: 0.2430
-==================== SPLIT 5/5 ====================
-[Split 5] Test | F-Score: 0.5052 | Tau: 0.2333 | Rho: 0.2591
-════════════════════════════════════════════════════════════
-FINAL GLOBAL BENCHMARK SUMMARY (5 SPLITS)
-════════════════════════════════════════════════════════════
-Global Avg | F1: 0.5099 | Kendall: 0.2253 | Spearman: 0.2508 # Base
-Global Avg | F1: 0.5198 | Kendall: 0.2470 | Spearman: 0.2750 # w DPO
-TVSum:
-Global Avg | F1: 0.4788 | Kendall: 0.2438 | Spearman: 0.3118
-
-### CSTA
-# Summe
-Average F-score across 5 splits: 0.5515
-Average Kendall Tau across splits: 0.2532
-Average Spearman Rho across splits: 0.2819
-# TVSum
-Average F-score across 5 splits: 0.5437
-Average Kendall Tau across splits: 0.1925
-Average Spearman Rho across splits: 0.2532
-[Split 1] Test | F-Score: 0.5086 | Tau: 0.2293 | Rho: 0.2561
-[Split 2] Test | F-Score: 0.5368 | Tau: 0.2460 | Rho: 0.2738
-[Split 3] Test | F-Score: 0.7210 | Tau: 0.3915 | Rho: 0.4349
-[Split 4] Test | F-Score: 0.4544 | Tau: 0.1869 | Rho: 0.2100
-[Split 5] Test | F-Score: 0.5321 | Tau: 0.2294 | Rho: 0.2541
-"""
-
-def evaluate(model, val_loader, dataset_name, h5_paths, tvsum_user_scores=None, yes_id=9454, no_id=2753,
-             output_dir=None, model_type="minicpm"):
+def evaluate(model, val_loader, dataset_name, h5_paths, tvsum_user_scores=None, yes_id=3363, no_id=1400,
+             output_dir=None, chunk_size=8):
     """
-    Evaluates the model using the ValBatchCollator and val_loader.
+    Evaluates the Moondream model using ValBatchCollator and val_loader with frame chunking.
+    Chunking processes frames in mini-batches along dimension 0 to prevent CUDA OOM.
     """
     all_preds = []
     split_results = []
@@ -94,7 +68,7 @@ def evaluate(model, val_loader, dataset_name, h5_paths, tvsum_user_scores=None, 
     torch.cuda.empty_cache()
 
     with torch.inference_mode():
-        for step, batch_data in enumerate(tqdm(val_loader, desc=f"Evaluating {dataset_name}", leave=False)):
+        for step, batch_data in enumerate(tqdm(val_loader, desc=f"Evaluating {dataset_name} (chunk_size={chunk_size})", leave=False)):
             
             video_name = batch_data.pop("video_name")[0]
             titles = batch_data.pop("title")
@@ -109,25 +83,38 @@ def evaluate(model, val_loader, dataset_name, h5_paths, tvsum_user_scores=None, 
 
             gtscore = gtscores.squeeze().numpy() if hasattr(gtscores, 'numpy') else np.array(gtscores)
 
-            batch_data = batch_data.to(device)
-            if model_type == "minicpm":
-                outputs = model.base_model(batch_data)
-            else:
-                outputs = model(**batch_data)
+            num_frames = batch_data["input_ids"].size(0)
+            chunk_preds = []
 
-            logits = outputs.logits[:, -1, :].detach()
-            yes_logits, no_logits = logits[:, yes_id], logits[:, no_id]
-            raw_preds = F.sigmoid(yes_logits - no_logits).cpu().float()
-            
-            # Eagerly free up GPU memory
-            del outputs, logits, yes_logits, no_logits, batch_data
+            # Process in frame chunks to fit GPU VRAM
+            for start_idx in range(0, num_frames, chunk_size):
+                end_idx = min(start_idx + chunk_size, num_frames)
+
+                mini_batch = {}
+                for k, v in batch_data.items():
+                    if isinstance(v, torch.Tensor) and v.size(0) == num_frames:
+                        mini_batch[k] = v[start_idx:end_idx].to(device)
+                    elif isinstance(v, list) and len(v) == num_frames:
+                        mini_batch[k] = v[start_idx:end_idx]
+                    else:
+                        mini_batch[k] = v.to(device) if isinstance(v, torch.Tensor) else v
+
+                outputs = model(**mini_batch)
+
+                logits = outputs.logits[:, -1, :].detach()
+                yes_logits, no_logits = logits[:, yes_id], logits[:, no_id]
+                raw_chunk_preds = F.sigmoid(yes_logits - no_logits).cpu().float()
+                chunk_preds.append(raw_chunk_preds)
+
+                # Eagerly free memory per chunk
+                #del outputs, logits, yes_logits, no_logits, mini_batch
+                #torch.cuda.empty_cache()
+
+            del batch_data
             torch.cuda.empty_cache()
 
-            yes_scores = raw_preds.numpy()
+            yes_scores = torch.cat(chunk_preds, dim=0).numpy()
             all_preds.extend(yes_scores)
-            
-            # Apply Min-Max Scaling
-            # yes_scores = (yes_scores - yes_scores.min()) / (yes_scores.max() - yes_scores.min() + 1e-8)
 
             res = compute_video_metrics(
                 yes_scores=yes_scores, 
@@ -150,23 +137,32 @@ def diff_attn_boost(logits_yes, logits_no, boost=False):
     Applies Tanh boost.
     Mathematically isomorphic to: Residual + (softmax(A1) - softmax(A2)) * V
     """
-    # 1. Base logit difference
     diff = logits_yes - logits_no
-    
-    # 2. Differential Gate: softmax(yes) - softmax(no) simplifies exactly to tanh(diff / 2)
     diff_gate = torch.tanh(diff / 2.0)
 
-    # 3. Boosted Output: Residual + Gate * Magnitude
     if boost:
         return diff * (1.0 + diff_gate.abs())
     else:
         return diff
 
+def resolve_model_path(model_path=None):
+    if model_path:
+        return model_path
+    candidates = ["vikhyatk/moondream2", "./moondream2"]
+    for p in candidates:
+        if os.path.exists(p):
+            return p
+    return "vikhyatk/moondream2"
+
 def train_dpo(args):
-    # Load VLM
-    vlm_vars = load_vlm(args.model_path, args.model_type, device)
-    wrapper_or_model, tokenizer, processor, yes_id, no_id = vlm_vars
-    model = wrapper_or_model.model if args.model_type == "qwen" else wrapper_or_model
+    # Load Moondream
+    model_path = resolve_model_path(args.model_path)
+    model, tokenizer, processor, yes_id, no_id = load_vlm(
+        model_path=model_path,
+        model_type="moondream",
+        device=device,
+        load_in_4bit=args.load_in_4bit
+    )
     
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
@@ -175,34 +171,42 @@ def train_dpo(args):
         "tvsum": os.path.join(args.root_dir, "TVSum", "eccv16_dataset_tvsum_google_pool5.h5")
     }
 
+    # Resolve split file automatically if not provided
+    if args.split_file is None:
+        args.split_file = f"./dataset/{args.dataset}_splits.json"
+
     splits = []
     if args.split_file and os.path.exists(args.split_file):
         with open(args.split_file, 'r') as f:
             splits = json.load(f)
         print(f"Loaded {len(splits)} splits from {args.split_file}")
+    else:
+        print(f"[WARN] Split file not found at {args.split_file}")
 
     eval_split_metrics = {}
 
     if args.dataset == 'tvsum':
-        tvsum_user_scores = get_gt('TVSum')
-        print("TVSum GT Loaded")
+        tvsum_user_scores = get_gt('TVSum') if get_gt is not None else None
+        if tvsum_user_scores is not None:
+            print("TVSum GT Loaded")
     else:
         tvsum_user_scores = None
 
-    print("Freezing base model & use LoRA for fine-tuning ...")
+    print("Freezing base model & applying LoRA to Moondream text model ...")
     model.requires_grad_(False)
 
+    # Moondream uses Phi-based linear layers: Wqkv and out_proj
     lora_config = LoraConfig(
-            r=8,
-            lora_alpha=16,
-            target_modules=["q_proj", "v_proj", "k_proj", "o_proj"],
-            lora_dropout=0.05,
-            bias="none",
-            task_type=None,
+        r=8,
+        lora_alpha=16,
+        target_modules=["Wqkv", "out_proj"],
+        lora_dropout=0.05,
+        bias="none",
+        task_type=None,
     )
     peft_model = get_peft_model(model, lora_config)
 
-    # Store RNG state 
+    # Store initial RNG and LoRA states
     initial_lora_state = {k: v.cpu().clone() for k, v in peft_model.state_dict().items() if "lora_" in k}
     initial_py_rng = random.getstate()
     initial_np_rng = np.random.get_state()
@@ -212,7 +216,7 @@ def train_dpo(args):
     for split_idx, split in enumerate(splits):
         print(f"\n==================== SPLIT {split_idx+1}/{len(splits)} ====================")
 
-        # 1. Set RNG state for every split
+        # 1. Reset RNG state for reproducibility across splits
         random.setstate(initial_py_rng)
         np.random.set_state(initial_np_rng)
         torch.set_rng_state(initial_torch_rng)
@@ -243,7 +247,7 @@ def train_dpo(args):
 
         train_loader = DataLoader(
             train_dataset,
-            batch_size=args.batch_size, # Number of videos per batch
+            batch_size=args.batch_size,
             shuffle=True,
             collate_fn=train_collator,
             num_workers=0,
@@ -276,7 +280,7 @@ def train_dpo(args):
             num_training_steps=total_training_steps
         )
        
-        writer = SummaryWriter(f"runs/vslice_{args.model_type}_{args.loss_type}_{args.dataset}_{split_idx}_{timestamp}")
+        writer = SummaryWriter(f"runs/vslice_moondream_{args.loss_type}_{args.dataset}_{split_idx}_{timestamp}")
         writer.add_text(
             "hyperparameters",
             "|param|value|\n|-|-|\n%s" % ("\n".join([f"|{key}|{value}|" for key, value in vars(args).items()])),
@@ -286,7 +290,7 @@ def train_dpo(args):
         save_path = None
         global_step = 0
 
-        print(f"Dataset length:{train_dataset.__len__()}")
+        print(f"Dataset length: {len(train_dataset)}")
 
         for epoch in range(args.num_epochs):
             epoch_loss = 0.0
@@ -316,29 +320,16 @@ def train_dpo(args):
                 peft_model.eval()
                 with peft_model.disable_adapter():
                     with torch.no_grad():
-                        if args.model_type == "minicpm":
-                            ref_c_logits = peft_model.base_model(c_batch_data).logits[:, -1, :]
-                            ref_r_logits = peft_model.base_model(r_batch_data).logits[:, -1, :]
-                        else:
-                            ref_c_logits = peft_model(**c_batch_data).logits[:, -1, :]
-                            ref_r_logits = peft_model(**r_batch_data).logits[:, -1, :]
+                        ref_c_logits = peft_model(**c_batch_data).logits[:, -1, :]
+                        ref_r_logits = peft_model(**r_batch_data).logits[:, -1, :]
 
                         ref_logp_c = F.logsigmoid(diff_attn_boost(ref_c_logits[:, yes_id], ref_c_logits[:, no_id], args.use_boost))
                         ref_logp_r = F.logsigmoid(diff_attn_boost(ref_r_logits[:, yes_id], ref_r_logits[:, no_id], args.use_boost))
 
-                #ref_logp_c = ref_logp_c.detach()
-                #ref_logp_r = ref_logp_r.detach()
-                #del ref_c_logits, ref_r_logits
-                #torch.cuda.empty_cache()
-
-                # Policy Logps (LoRA Enabled)
+                # ── 2. Policy Logps (LoRA Enabled) ──
                 peft_model.train()
-                if args.model_type == "minicpm":
-                    c_logits = peft_model.base_model(c_batch_data).logits[:, -1, :]
-                    r_logits = peft_model.base_model(r_batch_data).logits[:, -1, :]
-                else:
-                    c_logits = peft_model(**c_batch_data).logits[:, -1, :]
-                    r_logits = peft_model(**r_batch_data).logits[:, -1, :]
+                c_logits = peft_model(**c_batch_data).logits[:, -1, :]
+                r_logits = peft_model(**r_batch_data).logits[:, -1, :]
 
                 # Compute binary log policy
                 pi_logp_c = F.logsigmoid(diff_attn_boost(c_logits[:, yes_id], c_logits[:, no_id], args.use_boost))
@@ -352,23 +343,22 @@ def train_dpo(args):
                 z = args.beta * (logits - log_margin.reshape(logits.shape))
 
                 if args.loss_type == "DPO":
-                    loss = -F.logsigmoid(z).mean() # DPO
-
+                    loss = -F.logsigmoid(z).mean()
                 elif args.loss_type == "IPO":
-                    loss = z.pow(2).mean() # IPO
-
+                    loss = z.pow(2).mean()
                 elif args.loss_type == "MPO":
-                    loss = - ((1.0 - torch.sigmoid(z)).pow(2).detach() * F.logsigmoid(z)).mean() # MPO
+                    loss = - ((1.0 - torch.sigmoid(z)).pow(2).detach() * F.logsigmoid(z)).mean()
+                else:
+                    raise ValueError(f"Unknown loss_type: {args.loss_type}")
                 
                 grad_scalar = torch.sigmoid(-z).mean().detach().cpu()
-                track_loss = -F.logsigmoid(z/args.beta).mean().detach().cpu()
+                track_loss = -F.logsigmoid(z / args.beta).mean().detach().cpu()
                 preds = F.sigmoid(c_logits[:, yes_id] - c_logits[:, no_id])
                 mse_loss = F.mse_loss(preds, c_gtscore.reshape(preds.shape))
 
-                # ── Diagnostic Metrics (Metric A & Metric B) ──
+                # Diagnostic Metrics
                 with torch.no_grad():
                     prob_z = torch.sigmoid(z).detach()
-                    # Focal / MPO weights: (1 - sigma(z))^2
                     mod_weights = (1.0 - prob_z).pow(2)
                     
                     easy_mask = prob_z >= 0.7
@@ -385,12 +375,10 @@ def train_dpo(args):
                     grad_share_border = (mod_weights[border_mask].sum().item() / total_w) * 100
                     grad_share_hard = (mod_weights[hard_mask].sum().item() / total_w) * 100
 
-                    # Metric B: KL Drift from Reference Policy
                     kl_c = (pi_logp_c - ref_logp_c).abs().mean().item()
                     kl_r = (pi_logp_r - ref_logp_r).abs().mean().item()
                     kl_drift = kl_c + kl_r
 
-                # Track diagnostics
                 diag['loss'].append(track_loss.item())
                 diag['pi_ratio'].append(pi_ratio.mean().item())
                 diag['ref_ratio'].append(ref_ratio.mean().item())
@@ -411,7 +399,6 @@ def train_dpo(args):
                 epoch_loss += track_loss.item()
                 num_batches += 1
 
-                # Log per global step across epochs
                 writer.add_scalar("Train/step_loss", track_loss, global_step)
                 writer.add_scalar("Train/step_learning_rate", scheduler.get_last_lr()[0], global_step)
                 writer.add_scalar("Train/step_gradient_scalar", grad_scalar.mean().item(), global_step)
@@ -423,7 +410,7 @@ def train_dpo(args):
                 writer.add_scalar("Train/step_grad_share_hard", grad_share_hard, global_step)
                 global_step += 1
 
-            acc = diag['correct'] / diag['total'] * 100
+            acc = diag['correct'] / diag['total'] * 100 if diag['total'] > 0 else 0.0
             print(f"\n{'═'*70}")
             print(f"EPOCH {epoch+1} DIAGNOSTICS:")
             print(f"{'═'*70}")
@@ -437,9 +424,8 @@ def train_dpo(args):
             print(f"{'═'*70}")
 
             # ================= VALIDATION BLOCK =================
-            # Evaluate every epochs, or on the final epoch
             if (epoch + 1) % 1 == 0 or epoch == args.num_epochs - 1:
-                print("--> Running Validation...")
+                print("--> Running Validation with Chunking...")
 
                 val_df = evaluate(
                     model=peft_model, 
@@ -449,7 +435,7 @@ def train_dpo(args):
                     yes_id=yes_id,
                     no_id=no_id,
                     tvsum_user_scores=tvsum_user_scores,
-                    model_type=args.model_type,
+                    chunk_size=args.eval_chunk_size,
                 )
                 
                 if not val_df.empty:
@@ -465,7 +451,7 @@ def train_dpo(args):
                     current_corr = avg_tau + avg_rho
                     if current_corr > best_corr:
                         best_corr = current_corr
-                        save_path = os.path.join(args.output_dir, f"{args.dataset}_{timestamp}_best_{args.loss_type}_split{split_idx}.pth")
+                        save_path = os.path.join(args.output_dir, f"moondream_{args.dataset}_{timestamp}_best_{args.loss_type}_split{split_idx}.pth")
                         os.makedirs(args.output_dir, exist_ok=True)
                         peft_model.save_pretrained(save_path)
                         print(f"Saved LoRA weights to {save_path}")
@@ -473,14 +459,13 @@ def train_dpo(args):
         print(f"Finished Split {split_idx+1}. Best Correlation: {best_corr:.4f}\n")
 
         # ================= FINAL TEST BLOCK =================
-        print(f"--> Running Final Test for Split {split_idx+1}...")
+        print(f"--> Running Final Test for Split {split_idx+1} with Chunking...")
 
-        # Load the best saved model weights for testing without re-wrapping
         if save_path and os.path.exists(save_path):
             best_weights = load_peft_weights(save_path)
             set_peft_model_state_dict(peft_model, best_weights)
             peft_model.to(device)
-            print(f"Loaded best LORA checkpoint from {save_path}")
+            print(f"Loaded best LoRA checkpoint from {save_path}")
 
         test_df = evaluate(
             model=peft_model,
@@ -490,7 +475,7 @@ def train_dpo(args):
             yes_id=yes_id,
             no_id=no_id,
             tvsum_user_scores=tvsum_user_scores,
-            model_type=args.model_type,
+            chunk_size=args.eval_chunk_size,
         )
 
         if not test_df.empty:
@@ -499,65 +484,53 @@ def train_dpo(args):
             test_rho = test_df['spearman'].mean()
             print(f"\n[Split {split_idx+1}] Test | F-Score: {test_f1:.4f} | Tau: {test_tau:.4f} | Rho: {test_rho:.4f}")
             
-            # Log test scores to tensorboard (logged at step = split_idx so you can see across splits)
             writer.add_scalar("Global/F-Score", test_f1, split_idx)
             writer.add_scalar("Global/Kendall_Tau", test_tau, split_idx)
             writer.add_scalar("Global/Spearman_Rho", test_rho, split_idx)
 
-            eval_split_metrics[split_idx] = {}
-            eval_split_metrics[split_idx]['f_score'] = test_f1
-            eval_split_metrics[split_idx]['kendall'] = test_tau
-            eval_split_metrics[split_idx]['spearman'] = test_rho
+            eval_split_metrics[split_idx] = {
+                'f_score': test_f1,
+                'kendall': test_tau,
+                'spearman': test_rho
+            }
     
     if eval_split_metrics:
         print("\n" + "═"*60)
         print(f"FINAL GLOBAL BENCHMARK SUMMARY ({len(splits)} SPLITS)")
         print("═"*60)
 
-        # Calculate averages across all processed splits
         avg_overall_f1 = np.mean([m['f_score'] for m in eval_split_metrics.values()])
         avg_overall_tau = np.mean([m['kendall'] for m in eval_split_metrics.values()])
         avg_overall_rho = np.mean([m['spearman'] for m in eval_split_metrics.values()])
         print(f"Global Avg | F1: {avg_overall_f1:.4f} | Kendall: {avg_overall_tau:.4f} | Spearman: {avg_overall_rho:.4f}")
-        writer.add_scalar("Test/Global_F-Score", avg_overall_f1) # Overall
+        writer.add_scalar("Test/Global_F-Score", avg_overall_f1)
         writer.add_scalar("Test/Global_Kendall_Tau", avg_overall_tau)
         writer.add_scalar("Test/Global_Spearman_Rho", avg_overall_rho)
 
     writer.flush()
     writer.close()
 
-def resolve_model_path(mtype):
-    if mtype in ["qwen2_vl_3b"]:
-        return "Qwen/Qwen2.5-VL-3B-Instruct"
-    elif mtype in ["qwen2_vl_7b"]:
-        return "Qwen/Qwen2.5-VL-7B-Instruct"
-    candidates = ["./MiniCPM-V-2_6-int4", "/home/dexter/VideoRAG/.checkpoints/MiniCPM-V-2_6-int4"]
-    for p in candidates:
-        if os.path.exists(p): return p
-    return "openbmb/MiniCPM-V-2_6"
-
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--model_type", type=str, default="minicpm", choices=["minicpm", "qwen2_vl_3b", "qwen2_vl_7b"])
-    parser.add_argument("--dataset", type=str, default="both", choices=["summe", "tvsum"])
-    parser.add_argument("--root_dir", type=str, default=".")
-    parser.add_argument("--model_path", type=str, default=None)
-    parser.add_argument("--split_file", type=str, default="./dataset/summe_splits.json")
-    parser.add_argument("--output_dir", type=str, default="./checkpoints")
+    parser = argparse.ArgumentParser(description="Moondream-specific DPO Fine-tuning with Chunked Evaluation")
+    parser.add_argument("--model_path", type=str, default="vikhyatk/moondream2", help="Path or HuggingFace ID for Moondream2")
+    parser.add_argument("--dataset", type=str, default="summe", choices=["summe", "tvsum"], help="Dataset to train and evaluate on")
+    parser.add_argument("--root_dir", type=str, default=".", help="Root directory for dataset files")
+    parser.add_argument("--split_file", type=str, default=None, help="Path to split file (defaults to ./dataset/<dataset>_splits.json)")
+    parser.add_argument("--output_dir", type=str, default="./checkpoints", help="Output directory for saved LoRA checkpoints")
     parser.add_argument("--num_epochs", type=int, default=5)
     parser.add_argument("--learning_rate", type=float, default=1e-5)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--weight_decay", type=float, default=1e-5)
 
     parser.add_argument('--batch_size', type=int, default=2, help='Batch size (number of videos per batch)')
-    parser.add_argument('--clip_length', type=int, default=4)
-    parser.add_argument("--beta", type=float, default=0.1)
+    parser.add_argument('--clip_length', type=int, default=4, help='Number of frames per preference clip')
+    parser.add_argument("--beta", type=float, default=0.1, help="DPO temperature parameter")
     parser.add_argument("--warmup_ratio", type=float, default=0.1, help="Ratio of total training steps for linear LR warmup")
     parser.add_argument('--use_boost', type=str_to_bool, default=False, help='Enable tanh boost')
-    parser.add_argument("--loss_type", type=str, default="DPO")
+    parser.add_argument("--loss_type", type=str, default="DPO", choices=["DPO", "IPO", "MPO"], help="Preference loss function type")
+    
+    # Chunking parameter for evaluation
+    parser.add_argument("--eval_chunk_size", type=int, default=8, help="Mini-batch chunk size during evaluate() to avoid OOM")
+    parser.add_argument("--load_in_4bit", action="store_true", default=False, help="Load Moondream in 4-bit quantization")
     args = parser.parse_args()
-    
-    if args.model_path is None:
-        args.model_path = resolve_model_path(args.model_type)
-    
     train_dpo(args)
