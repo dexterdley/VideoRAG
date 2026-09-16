@@ -20,7 +20,7 @@ MOONDREAM_TRANSFORM = transforms.Compose([
     transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
 ])
 
-def load_video_from_picks(video_path, picks, width=224, height=224):
+def load_video_from_picks(video_path, picks, width=896, height=672):
     """
     Directly load the picked frames as PIL Images
     """
