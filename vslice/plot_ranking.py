@@ -56,12 +56,12 @@ base_accs = [df_base[mask]['correct_ranking'].mean() * 100 for _, mask in tiers]
 peft_accs = [df_peft[mask]['correct_ranking'].mean() * 100 for _, mask in tiers]
 
 bars1 = ax1.bar(x - width/2, base_accs, width, label='Zero-Shot Base', color='#1f77b4', edgecolor='black', linewidth=0.6, alpha=0.85)
-bars2 = ax1.bar(x + width/2, peft_accs, width, label='PEFT Aligned (Ours)', color='#2ca02c', edgecolor='black', linewidth=0.6, alpha=0.85)
+bars2 = ax1.bar(x + width/2, peft_accs, width, label='VSLICE (Ours)', color='#2ca02c', edgecolor='black', linewidth=0.6, alpha=0.85)
 
 ax1.axhline(50, color='gray', linestyle='--', linewidth=1.0, label='Chance (50%)')
 ax1.set_xticks(x)
 ax1.set_xticklabels([name for name, _ in tiers], weight='bold')
-ax1.set_ylabel('Pairwise Accuracy (%)', weight='bold')
+ax1.set_ylabel('Preference Accuracy (%)', weight='bold')
 ax1.set_ylim(40, 95)
 ax1.set_title('Recognition vs. Ranking Gap', weight='bold', pad=8)
 ax1.legend(loc='upper left', frameon=True, fontsize=7.5, ncol=1)
@@ -84,43 +84,50 @@ print(f'Saved Figure 1 to {out_f1_png} and {out_f1_pdf}')
 
 
 # ==============================================================================
-# Figure 2: Confidence-Accuracy Calibration Curve
-# Proves: Zero-shot confidence does not imply ranking correctness (inverts at low confidence).
-#         PEFT alignment achieves monotonic confidence calibration (68.6% -> 83.9%).
+# Figure 2: Selective Prediction (Coverage vs. Accuracy Curve)
+# Proves: VSLICE monotonically scales from 77.5% -> 83.9% as selectivity increases,
+#         whereas Zero-Shot baseline is unstable and drops from 68.3% -> 64.0% at top 20%.
 # ==============================================================================
 fig2, ax2 = plt.subplots(figsize=FIG_SIZE)
 
-conf_labels = ['Q1\n(Low)', 'Q2', 'Q3', 'Q4', 'Q5\n(High)']
-df_base['conf_q'] = pd.qcut(df_base['model_gap'].abs(), q=5, labels=conf_labels)
-df_peft['conf_q'] = pd.qcut(df_peft['model_gap'].abs(), q=5, labels=conf_labels)
+cov_levels = np.array([1.0, 0.8, 0.6, 0.4, 0.2])
+acc_base_cov = []
+acc_peft_cov = []
 
-cal_base = df_base.groupby('conf_q', observed=False)['correct_ranking'].mean() * 100
-cal_peft = df_peft.groupby('conf_q', observed=False)['correct_ranking'].mean() * 100
+df_base['abs_gap'] = df_base['model_gap'].abs()
+df_peft['abs_gap'] = df_peft['model_gap'].abs()
 
-qx = np.arange(len(conf_labels))
-ax2.plot(qx, cal_base.values, marker='o', markersize=5.5, linestyle='-.', lw=1.8, color='#1f77b4', label='Zero-Shot Base', zorder=3)
-ax2.plot(qx, cal_peft.values, marker='s', markersize=5.5, linestyle='-', lw=2.2, color='#2ca02c', label='VSLICE (Ours)', zorder=3)
-ax2.plot([0, 4], [50, 100], color='#555555', linestyle=':', linewidth=1.5, label='Ideal Calibration', zorder=2)
+for c in cov_levels:
+    qb = df_base['abs_gap'].quantile(1.0 - c)
+    qp = df_peft['abs_gap'].quantile(1.0 - c)
+    acc_base_cov.append(df_base[df_base['abs_gap'] >= qb]['correct_ranking'].mean() * 100)
+    acc_peft_cov.append(df_peft[df_peft['abs_gap'] >= qp]['correct_ranking'].mean() * 100)
+
+cov_labels = ['100%\n(All)', '80%', '60%', '40%', '20%\n(Top)']
+qx_cov = np.arange(len(cov_labels))
+
+ax2.plot(qx_cov, acc_base_cov, marker='o', markersize=5.5, linestyle='-.', lw=1.8, color='#1f77b4', label='Zero-Shot Base', zorder=3)
+ax2.plot(qx_cov, acc_peft_cov, marker='s', markersize=5.5, linestyle='-', lw=2.2, color='#2ca02c', label='VSLICE (Ours)', zorder=3)
 ax2.axhline(50, color='gray', linestyle='--', linewidth=1.0, label='Random (50%)', zorder=1)
 
-for i, (b_val, p_val) in enumerate(zip(cal_base.values, cal_peft.values)):
-    ax2.text(i, b_val - 4.5, f'{b_val:.1f}%', ha='center', fontsize=10.5, color='#1f77b4', weight='bold')
-    ax2.text(i, p_val + 2.0, f'{p_val:.1f}%', ha='center', fontsize=10.5, color='#2ca02c', weight='bold')
+for i, (b_val, p_val) in enumerate(zip(acc_base_cov, acc_peft_cov)):
+    ax2.text(i, b_val - 3.2, f'{b_val:.1f}%', ha='center', fontsize=10.5, color='#1f77b4', weight='bold')
+    ax2.text(i, p_val + 1.8, f'{p_val:.1f}%', ha='center', fontsize=10.5, color='#2ca02c', weight='bold')
 
-# <-> arrow showing alignment improvement
-diff_q0 = cal_peft.values[0] - cal_base.values[0]
-ax2.annotate('', xy=(0, cal_peft.values[0] - 1.8), xytext=(0, cal_base.values[0] + 1.8),
+# <-> arrow showing alignment improvement at 100% full coverage
+diff_cov0 = acc_peft_cov[0] - acc_base_cov[0]
+ax2.annotate('', xy=(0, acc_peft_cov[0] - 1.8), xytext=(0, acc_base_cov[0] + 1.8),
              arrowprops=dict(arrowstyle='<->', color='#d62728', lw=2.0, shrinkA=0, shrinkB=0))
-ax2.text(0.08, (cal_peft.values[0] + cal_base.values[0]) / 2 + 8, f'+{diff_q0:.1f}%',
+ax2.text(0.08, (acc_peft_cov[0] + acc_base_cov[0]) / 2, f'+{diff_cov0:.1f}%',
          ha='left', va='center', fontsize=10.5, color='#d62728', weight='bold',
          bbox=dict(boxstyle='round,pad=0.15', facecolor='white', edgecolor='none', alpha=0.85))
 
-ax2.set_xticks(qx)
-ax2.set_xticklabels(conf_labels, weight='bold')
-ax2.set_ylim(18, 104)
-ax2.set_ylabel('Pairwise Accuracy (%)', weight='bold')
-ax2.set_xlabel(r'Confidence Quantile ($|\Delta \hat{z}|$)', weight='bold')
-ax2.set_title('Confidence Ranking', weight='bold', pad=8)
+ax2.set_xticks(qx_cov)
+ax2.set_xticklabels(cov_labels, weight='bold')
+ax2.set_ylim(42, 92)
+ax2.set_ylabel('Preference Accuracy (%)', weight='bold')
+ax2.set_xlabel('Coverage (Selective Prediction)', weight='bold')
+ax2.set_title('Selective Prediction', weight='bold', pad=8)
 ax2.legend(loc='lower right', frameon=True, fontsize=8)
 ax2.grid(True)
 
@@ -129,6 +136,10 @@ out_f2_png = os.path.join(results_dir, 'cvpr_fig2_confidence_ranking.png')
 out_f2_pdf = os.path.join(results_dir, 'cvpr_fig2_confidence_ranking.pdf')
 plt.savefig(out_f2_png, dpi=300, bbox_inches='tight')
 plt.savefig(out_f2_pdf, dpi=300, bbox_inches='tight')
+out_f2_sel_png = os.path.join(results_dir, 'cvpr_fig2_selective_prediction.png')
+out_f2_sel_pdf = os.path.join(results_dir, 'cvpr_fig2_selective_prediction.pdf')
+plt.savefig(out_f2_sel_png, dpi=300, bbox_inches='tight')
+plt.savefig(out_f2_sel_pdf, dpi=300, bbox_inches='tight')
 plt.close(fig2)
 print(f'Saved Figure 2 to {out_f2_png} and {out_f2_pdf}')
 
@@ -192,7 +203,6 @@ plt.savefig(out_f3_pdf, dpi=300, bbox_inches='tight')
 plt.close(fig3)
 print(f'Saved Figure 3 to {out_f3_png} and {out_f3_pdf}')
 
-
 # ==============================================================================
 # Figure 4: Continuous Difficulty Curve (Accuracy vs. True Human Margin)
 # Proves: Across the full continuous difficulty spectrum, PEFT strictly dominates Zero-Shot.
@@ -221,7 +231,6 @@ ax4.plot(stats_base['mean_human_gap'], stats_base['accuracy'],
 ax4.plot(stats_peft['mean_human_gap'], stats_peft['accuracy'], 
          marker='s', markersize=5.5, linestyle='-', linewidth=2.2, 
          color='#2ca02c', label='VSLICE (Ours)')
-
 ax4.axhline(50, color='gray', linestyle='--', linewidth=1.0, label='Chance (50%)')
 
 for i, row in stats_base.iterrows():
@@ -241,7 +250,7 @@ ax4.text(x_arr + 0.012, (y_peft + y_base) / 2, f'+{diff_pt:.1f}%',
          ha='left', va='center', fontsize=10.5, color='#d62728', weight='bold')
 
 ax4.set_title('Preference Accuracy vs. Highlight Difficulty', weight='bold', pad=8)
-ax4.set_xlabel(r'True Human Gap ($\Delta z$)', weight='bold')
+ax4.set_xlabel(r'True Human Preference Gap', weight='bold')
 ax4.set_ylabel('Preference Accuracy (%)', weight='bold')
 ax4.set_xlim(0.18, 0.72)
 ax4.set_ylim(40, 95)
@@ -272,7 +281,7 @@ bars2 = cax1.bar(x + width/2, peft_accs, width, label='VSLICE (Ours)', color='#2
 cax1.axhline(50, color='gray', linestyle='--', linewidth=1.0, label='Random (50%)')
 cax1.set_xticks(x)
 cax1.set_xticklabels([name for name, _ in tiers], weight='bold')
-cax1.set_ylabel('Pairwise Accuracy (%)', weight='bold')
+cax1.set_ylabel('Preference Accuracy (%)', weight='bold')
 cax1.set_ylim(40, 95)
 cax1.set_title('Recognition vs. Ranking Gap', weight='bold', fontsize=font_sz, pad=8)
 cax1.legend(loc='upper left', frameon=True, fontsize=8, ncol=1)
@@ -307,7 +316,7 @@ cax2.text(x_arr + 0.012, (y_peft + y_base) / 2, f'+{diff_pt:.1f}%',
           ha='left', va='center', fontsize=font_sz, color='#d62728', weight='bold')
 
 cax2.set_title('Preference Accuracy vs. Highlight Difficulty', weight='bold', fontsize=font_sz, pad=8)
-cax2.set_xlabel(r'True Human Gap ($\Delta z$)', weight='bold')
+cax2.set_xlabel(r'True Human Preference Gap', weight='bold')
 cax2.set_ylabel('Preference Accuracy (%)', weight='bold')
 cax2.set_xlim(0.18, 0.72)
 cax2.set_ylim(40, 95)
@@ -316,29 +325,28 @@ cax2.grid(True)
 
 
 # ------------------------------------------------------------------------------
-# Subplot 3: Confidence Calibration Curve (with <-> arrow)
+# Subplot 3: Selective Prediction (Coverage vs. Accuracy)
 # ------------------------------------------------------------------------------
-cax3.plot(qx, cal_base.values, marker='o', markersize=5.5, linestyle='-.', lw=1.8, color='#1f77b4', label='Zero-Shot Base', zorder=3)
-cax3.plot(qx, cal_peft.values, marker='s', markersize=5.5, linestyle='-', lw=2.2, color='#2ca02c', label='VSLICE (Ours)', zorder=3)
-cax3.plot([0, 4], [50, 100], color='#555555', linestyle=':', linewidth=1.5, label='Ideal Calibration', zorder=2)
+cax3.plot(qx_cov, acc_base_cov, marker='o', markersize=5.5, linestyle='-.', lw=1.8, color='#1f77b4', label='Zero-Shot Base', zorder=3)
+cax3.plot(qx_cov, acc_peft_cov, marker='s', markersize=5.5, linestyle='-', lw=2.2, color='#2ca02c', label='VSLICE (Ours)', zorder=3)
 cax3.axhline(50, color='gray', linestyle='--', linewidth=1.0, label='Random (50%)', zorder=1)
 
-for i, (b_val, p_val) in enumerate(zip(cal_base.values, cal_peft.values)):
-    cax3.text(i, b_val - 4.5, f'{b_val:.1f}%', ha='center', fontsize=11.5, color='#1f77b4', weight='bold')
-    cax3.text(i, p_val + 2.0, f'{p_val:.1f}%', ha='center', fontsize=11.5, color='#2ca02c', weight='bold')
+for i, (b_val, p_val) in enumerate(zip(acc_base_cov, acc_peft_cov)):
+    cax3.text(i, b_val - 3.2, f'{b_val:.1f}%', ha='center', fontsize=11.5, color='#1f77b4', weight='bold')
+    cax3.text(i, p_val + 1.8, f'{p_val:.1f}%', ha='center', fontsize=11.5, color='#2ca02c', weight='bold')
 
-cax3.annotate('', xy=(0, cal_peft.values[0] - 1.8), xytext=(0, cal_base.values[0] + 1.8),
+cax3.annotate('', xy=(0, acc_peft_cov[0] - 1.8), xytext=(0, acc_base_cov[0] + 1.8),
               arrowprops=dict(arrowstyle='<->', color='#d62728', lw=2.0, shrinkA=0, shrinkB=0))
-cax3.text(0.08, (cal_peft.values[0] + cal_base.values[0]) / 2 + 8, f'+{diff_q0:.1f}%',
+cax3.text(0.08, (acc_peft_cov[0] + acc_base_cov[0]) / 2, f'+{diff_cov0:.1f}%',
           ha='left', va='center', fontsize=font_sz, color='#d62728', weight='bold',
           bbox=dict(boxstyle='round,pad=0.15', facecolor='white', edgecolor='none', alpha=0.85))
 
-cax3.set_xticks(qx)
-cax3.set_xticklabels(conf_labels)
-cax3.set_ylim(18, 104)
-cax3.set_ylabel('Pairwise Accuracy (%)', weight='bold')
-cax3.set_xlabel(r'Confidence Quantile ($|\Delta \hat{z}|$)', weight='bold')
-cax3.set_title('Confidence Ranking', weight='bold', fontsize=font_sz, pad=8)
+cax3.set_xticks(qx_cov)
+cax3.set_xticklabels(cov_labels)
+cax3.set_ylim(42, 92)
+cax3.set_ylabel('Preference Accuracy (%)', weight='bold')
+cax3.set_xlabel('Coverage (Selective Prediction)', weight='bold')
+cax3.set_title('Selective Prediction', weight='bold', fontsize=font_sz, pad=8)
 cax3.legend(loc='lower right', frameon=True, fontsize=8)
 cax3.grid(True)
 

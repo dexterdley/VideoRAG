@@ -26,25 +26,25 @@ def moving_average(data, smoothing_weight=0.99, start=0):
 file_paths_kl = {
     'MiniCPM DPO': root + "run-vslice_DPO_no_margin_summe_0_20260909_163954-tag-Train_step_kl_drift.csv",
     'MiniCPM DPO + Margin': root + "run-vslice_DPO_summe_0_20260905_104913-tag-Train_step_kl_drift.csv",
-    'QWEN2-VL': root + "run-vslice_qwen2_vl_3b_DPO_no_margin_summe_0_20260919_042200-tag-Train_step_kl_drift.csv",
+    # 'MiniCPM Focal DPO + Margin': root + "run-vslice_MPO_summe_0_20260904_230053-tag-Train_step_kl_drift.csv",
+    'QWEN2-VL': root + "run-vslice_qwen2_vl_3b_DPO_no_margin_summe_0_20260921_181616-tag-Train_step_kl_drift.csv",
     'QWEN2-VL DPO + Margin': root + "run-vslice_qwen2_vl_3b_DPO_summe_0_20260917_053526-tag-Train_step_kl_drift.csv"
-     # 'Focal DPO + Margin': root + "run-vslice_MPO_summe_0_20260904_230053-tag-Train_step_kl_drift.csv",
 }
 
 file_paths_loss = {
     'MiniCPM DPO': root + "run-vslice_DPO_no_margin_summe_0_20260909_163954-tag-Train_step_loss.csv",
     'MiniCPM DPO + Margin': root + "run-vslice_DPO_summe_0_20260905_104913-tag-Train_step_loss.csv",
-    # 'QWEN2-VL': root + "run-vslice_qwen2_vl_3b_DPO_no_margin_summe_0_20260919_042200-tag-Train_step_loss.csv",
+    # 'MiniCPM Focal DPO + Margin': root + "run-vslice_MPO_summe_0_20260904_230053-tag-Train_step_loss.csv",
+    'QWEN2-VL': root + "run-vslice_qwen2_vl_3b_DPO_no_margin_summe_0_20260921_181616-tag-Train_step_loss.csv",
     'QWEN2-VL DPO + Margin': root + "run-vslice_qwen2_vl_3b_DPO_summe_0_20260917_053526-tag-Train_step_loss.csv",
-    # 'Focal DPO + Margin': root + "run-vslice_MPO_summe_0_20260904_230053-tag-Train_step_loss.csv",
 }
 
 file_paths_pi_ratio = {
     'MiniCPM DPO': root + "run-vslice_DPO_no_margin_summe_0_20260909_163954-tag-Train_step_pi_ratio.csv",
     'MiniCPM DPO + Margin': root + "run-vslice_DPO_summe_0_20260905_104913-tag-Train_step_pi_ratio.csv",
-    'QWEN2-VL': root + "run-vslice_qwen2_vl_3b_DPO_no_margin_summe_0_20260919_042200-tag-Train_step_pi_ratio.csv",
-    'QWEN2-VL DPO + Margin': root + "run-vslice_qwen2_vl_3b_DPO_summe_0_20260917_053526-tag-Train_step_pi_ratio.csv",
-    # 'Focal DPO + Margin': root + "run-vslice_MPO_summe_0_20260904_230053-tag-Train_step_pi_ratio.csv",
+    # 'MiniCPM Focal DPO + Margin': root + "run-vslice_MPO_summe_0_20260904_230053-tag-Train_step_pi_ratio.csv",
+    'QWEN2-VL': root + "run-vslice_qwen2_vl_3b_DPO_no_margin_summe_0_20260921_181616-tag-Train_step_pi_ratio.csv",
+    'QWEN2-VL DPO + Margin': root + "run-vslice_qwen2_vl_3b_DPO_summe_0_20260917_053526-tag-Train_step_pi_ratio.csv"
 }
 
 plt.rcParams.update({'font.size': 18})
@@ -82,6 +82,8 @@ def _plot_metric_on_ax(ax, file_paths, ylabel, smoothing_weight, start,
                     label=label, linewidth=lw)
     ax.set_xlabel('Steps')
     ax.set_ylabel(ylabel)
+    ax.set_xlim(0,575)
+    ax.set_xticks([0, 100, 200, 300, 400, 500])
     if show_legend:
         ax.legend(loc=legend_loc, prop={'size': 13})
     ax.grid(True, linestyle='--', alpha=0.6)
@@ -91,9 +93,9 @@ def plot_combined(save_file="vslice_combined.pdf"):
     fig, axes = plt.subplots(1, 3, figsize=(15, 4))
 
     configs = [
-        (file_paths_loss,     'Loss',           0.9, 7,  'upper right', False),
-        (file_paths_kl,       'KL Divergence', 0.9, 7,  'lower right', False),
-        (file_paths_pi_ratio, 'Separation Margin',         0.9, 7,  'upper left', True),
+        (file_paths_loss,     'Loss',           0.96, 7,  'upper right', False),
+        (file_paths_kl,       'KL Divergence', 0.96, 7,  'lower right', False),
+        (file_paths_pi_ratio, 'Separation Margin',         0.96, 7,  'upper left', True),
     ]
 
     for ax, (fps, ylabel, sw, st, lloc, show_leg) in zip(axes, configs):
