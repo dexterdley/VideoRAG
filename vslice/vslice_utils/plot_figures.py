@@ -88,9 +88,58 @@ def _plot_metric_on_ax(ax, file_paths, ylabel, smoothing_weight, start,
         ax.legend(loc=legend_loc, prop={'size': 13})
     ax.grid(True, linestyle='--', alpha=0.6)
 
+def _plot_kl_vs_margin_on_ax(ax, kl_paths, margin_paths, smoothing_weight, start, every=5,
+                             text_offsets=None, n_end=10):
+    """Helper: scatter smoothed separation margin (x) against KL divergence (y), aligned by step,
+    and enclose each run in a convex hull to contrast DPO with and without margin.
+    For each model, an arrow joins the final state of the no-margin run to the margin run,
+    labelled with the change in KL spent per unit separation (lower is better)."""
+    # Label placement per model in axes fraction (x, y, ha, va); runs lie on the diagonal,
+    # so the upper-left and lower-right corners are empty
+    text_offsets = text_offsets or {'MiniCPM': (0.03, 0.97, 'left', 'top'),
+                                    'QWEN2-VL': (0.97, 0.03, 'right', 'bottom')}
+    ends = {}  # model -> {is_margin: (end_margin, end_kl, color)}
+    for idx, label in enumerate(kl_paths):
+        kl = pd.read_csv(kl_paths[label])[['Step', 'Value']]
+        mg = pd.read_csv(margin_paths[label])[['Step', 'Value']]
+        df = kl.merge(mg, on='Step', suffixes=('_kl', '_margin'))[start:-1]
+        style, lw, color = _get_curve_style(label, idx)
+        full = np.column_stack([moving_average(df['Value_margin'], smoothing_weight),
+                                moving_average(df['Value_kl'], smoothing_weight)])
+        pts = full[::every]
+        is_margin = 'margin' in label.lower()
+        end_mg, end_kl = full[-n_end:].mean(axis=0)
+        ends.setdefault(label.split()[0], {})[is_margin] = (end_mg, end_kl, color)
+        ax.scatter(pts[:, 0], pts[:, 1], s=12, color=color, alpha=0.6,
+                   marker='o' if is_margin else 'x', label=label)
+        if len(pts) >= 3:
+            hull = pts[ConvexHull(pts).vertices]
+            ax.fill(hull[:, 0], hull[:, 1], color=color, alpha=0.12)
+            ax.plot(np.append(hull[:, 0], hull[0, 0]), np.append(hull[:, 1], hull[0, 1]),
+                    style, color=color, linewidth=lw)
+
+    for model, runs in ends.items():
+        if True not in runs or False not in runs:
+            continue
+        (mg_n, kl_n, _), (mg_m, kl_m, color_m) = runs[False], runs[True]
+        # End-state markers: hollow circle = no margin, yellow star = margin; arrow drawn above the hulls
+        ax.scatter([mg_n], [kl_n], s=70, facecolors='white', edgecolors='black', linewidths=1.5, zorder=7)
+        ax.scatter([mg_m], [kl_m], s=260, color='gold', edgecolors='black', linewidths=1.2,
+                   marker='*', zorder=8)
+        ax.annotate('', xy=(mg_m, kl_m), xytext=(mg_n, kl_n), zorder=7,
+                    arrowprops=dict(arrowstyle='-|>', color='black', lw=1.8, mutation_scale=16,
+                                    shrinkA=4, shrinkB=9))
+        tx, ty, ha, va = text_offsets.get(model, (0.03, 0.97, 'left', 'top'))
+        ax.text(tx, ty, f'{model}: +Margin\nKL/Sep {kl_n / mg_n:.2f}' + r'$\rightarrow$' + f'{kl_m / mg_m:.2f}',
+                transform=ax.transAxes, ha=ha, va=va, fontsize=10, color=color_m, zorder=9,
+                bbox=dict(boxstyle='round,pad=0.25', fc='white', ec=color_m, lw=0.8, alpha=0.9))
+    ax.set_xlabel('Separation Margin')
+    ax.set_ylabel('KL Divergence')
+    ax.grid(True, linestyle='--', alpha=0.6)
+
 def plot_combined(save_file="vslice_combined.pdf"):
-    """Compile KL Divergence, Loss and Margin into a 1×3 figure."""
-    fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+    """Compile Loss, KL Divergence, Margin and KL vs. Margin into a 1×4 figure."""
+    fig, axes = plt.subplots(1, 4, figsize=(20, 4))
 
     configs = [
         (file_paths_loss,     'Loss',           0.96, 7,  'upper right', False),
@@ -100,6 +149,8 @@ def plot_combined(save_file="vslice_combined.pdf"):
 
     for ax, (fps, ylabel, sw, st, lloc, show_leg) in zip(axes, configs):
         _plot_metric_on_ax(ax, fps, ylabel, sw, st, legend_loc=lloc, show_legend=show_leg)
+
+    _plot_kl_vs_margin_on_ax(axes[3], file_paths_kl, file_paths_pi_ratio, 0.96, 7)
 
     plt.tight_layout()
     plt.savefig("./results/" + save_file, format="pdf", bbox_inches="tight")
