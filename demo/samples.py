@@ -9,6 +9,7 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SUMME_DIR = os.path.join(REPO_ROOT, "SumMe", "raw", "videos")
 TVSUM_DIR = os.path.join(REPO_ROOT, "TVSum", "tvsum50_ver_1_1", "ydata-tvsum50-v1_1")
 CHECKPOINT_DIR = os.path.join(REPO_ROOT, "checkpoints")  # vslice/simple_dpo.py --output_dir
+NARAKA_DIR = os.path.join(REPO_ROOT, "naraka_vids")  # vslice/naraka_gui.py sample videos
 
 
 def list_samples():

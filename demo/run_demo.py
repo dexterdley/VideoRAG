@@ -6,6 +6,8 @@ USAGE (from the repo root, VRAG env):
     python demo/run_demo.py --video tvsum/37rzWOQsNIw --prompt "close-ups of the sandwiches being made"
     python demo/run_demo.py --video path/to/any.mp4 --prompt "..." --layout crop --mood chill
     python demo/run_demo.py --video summe/Jumps_ --prompt "..." --lora checkpoints/<adapter folder>
+    # vslice/naraka_gui.py's scores: a Yes/No prompt is sent verbatim with naraka's system prompt
+    python demo/run_demo.py --video naraka_vids/QID80I1IRyI.mp4 --prompt "Analyze these frames for text banners like 'First Blood', 'Double Kill', 'Triple Kill', 'Quadra Kill', or 'Invincible'. If any of these are present, answer 'Yes'. Otherwise, answer 'No'. Do not provide any explanation."
     python demo/run_demo.py --list   # show available SumMe / TVSum sample keys and LoRA checkpoints
 """
 
@@ -43,6 +45,8 @@ def main():
     ap.add_argument("--max_clips", type=int, default=d.max_clips)
     ap.add_argument("--min_clip", type=float, default=d.min_clip)
     ap.add_argument("--max_clip", type=float, default=d.max_clip)
+    ap.add_argument("--lead_in", type=float, default=d.lead_in,
+                    help="seconds of build-up kept before each detected highlight")
     ap.add_argument("--layout", choices=["blur", "crop"], default=d.layout)
     ap.add_argument("--width", type=int, default=d.width)
     ap.add_argument("--height", type=int, default=d.height)
@@ -71,6 +75,7 @@ def main():
         f"{slug(os.path.splitext(os.path.basename(video_path))[0])}__{slug(args.prompt)}")
     cfg = DemoConfig(
         sample_fps=args.sample_fps, batch_size=args.batch_size, min_clip=args.min_clip, max_clip=args.max_clip,
+        lead_in=args.lead_in,
         target_duration=args.target_duration, max_clips=args.max_clips, layout=args.layout,
         width=args.width, height=args.height, music=not args.no_music, mood=args.mood,
         orig_volume=args.orig_volume, text=not args.no_text, calib_frames=args.calib_frames,

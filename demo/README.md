@@ -6,8 +6,8 @@ such as the VSLICE DPO checkpoints in `../checkpoints/`) drafts clip proposals, 
 demo renders a 1080×1920 vertical edit with generated background music.
 
 ```
-video ─► 1 fps frames ─► MiniCPM P(Yes | "is this a strong shot for <prompt>?")
-      ─► smooth + peak-grow ─► proposals (2–6 s, temporal NMS)
+video ─► 1 fps frames ─► MiniCPM P(Yes | prompt)   (Yes/No prompts verbatim, else "is this a strong shot for <prompt>?")
+      ─► importance curve (naraka_gui.py's calibrate_bitemporal) ─► peak-grow ─► proposals (2–6 s, temporal NMS)
       ─► MiniCPM multi-frame verification ─► rank = ½ frame + ½ clip score
       ─► greedy selection to target length (weak clips dropped, overlaps trimmed, touching clips merged)
       ─► MiniCPM captions + hook title + music mood
@@ -48,11 +48,31 @@ python -m unittest discover -s demo/tests -v
 2. **Find highlights**: the progress bar, log and a live P(Yes) line plot stream while MiniCPM scores
    each second. Up to 8 **proposal cards** then appear one by one, each with a preview clip, its time
    range and scores, an editable MiniCPM caption and an *Include* checkbox (pre-ticked to fill the
-   target length). A timeline image shows where all the proposals fall.
+   target length). A timeline image shows where all the proposals fall. Each proposal is the detected
+   window (≤6 s around the peak) plus a **lead-in** (slider, default 5 s) so the build-up before the
+   moment, e.g. the fight before a kill banner, is kept.
 3. **Create short**: the ticked clips are combined in chronological order (overlaps trimmed, touching clips
    merged), reframed to 9:16 (blur-pad or motion-aware crop, 1080×1920 or 720×1280), given the hook title,
-   captions and generated music, and shown in a phone-shaped player with a **Download MP4** button.
+   captions and generated music (*Music*: auto / a mood / **none** = original audio only), and shown in a
+   phone-shaped player with a **Download MP4** button.
    You can re-tick, edit and re-create as many times as you like without re-analysing.
+
+### Same scores as `vslice/naraka_gui.py`
+
+For the same video and prompt, the demo's per-frame P(Yes) and importance curve are naraka_gui.py's:
+
+* **Prompt**: a prompt that itself asks for a Yes/No answer (e.g. naraka's banner prompt, the first UI example
+  when `demo/QID80I1IRyI.mp4` or `naraka_vids/QID80I1IRyI.mp4` exists) is sent **verbatim** with naraka's system prompt (`You are a video game expert
+  identifier.`, or `你是一位专业的游戏视觉识别专家。` for Chinese prompts), for frames and clip checks alike.
+  A plain description ("goals and celebrations") is wrapped into a "strong shot for this video?" question instead,
+  which naraka_gui.py cannot do. The log says which path was taken.
+* **Score**: P(Yes) = full-vocabulary softmax of the `Yes` token at the answer position (not Yes-vs-No only).
+* **Frames**: naraka's 64 s segments sampled every `int(fps)` frames, decoded at ≤1280 px (1280×720 for 16:9).
+* **Model**: bf16 + flash-attention 2 (sdpa if `flash_attn` is missing).
+* **Curve**: `proposals.calibrate_bitemporal` (decay 0.9, gaussian σ=2, rescaled to the raw peak) is the blue
+  "importance" line, the timeline plot, and what proposals are grown from. The grey line is the raw P(Yes).
+
+`python -m unittest discover -s demo/tests` checks these against the code in `vslice/naraka_gui.py`.
 
 UI runs are saved under `demo/outputs/app/<run id>/` (`proposal_<n>.mp4` previews, `proposals.json`,
 `proposals_timeline.png`, and `short_<time>.mp4` + `.json` + `_bgm_<mood>.wav` for every render).
@@ -66,7 +86,8 @@ CLI outputs go to `demo/outputs/<video>__<prompt>/`:
 | `scores.png` | per-frame relevance curve with proposals / selected clips shaded |
 | `bgm_<mood>.wav` | the generated background track |
 
-Useful flags: `--target_duration`, `--max_clips`, `--min_clip/--max_clip`, `--layout blur|crop`,
+Useful flags: `--target_duration`, `--max_clips`, `--min_clip/--max_clip`, `--lead_in` (build-up seconds
+kept before each highlight, default 5), `--layout blur|crop`,
 `--mood auto|upbeat|energetic|chill|epic`, `--no_music`, `--no_text`, `--orig_volume` (source audio
 level under the music), `--sample_fps`, `--batch_size`, `--width/--height`, `--lora <adapter dir>`,
 `--lora_all`, `--calib_frames` (`--list` also lists the LoRA checkpoints it finds).

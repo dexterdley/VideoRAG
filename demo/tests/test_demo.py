@@ -47,26 +47,31 @@ class FakeVLM:
     def __init__(self):
         self.seen = 0
         self.lora_path, self.lora_all, self.calib, self.calls = None, False, None, []
+        self.probes = set()  # (kind, question, system_prompt) sent to the Yes/No probes
+        self.chats = []      # free-form generation requests (captions, title, mood)
 
     def set_lora(self, path=None, lora_all=None):
         self.lora_path, self.lora_all = path or None, bool(lora_all)
         self.calls.append(("set_lora", path, self.lora_all))
         return "base model (no LoRA)" if not path else f"fake adapter {os.path.basename(path)}"
 
-    def calibrate(self, frames, question, n=12, batch_size=4):
+    def calibrate(self, frames, question, n=12, batch_size=4, system_prompt=None):
         self.calls.append(("calibrate", n))
         self.calib = (0.5, 1.0) if n else None
         return self.calib
 
-    def score_frames(self, frames, question, batch_size=4, progress=None):
+    def score_frames(self, frames, question, batch_size=4, system_prompt=None, progress=None):
+        self.probes.add(("frame", question, system_prompt))
         t = self.seen + np.arange(len(frames), dtype=float)
         self.seen += len(frames)
         return list(0.1 + 0.8 * np.exp(-((t - 3) ** 2) / 2) + 0.6 * np.exp(-((t - 9) ** 2) / 2))
 
-    def score_clip(self, frames, question):
+    def score_clip(self, frames, question, system_prompt=None):
+        self.probes.add(("clip", question, system_prompt))
         return 0.7
 
     def chat(self, frames, text, max_new_tokens=48, system_prompt=None):
+        self.chats.append(text)
         return "energetic" if "music" in text else '"Wow, look at this!" #fyp 🔥'
 
 
@@ -122,6 +127,15 @@ class TestProposals(unittest.TestCase):
         sel = select_clips([Proposal(10, 16, 13, 0.9), Proposal(14, 20, 17, 0.8), Proposal(15, 16.5, 16, 0.7)],
                            target_duration=20)
         self.assertEqual([(p.start, p.end) for p in sel], [(10, 20)])  # 14-20 -> 16-20, merged
+
+    def test_add_lead_in(self):
+        from proposals import add_lead_in
+        p = add_lead_in(Proposal(10, 16, 13, 0.9), 5)
+        self.assertEqual((p.start, p.end, p.peak, p.extra["lead_in"]), (5, 16, 13, 5))
+        p = add_lead_in(Proposal(2, 8, 5, 0.9), 5)           # clamped at the start of the video
+        self.assertEqual((p.start, p.extra["lead_in"]), (0, 2))
+        p = add_lead_in(Proposal(0, 6, 3, 0.9), 5)
+        self.assertEqual((p.start, p.extra), (0, {}))
 
     def test_clip_score_changes_rank(self):
         a, b = Proposal(0, 4, 2, 0.6), Proposal(10, 14, 12, 0.5)
@@ -261,8 +275,8 @@ class TestLoRA(unittest.TestCase):
                 state["adapter"] = True
 
         m.peft = Peft()
-        m._log_odds = lambda lists, q, sp, batch_size=None: np.array(
-            [(lora if state["adapter"] else base)[f[0]] for f in lists])
+        m._probe = lambda lists, q, sp=None, batch_size=None: (   # (log-odds, P(Yes)+P(No) = 1)
+            np.array([(lora if state["adapter"] else base)[f[0]] for f in lists]), np.ones(len(lists)))
         a, b = m.calibrate(list(range(40)), "q", n=12)
         self.assertAlmostEqual(a, 0.13, delta=0.01)
         self.assertAlmostEqual(b, 2.0, delta=0.15)
@@ -344,6 +358,52 @@ class TestApp(unittest.TestCase):
     def test_ui_builds(self):
         self.assertIsNotNone(self.app.build_ui())
 
+    def test_lead_in_extends_cards_backwards(self):
+        def cards(lead_in):
+            vlm = FakeVLM()
+            list(self.app.analyze_events(self.video, "test pattern", 6, 4, lead_in=lead_in, vlm_getter=lambda: vlm))
+            return {c.end: c for c in self.app.RUNS[list(self.app.RUNS)[-1]]["cards"]}
+
+        core, led = cards(0), cards(4)
+        self.assertEqual(set(core), set(led))  # same detections, same ends
+        for end, c in core.items():
+            self.assertAlmostEqual(led[end].start, max(0.0, c.start - 4), places=2)
+            self.assertEqual((led[end].peak, led[end].frame_score, led[end].clip_score),
+                             (c.peak, c.frame_score, c.clip_score))  # ranking/verification on the core
+        self.assertTrue(any(led[e].duration > core[e].duration for e in core))
+
+    def test_create_with_music_none(self):
+        _, final = self.analyze()
+
+        def no_vlm():
+            raise AssertionError("MiniCPM should not be asked for a mood when music is none")
+
+        events = list(self.app.create_events(final["run_id"], [True] + [False] * 7, [""] * 8, "", "blur",
+                                             "720 x 1280 (HD, faster)", "none", True, False, 0.3,
+                                             vlm_getter=no_vlm))
+        self.assertIn("no music", "\n".join(e.get("log", "") for e in events))
+        out = events[-1]["video"]
+        with open(os.path.splitext(out)[0] + ".json") as f:
+            meta = json.load(f)
+        self.assertEqual((meta["mood"], meta["music"]), (None, None))
+        self.assertTrue(any(s["codec_type"] == "audio" for s in ffprobe_json(out)["streams"]))  # original audio
+
+    def test_analyze_naraka_prompt_like_naraka_gui(self):
+        from pipeline import NARAKA_PROMPT, NARAKA_SYSTEM
+        from proposals import calibrate_bitemporal
+        vlm = FakeVLM()
+        events = list(self.app.analyze_events(self.video, NARAKA_PROMPT, 6, 4, vlm_getter=lambda: vlm))
+        self.assertEqual(vlm.probes, {("frame", NARAKA_PROMPT, NARAKA_SYSTEM), ("clip", NARAKA_PROMPT, NARAKA_SYSTEM)})
+        self.assertIn("sent verbatim", events[-1]["log"])
+        # Captions / title must not quote the "answer 'Yes' ... no explanation" instruction (MiniCPM obeys it).
+        self.assertTrue(vlm.chats)
+        for text in vlm.chats:
+            self.assertNotIn("answer 'Yes'", text)
+            self.assertIn('"highlight moments"', text)
+        plot = [e["plot"] for e in events if "plot" in e][-1]
+        raw = plot[plot.Series == "P(Yes) per frame"].Score.to_numpy()
+        np.testing.assert_allclose(plot[plot.Series == "importance"].Score.to_numpy(), calibrate_bitemporal(raw))
+
     def test_analyze_with_lora(self):
         import gradio as gr
         with tempfile.TemporaryDirectory() as root:
@@ -380,6 +440,125 @@ class TestApp(unittest.TestCase):
 
             with self.assertRaises(gr.Error):
                 list(self.app.analyze_events(self.video, "x", 6, 4, os.path.join(root, "missing")))
+
+
+NARAKA_GUI = os.path.join(os.path.dirname(DEMO), "vslice", "naraka_gui.py")
+
+
+def naraka_gui_defs(*names, **namespace):
+    """Exec only the named top-level defs of vslice/naraka_gui.py (importing it loads the model)."""
+    import ast
+    if not os.path.exists(NARAKA_GUI):
+        raise unittest.SkipTest("vslice/naraka_gui.py not found")
+    with open(NARAKA_GUI, encoding="utf-8") as f:
+        tree = ast.parse(f.read())
+    nodes = [n for n in tree.body if isinstance(n, (ast.FunctionDef, ast.ClassDef)) and n.name in names]
+    exec(compile(ast.Module(body=nodes, type_ignores=[]), NARAKA_GUI, "exec"), namespace)
+    return [namespace[n] for n in names]
+
+
+class TestNarakaParity(unittest.TestCase):
+    """The demo's frames, prompts, P(Yes) and importance curve are vslice/naraka_gui.py's."""
+
+    def test_importance_curve_is_naraka_calibration(self):
+        from scipy.ndimage import gaussian_filter1d
+        from proposals import calibrate_bitemporal
+        (ref,) = naraka_gui_defs("calibrate_bitemporal", np=np, gaussian_filter1d=gaussian_filter1d)
+        rng = np.random.default_rng(1)
+        sparse = np.where(rng.random(300) < 0.03, rng.uniform(0.6, 1.0, 300), rng.uniform(0, 0.05, 300))
+        for x in (sparse, rng.random(50), np.zeros(10), np.array([0.7]), np.array([])):
+            np.testing.assert_allclose(calibrate_bitemporal(x), ref(np.asarray(x, dtype=float)), atol=1e-12)
+
+    def test_frame_indices_are_naraka_segments(self):
+        from video_io import naraka_frame_indices
+
+        class FakeReader:  # decord.VideoReader stand-in: get_batch(idx) "decodes" to the indices
+            def __init__(self, path, ctx=None, width=None, height=None):
+                self.n, self.fps = path
+
+            def __len__(self):
+                return self.n
+
+            def get_avg_fps(self):
+                return self.fps
+
+            def get_batch(self, idx):
+                return type("B", (), {"asnumpy": lambda _: np.asarray(idx)})()
+
+        image = type("I", (), {"fromarray": staticmethod(lambda f, mode=None: int(f))})
+        (Dataset,) = naraka_gui_defs("VideoSegmentDataset", VideoReader=FakeReader, cpu=lambda i: None,
+                                     Dataset=object, Image=image)
+        for n, fps in [(83380, 60.0), (62872, 45.0), (4200, 29.97), (2000, 30000 / 1001), (7681, 60.0),
+                       (3841, 30.0), (1500, 23.976), (100, 25.0)]:
+            ds = Dataset((n, fps), segment_length=64)
+            ref = [i for k in range(len(ds)) for i in ds[k][0]]
+            self.assertEqual(naraka_frame_indices(n, fps), ref, f"n={n} fps={fps}")
+
+    def test_sample_frames_picks_naraka_frames(self):
+        from video_io import naraka_frame_indices
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "ntsc.mp4")  # 29.97 fps: naraka steps int(fps)=29, re-phased at 64 s
+            subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-f", "lavfi", "-i",
+                            "testsrc2=size=96x54:rate=30000/1001:duration=70", "-c:v", "libx264",
+                            "-pix_fmt", "yuv420p", path], check=True)
+            frames, times = sample_frames(path, 1.0)
+            n = int(subprocess.run(["ffprobe", "-v", "error", "-count_frames", "-select_streams", "v:0",
+                                    "-show_entries", "stream=nb_read_frames", "-of", "csv=p=0", path],
+                                   capture_output=True, text=True, check=True).stdout)
+        fps = 30000 / 1001
+        self.assertEqual(list(np.round(times * fps).astype(int)), naraka_frame_indices(n, fps))
+        self.assertEqual(len(frames), len(times))
+        self.assertEqual(frames[0].size, (96, 54))
+
+    def test_scoring_prompts(self):
+        from pipeline import NARAKA_PROMPT, NARAKA_SYSTEM, NARAKA_SYSTEM_ZH, scoring_prompts
+        self.assertEqual(scoring_prompts(NARAKA_PROMPT), (NARAKA_PROMPT, NARAKA_PROMPT, NARAKA_SYSTEM))
+        zh = ("分析这些画面，检测是否存在类似 '首胜'、'2连胜'、'3连胜'、'4连胜' 或 '无敌' 的文字横幅。"
+              "请忽略画面中的其他所有横幅或文字。如果存在上述任意一种，请回答 'Yes'。否则，请回答 'No'。不要提供任何解释。")
+        self.assertEqual(scoring_prompts(zh), (zh, zh, NARAKA_SYSTEM_ZH))
+        for desc in ("Player scoring goals and penalty kicks.", "no people, just yesterday's ramp"):
+            frame_q, clip_q, system = scoring_prompts(desc)
+            self.assertIn(f'"{desc}"', frame_q)
+            self.assertTrue(frame_q.endswith("Answer Yes or No.") and clip_q.endswith("Answer Yes or No."))
+            self.assertIsNone(system)
+
+    def test_p_yes_is_full_softmax(self):
+        """score_frames == softmax(logits)[Yes] at the last position, as in naraka_gui.py."""
+        import torch
+        from vlm import YES_NO_SYSTEM, MiniCPM
+
+        logits = torch.randn(5, 3, 40) * 3
+        logits[1, -1, :] = 0.0
+        logits[1, -1, 7] = 6.0  # most mass on a non Yes/No token
+        seen = {}
+
+        class Batch(dict):
+            def to(self, device):
+                return self
+
+        def processor(prompts, imgs, **kw):
+            seen.update(prompts=prompts, kw=kw)
+            return Batch(input_ids=torch.zeros(len(prompts), 3, dtype=torch.long),
+                         attention_mask=torch.ones(len(prompts), 3, dtype=torch.long), image_sizes=None)
+
+        rows = iter(range(5))
+        m = MiniCPM.__new__(MiniCPM)
+        m.lora_path, m.calib, m.device, m.yes_id, m.no_id = None, None, "cpu", 3, 5
+        m.processor = processor
+        m.tokenizer = type("T", (), {"apply_chat_template": staticmethod(
+            lambda msgs, tokenize, add_generation_prompt: repr(msgs))})()
+        m.model = lambda inputs, attention_mask: type("O", (), {
+            "logits": torch.stack([logits[next(rows)] for _ in range(len(attention_mask))])})()
+
+        scores = m.score_frames(["f0", "f1", "f2", "f3", "f4"], "Q?", batch_size=2, system_prompt="SYS")
+        np.testing.assert_allclose(scores, torch.softmax(logits[:, -1, :], -1)[:, 3].numpy(), rtol=1e-5)
+        self.assertLess(scores[1], 0.01)
+        self.assertIn("'role': 'system', 'content': 'SYS'", seen["prompts"][0])
+        self.assertIn("(<image>./</image>)\\nQ?", seen["prompts"][0])
+        self.assertEqual((seen["kw"]["max_slice_nums"], seen["kw"]["use_image_id"]), (1, False))
+        rows = iter([0])
+        m.score_frames(["f0"], "Q?")
+        self.assertIn(YES_NO_SYSTEM, seen["prompts"][0])  # system_prompt=None -> default editor prompt
 
 
 class TestSamples(unittest.TestCase):

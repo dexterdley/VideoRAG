@@ -50,23 +50,53 @@ def probe_video(path):
     )
 
 
-def sample_frames(path, sample_fps=1.0, max_side=448):
-    """
-    Decode the video sequentially and keep ~`sample_fps` frames per second.
+SEGMENT_SEC = 64  # vslice/naraka_gui.py: VideoSegmentDataset(segment_length=64)
 
-    Returns (list[PIL.Image], np.ndarray timestamps_sec). Frames are downscaled
-    so the longest side is <= max_side (MiniCPM resizes to ~448px anyway).
+
+def naraka_frame_indices(n_frames, fps, sample_fps=1.0, segment_sec=SEGMENT_SEC):
+    """
+    The frame indices vslice/naraka_gui.py's VideoSegmentDataset scores: segments start every
+    `segment_sec` seconds (up to int(duration)) and each one is sampled every int(fps / sample_fps)
+    frames from its own first frame. For integer fps this is simply every fps-th frame; for e.g.
+    29.97 fps (step 29) it is slightly faster than 1 fps and re-phases every segment.
+    """
+    step = max(1, int(fps / sample_fps))
+    duration = n_frames / fps
+    starts = range(0, int(duration), segment_sec) or [0]  # (clips < 1 s: naraka_gui scores nothing)
+    idx = []
+    for s in starts:
+        e = min(s + segment_sec, duration)
+        idx.extend(range(int(s * fps), int(e * fps), step))
+    return idx
+
+
+def sample_frames(path, sample_fps=1.0, max_side=1280):
+    """
+    Decode the video sequentially and keep the frames vslice/naraka_gui.py scores
+    (`naraka_frame_indices`, ~`sample_fps` per second).
+
+    Returns (list[PIL.Image], np.ndarray timestamps_sec), timestamps = frame index / fps.
+    Frames are downscaled so the longest side is <= max_side (1280 -> 1280x720 for 16:9,
+    as in vslice/naraka_gui.py; INTER_AREA is within ~1.5/255 of decord's resize). MiniCPM
+    (max_slice_nums=1) resizes every image to a ~448x448-area grid and upscales smaller
+    inputs, so decoding at 448px would blur fine detail such as on-screen text banners.
     """
     cap = cv2.VideoCapture(path)
     if not cap.isOpened():
         raise IOError(f"Cannot open video: {path}")
     fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
-    step = max(1, int(round(fps / sample_fps)))
+    step = max(1, int(fps / sample_fps))
 
-    frames, times = [], []
+    # The frame count is only known once decoding ends, so keep every segment's candidates
+    # (a superset) and trim the tail to naraka_frame_indices(n_frames) afterwards.
+    frames, kept = [], []
+    seg, seg_start, seg_end = 0, 0, int(SEGMENT_SEC * fps)
     idx = 0
     while True:
-        if idx % step == 0:
+        while idx >= seg_end:
+            seg += 1
+            seg_start, seg_end = seg_end, int((seg + 1) * SEGMENT_SEC * fps)
+        if (idx - seg_start) % step == 0:
             ok, frame = cap.read()
             if not ok:
                 break
@@ -75,12 +105,15 @@ def sample_frames(path, sample_fps=1.0, max_side=448):
             if scale < 1.0:
                 frame = cv2.resize(frame, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
             frames.append(Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)))
-            times.append(idx / fps)
+            kept.append(idx)
         elif not cap.grab():  # grab() skips the BGR conversion -> much faster
             break
         idx += 1
     cap.release()
-    return frames, np.asarray(times, dtype=np.float64)
+
+    wanted = set(naraka_frame_indices(idx, fps, sample_fps))
+    sel = [k for k, i in enumerate(kept) if i in wanted]
+    return [frames[k] for k in sel], np.asarray([kept[k] / fps for k in sel], dtype=np.float64)
 
 
 def motion_centre_x(frames, times, start, end, crop_frac):

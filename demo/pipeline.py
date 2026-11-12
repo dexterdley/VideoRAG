@@ -2,9 +2,10 @@
 Prompt -> vertical short pipeline, split into stages so the CLI can run it in one go
 (`run_pipeline`) and the UI can stream each stage and let the user edit in between.
 
-    1. prepare          sample frames (1 fps)                      video_io.sample_frames
+    1. prepare          sample frames (1 fps, naraka_gui.py's frames)  video_io.sample_frames
     2. iter_scores      MiniCPM yes/no probing vs. the user prompt (yields partial scores)
-    3. draft_proposals  peak-grown proposals + multi-frame MiniCPM verification
+    3. draft_proposals  importance curve (proposals.calibrate_bitemporal, as plotted by
+                        vslice/naraka_gui.py) -> peak-grown proposals + multi-frame MiniCPM verification
     4. select_clips     budgeted selection (proposals.select_clips)
     5. caption_clips /  MiniCPM captions, hook title, music mood
        make_title / pick_mood
@@ -20,9 +21,17 @@ from dataclasses import asdict, dataclass
 import numpy as np
 
 import music
-from proposals import gaussian_smooth, generate_proposals, select_clips
+from proposals import add_lead_in, calibrate_bitemporal, generate_proposals, select_clips
 from render import render_vertical
 from video_io import motion_centre_x, probe_video, sample_frames
+
+# vslice/naraka_gui.py's default (English) prompt and its system prompts (--language English / CHN).
+NARAKA_PROMPT = ("Analyze these frames for text banners like 'First Blood', 'Double Kill', "
+                 "'Triple Kill', 'Quadra Kill', or 'Invincible'. "
+                 "If any of these are present, answer 'Yes'. Otherwise, answer 'No'. "
+                 "Do not provide any explanation.")
+NARAKA_SYSTEM = "You are a video game expert identifier."
+NARAKA_SYSTEM_ZH = "你是一位专业的游戏视觉识别专家。"
 
 
 @dataclass
@@ -30,7 +39,8 @@ class DemoConfig:
     sample_fps: float = 1.0
     batch_size: int = 4
     min_clip: float = 2.0
-    max_clip: float = 6.0
+    max_clip: float = 6.0         # detected window around each peak (before the lead-in)
+    lead_in: float = 5.0          # seconds of build-up kept before each detected highlight
     target_duration: float = 20.0
     max_clips: int = 6
     verify_top: int = 8           # proposals re-scored with multi-frame MiniCPM
@@ -44,15 +54,37 @@ class DemoConfig:
     calib_frames: int = 12        # LoRA only: anchor frames for the log-odds calibration (0 = raw adapter P(Yes))
 
 
-def frame_question(prompt):
+def asks_yes_no(prompt):
+    """True if the prompt is itself a Yes/No instruction, like vslice/naraka_gui.py's banner prompt."""
+    p = prompt.lower()
+    return bool(re.search(r"(?<![a-z])yes(?![a-z])", p) and re.search(r"(?<![a-z])no(?![a-z])", p))
+
+
+def scoring_prompts(prompt):
+    """
+    -> (frame_question, clip_question, system_prompt) for the MiniCPM Yes/No probes.
+
+    A prompt that already asks for a Yes/No answer is used verbatim for frames and clips, with
+    vslice/naraka_gui.py's system prompt (the Chinese one if the prompt contains CJK text), so the
+    per-frame scores are naraka_gui.py's. A plain description ("goals and celebrations") is wrapped
+    into shot-relevance questions with the VLM's default editor system prompt (None).
+    """
+    if asks_yes_no(prompt):
+        system = NARAKA_SYSTEM_ZH if re.search("[\\u3400-\\u9fff]", prompt) else NARAKA_SYSTEM
+        return prompt, prompt, system
     return (f'A user wants a short vertical video about: "{prompt}". '
             "Is this frame a strong shot for that video (relevant, clear and interesting)? "
-            "Answer Yes or No.")
+            "Answer Yes or No.",
+            f'These frames come from one short clip. Does the clip clearly show: "{prompt}"? '
+            "Answer Yes or No.",
+            None)
 
 
-def clip_question(prompt):
-    return (f'These frames come from one short clip. Does the clip clearly show: "{prompt}"? '
-            "Answer Yes or No.")
+def describe_scoring(prompt):
+    """One log line saying how the prompt is sent to MiniCPM."""
+    if asks_yes_no(prompt):
+        return f"Yes/No prompt -> sent verbatim, system prompt {scoring_prompts(prompt)[2]!r} (as naraka_gui.py)"
+    return "Descriptive prompt -> wrapped into a 'strong shot for this video?' Yes/No question"
 
 
 def clean_text(text, max_words):
@@ -84,7 +116,8 @@ def calibrate_lora(vlm, frames, prompt, cfg):
     """If a LoRA adapter is active, map its frame log-odds onto the base model's scale. -> log line or None."""
     if not getattr(vlm, "lora_path", None):
         return None
-    ab = vlm.calibrate(frames, frame_question(prompt), n=cfg.calib_frames, batch_size=cfg.batch_size)
+    question, _, system = scoring_prompts(prompt)
+    ab = vlm.calibrate(frames, question, n=cfg.calib_frames, batch_size=cfg.batch_size, system_prompt=system)
     if ab is None:
         return "LoRA scores uncalibrated (raw adapter P(Yes))"
     return f"LoRA log-odds calibrated to the base model on {min(cfg.calib_frames, len(frames))} frames: " \
@@ -94,39 +127,57 @@ def calibrate_lora(vlm, frames, prompt, cfg):
 def iter_scores(vlm, frames, prompt, cfg, chunk=None):
     """Score frames chunk by chunk, yielding (n_done, scores_so_far) for live plots."""
     chunk = chunk or cfg.batch_size * 2
-    question = frame_question(prompt)
+    question, _, system = scoring_prompts(prompt)
     scores = []
     for start in range(0, len(frames), chunk):
-        scores.extend(vlm.score_frames(frames[start:start + chunk], question, batch_size=cfg.batch_size))
+        scores.extend(vlm.score_frames(frames[start:start + chunk], question, batch_size=cfg.batch_size,
+                                       system_prompt=system))
         yield len(scores), np.asarray(scores, dtype=np.float64)
 
 
 def draft_proposals(vlm, frames, times, scores, duration, prompt, cfg):
-    """Generate proposals, verify the strongest with multi-frame MiniCPM; return them best-first."""
-    props = generate_proposals(times, scores, duration, min_len=cfg.min_clip, max_len=cfg.max_clip)
+    """
+    Grow proposals from the peaks of the importance curve (naraka_gui.py's calibrate_bitemporal of the
+    raw P(Yes), already smooth -> no extra smoothing), verify the strongest with multi-frame MiniCPM,
+    then start every proposal cfg.lead_in s earlier to keep the build-up. Detection, NMS, ranking and
+    verification all use the detected window; return them best-first.
+    """
+    props = generate_proposals(times, calibrate_bitemporal(scores), duration,
+                               min_len=cfg.min_clip, max_len=cfg.max_clip, sigma_sec=0.0)
+    _, question, system = scoring_prompts(prompt)
     for p in props[: cfg.verify_top]:
-        p.clip_score = vlm.score_clip(frames_in(frames, times, p.start, p.end), clip_question(prompt))
+        p.clip_score = vlm.score_clip(frames_in(frames, times, p.start, p.end), question, system_prompt=system)
+    for p in props:
+        add_lead_in(p, cfg.lead_in)
     return sorted(props, key=lambda p: -p.rank_score)
+
+
+def text_topic(prompt):
+    """
+    What captions / title / music mood are written about. A Yes/No detection prompt (naraka_gui.py's
+    "...answer 'Yes'... no explanation") is not quoted: MiniCPM would obey it and reply "Yes"/"No".
+    """
+    return "highlight moments" if asks_yes_no(prompt) else prompt
 
 
 def caption_clip(vlm, frames, times, clip, prompt):
     return clean_text(vlm.chat(
         frames_in(frames, times, clip.start, clip.end),
         f'Write a short, catchy on-screen caption (max 8 words, no hashtags, no emojis) for this clip '
-        f'of a video about "{prompt}". Reply with only the caption.', max_new_tokens=24), 10)
+        f'of a video about "{text_topic(prompt)}". Reply with only the caption.', max_new_tokens=24), 10)
 
 
 def make_title(vlm, frames, times, clips, prompt):
     hook_frames = [frames_in(frames, times, p.start, p.end, k=1)[0] for p in clips[:4]]
     return clean_text(vlm.chat(
         hook_frames,
-        f'Write a catchy hook title (max 6 words, no hashtags, no emojis) for a TikTok video about "{prompt}". '
-        "Reply with only the title.", max_new_tokens=20), 7)
+        f'Write a catchy hook title (max 6 words, no hashtags, no emojis) for a TikTok video about '
+        f'"{text_topic(prompt)}". Reply with only the title.', max_new_tokens=20), 7)
 
 
 def pick_mood(vlm, frames, prompt):
     options = ", ".join(music.MOOD_NAMES)
-    reply = vlm.chat(frames, f'Pick the best background music mood for a short video about "{prompt}". '
+    reply = vlm.chat(frames, f'Pick the best background music mood for a short video about "{text_topic(prompt)}". '
                              f"Options: {options}. Reply with exactly one word from the options.",
                      max_new_tokens=8).lower()
     for m in music.MOOD_NAMES:
@@ -173,7 +224,7 @@ def plot_scores(times, scores, proposals, selected, path, prompt):
         ax.axvspan(p.start, p.end, color=blue, alpha=0.18, lw=0)
         ax.text((p.start + p.end) / 2, 1.02, str(i + 1), ha="center", va="bottom", fontsize=9, color=ink)
     ax.plot(times, scores, color=muted, lw=1, alpha=0.6, label="P(Yes) per frame")
-    ax.plot(times, gaussian_smooth(scores, 1.5 / dt), color=blue, lw=2, label="smoothed")
+    ax.plot(times, calibrate_bitemporal(scores), color=blue, lw=2, label="importance (naraka_gui calibration)")
     ax.plot([], [], color=blue, alpha=0.3, lw=8, label="selected clips")
     ax.plot([], [], color="#c3c2b7", alpha=0.5, lw=8, label="other proposals")
     ax.set_ylim(0, 1.1)
@@ -216,6 +267,7 @@ def run_pipeline(video_path, prompt, vlm, out_dir, cfg=None, log=print, progress
         f"({info.width}x{info.height}, {info.duration:.1f}s, audio={info.has_audio})")
 
     step("score")
+    log(f"      {describe_scoring(prompt)}")
     if getattr(vlm, "lora_path", None):
         log(f"      LoRA: {vlm.lora_path}")
     msg = calibrate_lora(vlm, frames, prompt, cfg)
@@ -278,6 +330,7 @@ def run_pipeline(video_path, prompt, vlm, out_dir, cfg=None, log=print, progress
         "selected": [p.to_dict() for p in selected],
         "times": [round(float(t), 3) for t in times],
         "scores": [round(float(s), 4) for s in scores],
+        "importance": [round(float(s), 4) for s in calibrate_bitemporal(scores)],
         "timings_sec": durations,
         "outputs": {"video": out_video, "plot": plot_path, "music": bgm},
     }

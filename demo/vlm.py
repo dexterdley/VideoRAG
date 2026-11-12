@@ -6,6 +6,10 @@ Three primitives are all the demo needs:
   * score_clip   : multi-image Yes/No probing         -> P(Yes) for a clip
   * chat         : free-form generation (captions, music mood)
 
+Loading (bf16 + flash-attention 2), the prompt layout and P(Yes) (the full-vocabulary
+softmax probability of the "Yes" token at the answer position) are the same as in
+vslice/naraka_gui.py, so the same frame + question + system prompt gives the same score.
+
 Optional LoRA adapters (PEFT folders, e.g. the DPO checkpoints written by
 vslice/simple_dpo.py) can be attached on top of the resident int4 model and
 swapped at runtime with `set_lora(path)` without reloading the base weights.
@@ -15,11 +19,13 @@ clip checks and captions / title / mood stay on the base model unless
 `lora_all=True`. DPO only learns *relative* preferences, so an adapter's absolute
 P(Yes) can drift far from the base model's (the SumMe DPO splits put almost every
 frame at P(Yes) < 1e-3). `calibrate()` maps the adapter's Yes-No log-odds back onto
-the base model's scale with an affine fit on a few anchor frames; the frame
-ordering stays the adapter's own.
+the base model's scale with an affine fit on a few anchor frames (P(Yes) is then
+sigmoid(calibrated log-odds) x the adapter's P(Yes) + P(No)); the frame ordering stays
+the adapter's own.
 """
 
 import contextlib
+import importlib.util
 import os
 
 import numpy as np
@@ -43,10 +49,13 @@ class MiniCPM:
 
         if not torch.cuda.is_available():
             raise RuntimeError("MiniCPM-V int4 (bitsandbytes) needs a CUDA GPU.")
-        print(f"[MiniCPM] loading {model_path} ...")
-        # The checkpoint already carries a bnb nf4 quantization_config -> no dtype / bnb args needed.
+        # Loaded like vslice/naraka_gui.py (bf16 + flash-attention 2; sdpa when flash-attn is not
+        # installed). The checkpoint carries its own bnb nf4 quantization_config; bf16 sets the dtype of
+        # the unquantized parts (vision tower, resampler, embeddings, lm_head), which default to fp32.
+        attn = "flash_attention_2" if importlib.util.find_spec("flash_attn") else "sdpa"
+        print(f"[MiniCPM] loading {model_path} (bf16, {attn}) ...")
         self.model = AutoModel.from_pretrained(
-            model_path, trust_remote_code=True, device_map=device, attn_implementation="sdpa"
+            model_path, trust_remote_code=True, device_map=device, dtype=torch.bfloat16, attn_implementation=attn
         ).eval()
         self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
         self.processor = AutoProcessor.from_pretrained(model_path, trust_remote_code=True)
@@ -106,7 +115,7 @@ class MiniCPM:
             return self.peft.disable_adapter()
         return contextlib.nullcontext()
 
-    def calibrate(self, frames, question, n=12, batch_size=4, system_prompt=YES_NO_SYSTEM):
+    def calibrate(self, frames, question, n=12, batch_size=4, system_prompt=None):
         """
         Fit base_logodds ~= a * adapter_logodds + b on `n` evenly spaced frames and use it
         in score_frames until the next set_lora / calibrate. n=0 (or no adapter) clears it.
@@ -128,10 +137,16 @@ class MiniCPM:
 
     # ───────────────────────── yes / no probing ─────────────────────────
 
-    def _log_odds(self, image_lists, question, system_prompt, batch_size=None):
-        """logit(Yes) - logit(No) at the answer position; sigmoid of it == softmax P(Yes)."""
+    def _probe(self, image_lists, question, system_prompt=None, batch_size=None):
+        """
+        Yes/No probe at the answer position -> (log_odds, mass), with log_odds = logit(Yes) - logit(No)
+        and mass = P(Yes) + P(No) under the full-vocabulary softmax, so sigmoid(log_odds) * mass is
+        exactly vslice/naraka_gui.py's softmax(logits)[Yes]. Same message layout as naraka_gui.py:
+        system prompt, then one user turn "(<image>./</image>)...\\n<question>".
+        """
+        system_prompt = system_prompt or YES_NO_SYSTEM
         batch_size = batch_size or len(image_lists)
-        out = []
+        odds, mass = [], []
         for start in range(0, len(image_lists), batch_size):
             prompts, imgs = [], image_lists[start:start + batch_size]
             for frames in imgs:
@@ -152,26 +167,33 @@ class MiniCPM:
 
             with torch.inference_mode():
                 logits = self.model(inputs, attention_mask=mask).logits[:, -1, :].float()
-            out.append((logits[:, self.yes_id] - logits[:, self.no_id]).cpu().numpy())
-        return np.concatenate(out)
+            logp = torch.log_softmax(logits, dim=-1)
+            odds.append((logits[:, self.yes_id] - logits[:, self.no_id]).cpu().numpy())
+            mass.append((logp[:, self.yes_id].exp() + logp[:, self.no_id].exp()).cpu().numpy())
+        return np.concatenate(odds), np.concatenate(mass)
 
-    def score_frames(self, frames, question, batch_size=4, system_prompt=YES_NO_SYSTEM, progress=None):
+    def _log_odds(self, image_lists, question, system_prompt=None, batch_size=None):
+        """logit(Yes) - logit(No) at the answer position (what the LoRA calibration fits)."""
+        return self._probe(image_lists, question, system_prompt, batch_size)[0]
+
+    def score_frames(self, frames, question, batch_size=4, system_prompt=None, progress=None):
         """P(Yes) for every frame (single-image prompts, batched; calibrated if an adapter is active)."""
         scores = []
         steps = range(0, len(frames), batch_size)
         for n, start in enumerate(tqdm(steps, desc="Scoring frames", disable=len(steps) <= 2)):
-            z = self._log_odds([[f] for f in frames[start:start + batch_size]], question, system_prompt)
+            z, mass = self._probe([[f] for f in frames[start:start + batch_size]], question, system_prompt)
             if self.calib and self.lora_path:
                 z = self.calib[0] * z + self.calib[1]
-            scores.extend(sigmoid(z))
+            scores.extend(sigmoid(z) * mass)
             if progress is not None:
                 progress((n + 1) / len(steps))
         return scores
 
-    def score_clip(self, frames, question, system_prompt=YES_NO_SYSTEM):
+    def score_clip(self, frames, question, system_prompt=None):
         """P(Yes) for a clip given a few of its frames in one prompt."""
         with self._base_only():
-            return float(sigmoid(self._log_odds([list(frames)], question, system_prompt))[0])
+            z, mass = self._probe([list(frames)], question, system_prompt)
+            return float(sigmoid(z[0]) * mass[0])
 
     # ───────────────────────── generation ─────────────────────────
 

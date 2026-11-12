@@ -44,8 +44,41 @@ if sys.platform == "win32":
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
     sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
 
+def _slice_frames(batch_data, s, e, num_frames):
+    """Slice frames [s:e] out of a collated batch. Handles Qwen's flattened pixel_values."""
+    grid = batch_data.get("image_grid_thw")
+    if grid is not None:
+        # Qwen2.5-VL: pixel_values are patches of all frames concatenated; frame i owns t*h*w rows
+        offsets = torch.cat([grid.new_zeros(1), grid.prod(-1).cumsum(0)])
+    mini = {}
+    for k, v in batch_data.items():
+        if k == "pixel_values" and grid is not None:
+            mini[k] = v[offsets[s]:offsets[e]]
+        elif isinstance(v, torch.Tensor) and v.size(0) == num_frames:
+            mini[k] = v[s:e]
+        else:
+            mini[k] = v
+    return {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in mini.items()}
+
+def forward_yes_no_logits(model, batch_data, model_type, yes_id, no_id, chunk_size=8):
+    """Returns last-token (yes_logits, no_logits), each [num_frames], for any supported VLM."""
+    if model_type == "minicpm":
+        logits = model.base_model(batch_data.to(device)).logits[:, -1, :]
+        return logits[:, yes_id], logits[:, no_id]
+
+    # Moondream / Qwen2.5-VL: kwargs forward, chunked over frames to fit VRAM
+    num_frames = batch_data["input_ids"].size(0)
+    yes_chunks, no_chunks = [], []
+    for s in range(0, num_frames, chunk_size):
+        e = min(s + chunk_size, num_frames)
+        logits = model(**_slice_frames(batch_data, s, e, num_frames)).logits[:, -1, :]
+        yes_chunks.append(logits[:, yes_id].float())
+        no_chunks.append(logits[:, no_id].float())
+        del logits
+    return torch.cat(yes_chunks), torch.cat(no_chunks)
+
 def evaluate(model, val_loader, dataset_name, h5_paths, tvsum_user_scores=None, yes_id=9454, no_id=2753,
-             output_dir=None, model_type="minicpm"):
+             output_dir=None, model_type="minicpm", chunk_size=8):
     """
     Evaluates the model using the ValBatchCollator and val_loader.
     """
@@ -73,15 +106,11 @@ def evaluate(model, val_loader, dataset_name, h5_paths, tvsum_user_scores=None, 
             title = titles[0] if isinstance(titles, (list, tuple)) else titles
             gtscore = gtscores.squeeze().numpy() if hasattr(gtscores, 'numpy') else np.array(gtscores)
 
-            batch_data = batch_data.to(device)
-            outputs = model.base_model(batch_data)
-
-            logits = outputs.logits[:, -1, :]
-            yes_logits, no_logits = logits[:, yes_id], logits[:, no_id]
+            yes_logits, no_logits = forward_yes_no_logits(model, batch_data, model_type, yes_id, no_id, chunk_size)
             raw_preds = F.sigmoid(yes_logits - no_logits).cpu().float()
 
             # Eagerly free up GPU memory
-            del outputs, logits, yes_logits, no_logits, batch_data
+            del yes_logits, no_logits, batch_data
             torch.cuda.empty_cache()
 
             yes_scores = raw_preds.numpy()
@@ -97,8 +126,7 @@ def evaluate(model, val_loader, dataset_name, h5_paths, tvsum_user_scores=None, 
                 h5_key=video_name, 
                 video_name=video_name,
                 dataset_name=dataset_name,
-                user_scores=tvsum_user_scores,
-                use_advanced_scoring=False,
+                user_scores=tvsum_user_scores
             )
 
             split_results.append(res)
@@ -173,11 +201,7 @@ def extract_all_features(args, model, processor, yes_id, no_id):
                 print(f"  [SKIP] {title} — already extracted")
                 continue
 
-            batch_data = batch_data.to(device)
-            outputs = model.base_model(batch_data)
-                
-            logits = outputs.logits[:, -1, :]
-            yes_logits, no_logits = logits[:, yes_id], logits[:, no_id]
+            yes_logits, no_logits = forward_yes_no_logits(model, batch_data, args.model_type, yes_id, no_id, args.chunk_size)
             binary_probs = F.softmax(torch.stack([yes_logits, no_logits], dim=-1), dim=-1)
             all_preds_tensor = binary_probs[:, 0].detach().cpu().float()
 
@@ -275,7 +299,8 @@ def train_dpo(args):
             no_id=no_id,
             tvsum_user_scores=tvsum_user_scores,
             output_dir=args.output_dir,
-            model_type=args.model_type
+            model_type=args.model_type,
+            chunk_size=args.chunk_size
         )
 
         if not test_df.empty:
@@ -303,6 +328,8 @@ def train_dpo(args):
 
 def resolve_model_path(mtype):
     if mtype == "qwen": return "Qwen/Qwen3.5-9B"
+    if mtype == "qwen2_vl_3b": return "Qwen/Qwen2.5-VL-3B-Instruct"
+    if mtype == "moondream": return "./moondream2" if os.path.exists("./moondream2") else "vikhyatk/moondream2"
     candidates = ["./MiniCPM-V-2_6-int4", "/home/dexter/VideoRAG/.checkpoints/MiniCPM-V-2_6-int4"]
     for p in candidates:
         if os.path.exists(p): return p
@@ -310,7 +337,7 @@ def resolve_model_path(mtype):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model_type", type=str, default="minicpm", choices=["minicpm", "qwen"])
+    parser.add_argument("--model_type", type=str, default="minicpm", choices=["minicpm", "qwen", "qwen2_vl_3b", "moondream"])
     parser.add_argument("--dataset", type=str, default="summe", choices=["summe", "tvsum"])
     parser.add_argument("--root_dir", type=str, default=".")
     parser.add_argument("--model_path", type=str, default=None)
@@ -318,6 +345,7 @@ if __name__ == "__main__":
 
     parser.add_argument('--batch_size', type=int, default=1, help='Batch size (number of videos per batch)')
     parser.add_argument('--clip_length', type=int, default=4)
+    parser.add_argument('--chunk_size', type=int, default=8, help='Frames per forward pass (moondream / qwen2_vl)')
     parser.add_argument("--use_advanced_scoring", action="store_true", help="Use action based ranking")
     args = parser.parse_args()
     

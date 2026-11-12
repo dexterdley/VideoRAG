@@ -28,16 +28,19 @@ import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
 
 import music  # noqa: E402
-from pipeline import (DemoConfig, build_short, calibrate_lora, caption_clip, clean_text,  # noqa: E402
-                      draft_proposals, frames_in, iter_scores, make_title, pick_mood, plot_scores, prepare)
-from proposals import gaussian_smooth, select_clips  # noqa: E402
+from pipeline import (NARAKA_PROMPT, DemoConfig, build_short, calibrate_lora, caption_clip,  # noqa: E402
+                      clean_text, describe_scoring, draft_proposals, frames_in, iter_scores, make_title,
+                      pick_mood, plot_scores, prepare)
+from proposals import calibrate_bitemporal, select_clips  # noqa: E402
 from render import cut_preview  # noqa: E402
-from samples import (CHECKPOINT_DIR, SUMME_DIR, TVSUM_DIR, describe_lora, is_lora_dir,  # noqa: E402
+from samples import (CHECKPOINT_DIR, NARAKA_DIR, SUMME_DIR, TVSUM_DIR, describe_lora, is_lora_dir,  # noqa: E402
                      list_lora_checkpoints, list_samples)
 from video_io import ensure_web_mp4  # noqa: E402
 
 DEMO_DIR = os.path.dirname(os.path.abspath(__file__))
 OUT_ROOT = os.path.join(DEMO_DIR, "outputs", "app")
+# naraka_gui.py's sample video for the first example: demo/QID80I1IRyI.mp4, else <repo>/naraka_vids/.
+NARAKA_VIDEOS = [os.path.join(DEMO_DIR, "QID80I1IRyI.mp4"), os.path.join(NARAKA_DIR, "QID80I1IRyI.mp4")]
 WEB_DIR = os.path.join(OUT_ROOT, "_web")  # browser-playable copies of AVI / odd-codec inputs
 MAX_CARDS = 8
 MAX_RUNS = 4  # analyses kept in memory (frames stay server-side; gr.State only holds the run id)
@@ -85,16 +88,19 @@ def example_rows():
         ("tvsum/37rzWOQsNIw", "Close-ups of the sandwiches being prepared"),
     ]
     # SumMe '.mp4's are AVI containers -> remux once so the example players work.
-    return [[ensure_web_mp4(s[k]["path"], WEB_DIR), p] for k, p in wanted if k in s]
+    rows = [[ensure_web_mp4(s[k]["path"], WEB_DIR), p] for k, p in wanted if k in s]
+    naraka = next((p for p in NARAKA_VIDEOS if os.path.exists(p)), None)
+    if naraka:
+        rows.insert(0, [naraka, NARAKA_PROMPT])
+    return rows
 
 
 def score_df(times, scores):
+    """Raw per-frame P(Yes) + the importance curve vslice/naraka_gui.py plots (calibrate_bitemporal)."""
     n = len(scores)
     t = np.round(np.asarray(times[:n], dtype=float), 2)
-    dt = float(np.median(np.diff(times))) if len(times) > 1 else 1.0
-    smooth = gaussian_smooth(scores, 1.5 / dt) if n > 2 else np.asarray(scores)
-    return pd.DataFrame({"Time (s)": np.r_[t, t], "P(Yes)": np.r_[scores, smooth],
-                         "Series": ["per frame"] * n + ["smoothed"] * n})
+    return pd.DataFrame({"Time (s)": np.r_[t, t], "Score": np.r_[scores, calibrate_bitemporal(scores)],
+                         "Series": ["P(Yes) per frame"] * n + ["importance"] * n})
 
 
 def overlap(a, b):
@@ -122,7 +128,7 @@ class Log:
 
 
 def analyze_events(video, prompt, target, max_clips, lora=None, lora_all=False, calibrate=True,
-                   vlm_getter=get_vlm):
+                   lead_in=DemoConfig.lead_in, vlm_getter=get_vlm):
     if not video:
         raise gr.Error("Drop a video into the upload box first.")
     prompt = (prompt or "").strip()
@@ -132,7 +138,7 @@ def analyze_events(video, prompt, target, max_clips, lora=None, lora_all=False, 
     if lora and not is_lora_dir(lora):
         raise gr.Error(f"Not a LoRA adapter folder (no adapter_config.json): {lora}")
 
-    cfg = DemoConfig(target_duration=float(target), max_clips=int(max_clips))
+    cfg = DemoConfig(target_duration=float(target), max_clips=int(max_clips), lead_in=float(lead_in))
     if not calibrate:
         cfg.calib_frames = 0
     run_id = time.strftime("%Y%m%d-%H%M%S-") + uuid.uuid4().hex[:4]
@@ -154,6 +160,7 @@ def analyze_events(video, prompt, target, max_clips, lora=None, lora_all=False, 
         raise gr.Error("Could not decode any frames from this video.")
     yield {"log": log(f"{len(frames)} frames @ {cfg.sample_fps:g} fps ({info.width}x{info.height}, "
                       f"{info.duration:.1f}s, audio={'yes' if info.has_audio else 'no'})."), "progress": 2}
+    yield {"log": log(describe_scoring(prompt) + ".")}
     msg = calibrate_lora(vlm, frames, prompt, cfg)
     yield {"log": log((msg + ". " if msg else "") + "Scoring..."), "progress": 3}
 
@@ -167,8 +174,9 @@ def analyze_events(video, prompt, target, max_clips, lora=None, lora_all=False, 
     cards = props[:MAX_CARDS]
     default = select_clips(cards, cfg.target_duration, cfg.max_clips)
     checked = [any(overlap(c, d) >= 0.5 * c.duration for d in default) for c in cards]
-    yield {"log": log(f"{len(props)} proposals, showing top {len(cards)}; "
-                      f"{sum(checked)} pre-selected for ~{cfg.target_duration:g}s. Cutting previews + captions..."),
+    yield {"log": log(f"{len(props)} proposals (≤{cfg.max_clip:g}s detected + up to {cfg.lead_in:g}s lead-in), "
+                      f"showing top {len(cards)}; {sum(checked)} pre-selected for ~{cfg.target_duration:g}s. "
+                      "Cutting previews + captions..."),
            "progress": 72}
 
     with ThreadPoolExecutor(4) as pool:
@@ -192,7 +200,9 @@ def analyze_events(video, prompt, target, max_clips, lora=None, lora_all=False, 
                    "lora_calibration": getattr(vlm, "calib", None), "title": title,
                    "cards": [c.to_dict() for c in cards],
                    "proposals": [p.to_dict() for p in props], "times": [round(float(t), 3) for t in times],
-                   "scores": [round(float(s), 4) for s in scores]}, f, indent=2, ensure_ascii=False)
+                   "scores": [round(float(s), 4) for s in scores],
+                   "importance": [round(float(s), 4) for s in calibrate_bitemporal(scores)]},
+                  f, indent=2, ensure_ascii=False)
 
     RUNS[run_id] = dict(video=video, prompt=prompt, info=info, frames=frames, times=times,
                         cards=cards, out_dir=out_dir, lora=lora, lora_all=bool(lora_all))
@@ -218,7 +228,8 @@ def create_events(run_id, includes, captions, title, layout, resolution, mood, u
     # Chronological order, overlaps between ticked proposals trimmed, touching clips merged.
     clips = select_clips(chosen, target_duration=1e9, max_clips=len(chosen), min_rel_score=0.0)
     W, H = RESOLUTIONS.get(resolution, (1080, 1920))
-    cfg = DemoConfig(layout=layout, width=W, height=H, music=bool(use_music), mood=mood,
+    # mood "none" = no background music (original audio at full volume).
+    cfg = DemoConfig(layout=layout, width=W, height=H, music=bool(use_music) and mood != "none", mood=mood,
                      orig_volume=float(orig_volume), text=bool(use_text))
     lines = [log_text] if log_text else []
 
@@ -244,7 +255,7 @@ def create_events(run_id, includes, captions, title, layout, resolution, mood, u
            "progress": 25}
     t0 = time.time()
     total, bgm = build_short(run["video"], run["info"], run["frames"], run["times"], clips, out, cfg,
-                             title=clean_text(title or "", 10), mood=mood if mood != "auto" else "upbeat")
+                             title=clean_text(title or "", 10), mood=mood if mood in music.MOOD_NAMES else "upbeat")
     with open(os.path.splitext(out)[0] + ".json", "w", encoding="utf-8") as f:
         json.dump({"title": title, "mood": mood if cfg.music else None, "layout": layout, "size": [W, H],
                    "clips": [c.to_dict() for c in clips], "music": bgm}, f, indent=2, ensure_ascii=False)
@@ -296,15 +307,19 @@ def build_ui(default_lora=None):
                     target_in = gr.Slider(5, 60, value=20, step=1, label="Target length (s)",
                                           info="used to pre-select proposals")
                     max_clips_in = gr.Slider(1, MAX_CARDS, value=6, step=1, label="Max clips")
+                lead_in_in = gr.Slider(0, 15, value=DemoConfig.lead_in, step=1, elem_id="lead_in",
+                                       label="Lead-in before each highlight (s)",
+                                       info="build-up kept before the detected moment (e.g. the fight before a "
+                                            f"kill banner); clips are up to {DemoConfig.max_clip:g} s + this")
                 progress = gr.Slider(0, 100, value=0, label="Progress (%)", interactive=False)
                 analyze_btn = gr.Button("🔍 Find highlights (开始分析)", variant="primary", elem_id="analyze_btn")
                 gr.Examples(examples=example_rows(), inputs=[video_in, prompt_in],
                             label="Or try a SumMe / TVSum sample (示例视频)")
             with gr.Column(scale=2):
-                live_plot = gr.LinePlot(x="Time (s)", y="P(Yes)", color="Series", y_lim=[0, 1.05],
-                                        color_map={"per frame": "#9a9890", "smoothed": "#2a78d6"},
-                                        title="Live relevance to your prompt (MiniCPM P(Yes))",
-                                        tooltip=["Time (s)", "P(Yes)", "Series"], height=280)
+                live_plot = gr.LinePlot(x="Time (s)", y="Score", color="Series", y_lim=[0, 1.05],
+                                        color_map={"P(Yes) per frame": "#9a9890", "importance": "#2a78d6"},
+                                        title="Live importance (MiniCPM P(Yes), naraka_gui.py calibration)",
+                                        tooltip=["Time (s)", "Score", "Series"], height=280)
                 timeline = gr.Image(label="Proposals on the timeline (blue = pre-selected)", type="filepath",
                                     visible=False, height=260)
                 log_box = gr.Textbox(label="Log (日志)", lines=12, max_lines=12, interactive=False, autoscroll=True,
@@ -331,12 +346,12 @@ def build_ui(default_lora=None):
                 layout_in = gr.Radio(["blur", "crop"], value="blur", label="Phone layout (9:16)",
                                      info="blur = whole frame over a blurred fill · crop = motion-aware crop")
                 res_in = gr.Dropdown(list(RESOLUTIONS), value=next(iter(RESOLUTIONS)), label="Resolution")
-                mood_in = gr.Dropdown(["auto"] + music.MOOD_NAMES, value="auto", label="Music mood",
-                                      info="auto = MiniCPM chooses from the clips")
-                with gr.Row():
-                    music_in = gr.Checkbox(True, label="Background music")
-                    text_in = gr.Checkbox(True, label="Title & captions")
-                vol_in = gr.Slider(0, 1, value=0.35, step=0.05, label="Original audio volume under music")
+                mood_in = gr.Dropdown(["auto"] + music.MOOD_NAMES + ["none"], value="auto", label="Music",
+                                      elem_id="mood_in",
+                                      info="auto = MiniCPM picks a mood · none = no music, original audio only")
+                text_in = gr.Checkbox(True, label="Title & captions")
+                vol_in = gr.Slider(0, 1, value=0.35, step=0.05, label="Original audio volume under music",
+                                   info="ignored with music = none (original audio at full volume)")
                 create_btn = gr.Button("🎬 Create short (生成短视频)", variant="primary", interactive=False,
                                        elem_id="create_btn")
             with gr.Column(scale=1):
@@ -395,26 +410,27 @@ def build_ui(default_lora=None):
             gr.Info("Converted the upload to a browser-playable MP4 (it was not MP4/H.264).")
             return web
 
-        def on_analyze(video, prompt, target, max_clips, lora, calibrate, lora_all):
-            for ev in analyze_events(video, prompt, target, max_clips, lora, lora_all, calibrate):
+        def on_analyze(video, prompt, target, max_clips, lead_in, lora, calibrate, lora_all):
+            for ev in analyze_events(video, prompt, target, max_clips, lora, lora_all, calibrate, lead_in):
                 yield to_updates(ev)
             gr.Info("Proposals ready - pick your clips and press Create short. (候选片段已生成)")
 
-        def on_create(run_id, title, layout, resolution, mood, use_music, use_text, vol, log_text, *vals):
+        def on_create(run_id, title, layout, resolution, mood, use_text, vol, log_text, *vals):
             includes, captions = vals[:MAX_CARDS], vals[MAX_CARDS:]
             for ev in create_events(run_id, includes, captions, title, layout, resolution, mood,
-                                    use_music, use_text, vol, log_text):
+                                    mood != "none", use_text, vol, log_text):
                 yield to_updates(ev)
             gr.Info("Your short is ready to download! (短视频已生成，可以下载)")
 
         video_in.upload(on_upload, video_in, video_in)
         lora_in.change(lora_summary, lora_in, lora_md)
         refresh_btn.click(lambda cur: gr.update(choices=lora_choices(), value=cur), lora_in, lora_in)
-        analyze_btn.click(on_analyze, [video_in, prompt_in, target_in, max_clips_in, lora_in, calib_in, lora_all_in],
+        analyze_btn.click(on_analyze, [video_in, prompt_in, target_in, max_clips_in, lead_in_in, lora_in, calib_in,
+                                       lora_all_in],
                           analyze_outputs,
                           concurrency_id="gpu", concurrency_limit=1, show_progress="minimal")
         create_btn.click(on_create,
-                         [run_state, title_in, layout_in, res_in, mood_in, music_in, text_in, vol_in, log_box]
+                         [run_state, title_in, layout_in, res_in, mood_in, text_in, vol_in, log_box]
                          + card_incs + card_caps,
                          [log_box, progress, final_video, download],
                          concurrency_id="gpu", concurrency_limit=1, show_progress="minimal")
@@ -441,7 +457,7 @@ def main():
     if not a.lazy:
         get_vlm().set_lora(lora)
     build_ui(default_lora=lora).queue().launch(server_name=a.host, server_port=a.port, share=a.share, theme=THEME, css=CSS,
-                              allowed_paths=[OUT_ROOT, SUMME_DIR, TVSUM_DIR])
+                              allowed_paths=[OUT_ROOT, SUMME_DIR, TVSUM_DIR] + NARAKA_VIDEOS)
 
 
 if __name__ == "__main__":

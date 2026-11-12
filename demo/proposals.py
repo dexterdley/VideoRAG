@@ -1,13 +1,15 @@
 """
 Turn per-frame relevance scores into ranked, non-overlapping clip proposals.
 
-    scores --gaussian smooth--> peaks --grow while high--> windows
+    P(Yes) --calibrate_bitemporal--> importance curve (what vslice/naraka_gui.py plots)
+           --peaks--> grow while high --> windows
            --clamp [min_len, max_len]--> temporal NMS --> ranked proposals
 """
 
 from dataclasses import asdict, dataclass, field
 
 import numpy as np
+from scipy.ndimage import gaussian_filter1d
 
 
 @dataclass
@@ -15,7 +17,7 @@ class Proposal:
     start: float
     end: float
     peak: float              # time (s) of the score peak inside the clip
-    frame_score: float       # mean raw P(Yes) over the clip's sampled frames
+    frame_score: float       # mean importance (calibrated P(Yes)) over the clip's sampled frames
     clip_score: float = None  # multi-frame MiniCPM verification, filled later
     caption: str = ""
     extra: dict = field(default_factory=dict)
@@ -47,6 +49,35 @@ def gaussian_smooth(x, sigma):
     return np.convolve(np.pad(x, radius, mode="edge"), k, mode="valid")
 
 
+def calibrate_bitemporal(scores, decay=0.9, sigma=2.0):
+    """
+    The importance curve of vslice/naraka_gui.py (same function, same defaults):
+    forward and backward exponential decay (per sample) so each detection casts a
+    tail both ways, max of the two, gaussian smoothing (sigma in samples), then
+    rescaled so the curve's peak equals the highest raw score.
+    """
+    scores = np.asarray(scores, dtype=np.float64)
+    n = len(scores)
+    if n == 0:
+        return scores
+
+    forward = np.zeros(n)
+    backward = np.zeros(n)
+    curr = 0
+    for i in range(n):
+        curr = max(scores[i], curr * decay)
+        forward[i] = curr
+    curr = 0
+    for i in range(n - 1, -1, -1):
+        curr = max(scores[i], curr * decay)
+        backward[i] = curr
+
+    calibrated = gaussian_filter1d(np.maximum(forward, backward), sigma=sigma)
+    if calibrated.max() > 0:
+        calibrated = calibrated / calibrated.max() * np.max(scores)
+    return np.clip(calibrated, 0, 1)
+
+
 def temporal_iou(a, b):
     inter = max(0.0, min(a.end, b.end) - max(a.start, b.start))
     union = max(a.end, b.end) - min(a.start, b.start)
@@ -58,8 +89,10 @@ def generate_proposals(times, scores, duration, min_len=2.0, max_len=6.0,
     """
     Args:
         times:    (N,) sample timestamps in seconds (uniformly spaced).
-        scores:   (N,) raw per-frame P(Yes).
+        scores:   (N,) per-frame scores (the pipeline passes the calibrate_bitemporal
+                  importance curve with sigma_sec=0, as it is already smooth).
         duration: video duration in seconds (clips are clamped to it).
+        sigma_sec: extra gaussian smoothing before peak finding (0 = none).
         rel_drop: a clip grows outward from a peak while the normalised smoothed
                   score stays above (1 - rel_drop) * peak.
     Returns:
@@ -121,6 +154,18 @@ def generate_proposals(times, scores, duration, min_len=2.0, max_len=6.0,
         if len(kept) >= max_proposals:
             break
     return kept
+
+
+def add_lead_in(p, seconds):
+    """
+    Start `p` up to `seconds` earlier (never before 0) so the build-up to the detected moment
+    is kept (a kill banner appears after the fight). Records the amount in p.extra["lead_in"].
+    """
+    start = round(max(0.0, p.start - max(0.0, seconds)), 2)
+    if start < p.start:
+        p.extra["lead_in"] = round(p.start - start, 2)
+        p.start = start
+    return p
 
 
 def _without_overlap(p, chosen, min_len):
